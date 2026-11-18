@@ -1,0 +1,143 @@
+import Foundation
+
+/// Compact facts about a selected part at submission time, from the build's
+/// statistics. This is request intent, not a serialized mesh or measurement
+/// cache. The referenced revision's program remains the source of geometry.
+struct ProjectSelectionAnchor: Codable, Sendable, Equatable {
+    /// Volume centroid.
+    var center: [Double]? = nil
+    var area: Double? = nil
+    var volume: Double? = nil
+    var bounds: [Double]? = nil
+}
+
+struct ProjectSelectedPart: Codable, Sendable, Equatable {
+    /// Stable user-visible hierarchy identity; a solid-index fallback is used
+    /// only when no named part metadata exists in the captured revision.
+    var partID: String
+    var name: String
+    var path: [String]
+    var solidIndex: Int
+    var anchor: ProjectSelectionAnchor? = nil
+}
+
+/// A picked surface point, in its part's built coordinates (before any
+/// mechanism pose), with the outward unit normal there.
+struct ProjectSelectedPoint: Codable, Sendable, Equatable {
+    var partID: String
+    var name: String
+    var path: [String]
+    var solidIndex: Int
+    var point: [Double]
+    var normal: [Double]
+}
+
+struct ProjectSelectionContext: Codable, Sendable, Equatable {
+    var revisionID: UUID
+    var capturedAt = Date()
+    /// Whole-part selections, including explicitly selected folders' contents.
+    /// Owning parts of selected points do not enter this collection.
+    var parts: [ProjectSelectedPart]
+    /// Surface points in the user's selection order.
+    var points: [ProjectSelectedPoint]
+    /// Reproduce the selected mechanism pose when reconciling an older request.
+    var jointPositions: [String: Double]? = nil
+    /// Captured in the 3D printing version view: points and anchors belong to
+    /// the program's printing version in its built coordinates.
+    var printVersion: Bool? = nil
+
+    static let maximumParts = 8_192
+    static let maximumPoints = 8_192
+
+    static func capture(revisionID: UUID, preview: PreviewMesh?, nodes: [PartNode],
+                        selectedSolids: Set<Int>, selectedNodeIDs: Set<String>, selectedPoints: [CADSurfacePoint] = [],
+                        assemblyPose: AssemblyPose? = nil, printVersion: Bool = false) -> ProjectSelectionContext? {
+        struct Owner {
+            var id: String
+            var name: String
+            var path: [String]
+        }
+        var owners: [Int: Owner] = [:]
+        var wholeParts = selectedSolids
+        func visit(_ nodes: [PartNode], ancestors: [String]) {
+            for node in nodes {
+                let path = ancestors + [node.name]
+                for index in node.solidIndices { owners[index] = Owner(id: node.id, name: node.name, path: path) }
+                if selectedNodeIDs.contains(node.id) { wholeParts.formUnion(node.allSolidIndices) }
+                visit(node.children ?? [], ancestors: path)
+            }
+        }
+        visit(nodes, ancestors: [])
+        // Saved hierarchy identities remain selectable while native geometry
+        // is replaying. Preserve that part intent without inventing anchors or
+        // starting a worker solely to capture the request.
+        let solidCount = preview?.solids ?? ((owners.keys.filter { $0 >= 0 && $0 < 1_000_000 }.max() ?? -1) + 1)
+
+        let partFacts = Dictionary((preview?.partStats ?? []).map { ($0.solidIndex, $0) }) { first, _ in first }
+
+        func owner(_ index: Int) -> Owner {
+            owners[index] ?? Owner(id: "solid:\(index)", name: "Part \(index + 1)", path: ["Part \(index + 1)"])
+        }
+        func posed(_ anchor: ProjectSelectionAnchor?, solid: Int) -> ProjectSelectionAnchor? {
+            guard var anchor, let matrix = assemblyPose?.solidTransforms[solid] else { return anchor }
+            anchor.center = anchor.center.map { AssemblySolidTransform.point($0, by: matrix) }
+            // Rotating built bounds does not give the posed part's bounds.
+            anchor.bounds = nil
+            return anchor
+        }
+        let parts = wholeParts.filter { $0 >= 0 && $0 < solidCount }.sorted().map { index in
+            let identity = owner(index)
+            let anchor = partFacts[index].map { fact in
+                ProjectSelectionAnchor(center: fact.centroid, area: fact.area, volume: fact.volume, bounds: fact.bounds)
+            }
+            return ProjectSelectedPart(partID: identity.id, name: identity.name, path: identity.path,
+                                       solidIndex: index, anchor: posed(anchor, solid: index))
+        }
+        var seen = Set<CADSurfacePoint>()
+        let points = selectedPoints.filter { $0.isValid && $0.solidIndex < solidCount && seen.insert($0).inserted }
+            .prefix(maximumPoints).map { point in
+                let identity = owner(point.solidIndex)
+                return ProjectSelectedPoint(partID: identity.id, name: identity.name, path: identity.path,
+                                            solidIndex: point.solidIndex, point: point.point, normal: point.normal)
+            }
+        guard !parts.isEmpty || !points.isEmpty else { return nil }
+        return ProjectSelectionContext(revisionID: revisionID, parts: parts, points: Array(points),
+                                       jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil,
+                                       printVersion: printVersion ? true : nil)
+    }
+
+    func validate() throws {
+        if let positions = jointPositions {
+            guard positions.count <= 8_192, positions.allSatisfy({
+                !$0.key.isEmpty && $0.key.utf8.count <= 1_024 && $0.value.isFinite && abs($0.value) <= 1e9
+            }) else { throw RADError.message("The saved selection has invalid assembly positions.") }
+        }
+        func invalid() -> RADError { .message("The saved selection references are invalid.") }
+        func text(_ value: String, maximum: Int = 1_024) -> Bool {
+            !value.isEmpty && value.utf8.count <= maximum &&
+                value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        }
+        func path(_ values: [String]) -> Bool {
+            !values.isEmpty && values.count <= 64 && values.allSatisfy { text($0) }
+        }
+        func vector(_ values: [Double]?, count: Int = 3) -> Bool {
+            values.map { $0.count == count && $0.allSatisfy { $0.isFinite && abs($0) <= 1_000_000.1 } } ?? true
+        }
+        func nonnegative(_ value: Double?) -> Bool { value.map { $0.isFinite && $0 >= 0 } ?? true }
+        func anchor(_ value: ProjectSelectionAnchor?) -> Bool {
+            guard let value else { return true }
+            return vector(value.center) && nonnegative(value.area) && nonnegative(value.volume) &&
+                vector(value.bounds, count: 6) && (value.bounds.map { bounds in (0..<3).allSatisfy { bounds[$0] <= bounds[$0 + 3] } } ?? true)
+        }
+        func surfacePoint(_ point: ProjectSelectedPoint) -> CADSurfacePoint {
+            CADSurfacePoint(solidIndex: point.solidIndex, point: point.point, normal: point.normal)
+        }
+        guard capturedAt.timeIntervalSinceReferenceDate.isFinite,
+              !parts.isEmpty || !points.isEmpty,
+              parts.count <= Self.maximumParts, points.count <= Self.maximumPoints,
+              Set(parts.map(\.solidIndex)).count == parts.count,
+              Set(points.map(surfacePoint)).count == points.count,
+              parts.allSatisfy({ $0.solidIndex >= 0 && $0.solidIndex < 1_000_000 && text($0.partID) && text($0.name) && path($0.path) && anchor($0.anchor) }),
+              points.allSatisfy({ surfacePoint($0).isValid && text($0.partID) && text($0.name) && path($0.path) }) else { throw invalid() }
+    }
+}

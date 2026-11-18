@@ -1,0 +1,304 @@
+# RAD
+
+Language Aided Design
+
+RAD eschews traditional CAD in favor of a pure agent chat. Tell the agent what you want, review the design, request changes, and export STL files.
+
+RAD requires that ChatGPT/Codex or Claude Code be already installed for the built-in chat. A RAD MCP server, for use by the agent of your choice, can be enabled in RAD Settings.
+
+You must have your own Codex or Claude (or equivalent) subscription. RAD does not provide agent functionality on its own.
+
+## Features
+
+- Signed distance field (SDF) modeling: designs are Python programs that combine primitives, extruded, revolved and lofted profiles, booleans, smooth blends, shells and offsets; RAD's native kernel meshes them with crisp sharp edges.
+- Simple design viewer for inspecting and measuring proposed designs.
+- Moving assemblies - drag parts to test design motion, or use precision inputs to select positions.
+- Attach reference images to the chat for the agent to use in modeling.
+- Reference external files (STL, STEP, KiCad, etc.) to guide the agent in modeling.
+- 3D printing views and STL export: optional print-only features such as sacrificial bridges, and parts oriented and laid out for printing.
+
+
+## Run
+
+The app has been built at **`dist/RAD.app`**. Open it in Finder, or:
+
+```sh
+open dist/RAD.app
+```
+
+RAD carries its Python/NumPy runtime as a bundled payload and its native SDF kernel inside the app. Before the first CAD operation, it prepares a versioned private runtime under `~/Library/Application Support/RAD/Runtimes` without a network download. Moving the app or removing the source checkout does not remove that runtime. When an updated RAD installs a newer runtime, it removes older ones, keeping the most recently used previous runtime and any runtime another running copy of RAD is using. Codex or Claude Code is the only separately installed RAD dependency; install, configure and sign in to at least one of them before sending a request. RAD does not install, update or sign in to either agent.
+
+Automatic discovery looks for the standalone Codex CLI first, followed by the Codex app, the ChatGPT desktop app and compatible VS Code extension binaries. For Claude Code, it prefers the native installer and Homebrew locations, then the newest Claude Code editor-extension binary, then PATH and npm installations. Configure each agent in its own installation; RAD uses that installation for design requests and model discovery. When both agents are installed, RAD asks once at first launch which agent new designs use.
+
+For a development build from a fresh checkout, install Xcode (or its command line tools) and sign in to an installed Codex. The build scripts download a pinned standalone Python distribution and prepare the bundled CAD payload:
+
+```sh
+Scripts/setup.sh
+Scripts/build-app.sh
+open dist/RAD.app
+```
+
+The build-time payload preparation uses the pinned dependencies in `Engine/requirements-lock.txt`; users do not install Python, Homebrew or CAD libraries. RAD Settings (`⌘,`) contains the default save location, CAD thread count and agent permission policy. Agent, model and reasoning choices are available only in the composer. When both agents are installed, its dropdown lists the agents first; it then lists the selected agent’s models, followed by the selected model’s supported reasoning levels, using the installed agent’s model catalog (for Codex, its [model catalog](https://learn.chatgpt.com/docs/app-server#models)). Each design remembers its agent, its model and reasoning preferences per model, and the last choice made for the other agent. New designs start from the chosen agent’s installed configuration, then retain their explicit selections. Unsupported levels are replaced with the selected model’s advertised default. Changes apply to the next design request, including its repair attempt. No API key is stored by RAD.
+
+You can also open `Package.swift` in Xcode to work on the native target. `RAD_BUILD_CONFIGURATION=debug Scripts/build-app.sh` packages a debug build. RAD supports **Apple Silicon (arm64) only**, on macOS 14 or later. All build and release tooling targets that architecture.
+
+## Downloadable releases
+
+`Scripts/build-app.sh` creates the local development app. `Scripts/release.sh` builds a versioned DMG, signs the runtime and app, notarizes them, staples tickets, and verifies the actual app copied out of the mounted DMG. End users drag `RAD.app` onto the DMG's Applications shortcut; CAD dependencies are provisioned offline from the app's payload.
+
+The release machine needs Apple Silicon, Xcode command-line tools, an unlocked keychain containing a **Developer ID Application** certificate and private key, and a `notarytool` keychain profile. Configure credentials through Apple's `xcrun notarytool store-credentials` command before invoking the release script. Credentials are not stored in this repository or passed to the app.
+
+From a clean, committed checkout with reviewed release notes:
+
+```sh
+RAD_RUN_ENGINE_TESTS=1 RAD_RUN_SANDBOX_TESTS=1 Scripts/test.sh
+Scripts/release.sh --version 0.3.0 --build-number 100 \
+  --notes path/to/release-notes.md \
+  --identity 'Developer ID Application: Your Name (TEAMID)' \
+  --notary-profile RAD-release
+```
+
+`--identity` and `--notary-profile` can also come from `RAD_SIGNING_IDENTITY` and `RAD_NOTARY_PROFILE`. Production builds use a private snapshot of the committed source and verify that the prepared runtime matches its exact recipes and artifact locks. Version/build metadata is injected into the packaged app without changing the source plist. The output directory defaults to `dist/releases/<version>+<build>` and must not already exist; `--output` selects another new directory. It contains the arm64 DMG, `SHA256SUMS`, `release-notes.md`, and `release.json` with source revision, runtime inventory, verification results, and notarization IDs. Nothing is placed there until all required checks pass. Complete notarization logs remain under `.build/releases`; failed builds preserve their staging workspace for diagnosis.
+
+Before signing, packaging saves UUID-matched dSYM bundles for RAD and its thumbnail extension, strips their debug records, and rejects personal home or checkout paths remaining in either executable. Resource lookup no longer embeds the checkout's source path. The signed app and the actual copy from the DMG are checked again. Keep the symbols private for crash diagnosis: releases retain them under their `.build/releases/<workspace>/symbols` directory, separately from the distributable artifacts. Copy them to private storage before cleaning the checkout; `.build` is disposable, and a later CI checkout can remove it. Ordinary release-configuration app builds retain symbols under a unique `.build/app-symbols/release.<suffix>` directory; `RAD_APP_SYMBOLS_OUTPUT` can select another private destination.
+
+The release process signs each of the runtime's native images individually with hardened runtime and a secure timestamp, then submits the **expanded runtime** in a ZIP for notarization. This is necessary because the app normally carries those images inside a compressed tar payload. Python, the SDF kernel, the RAD app and the other native libraries receive no entitlement exceptions; production Python retains library validation. The final signed runtime receives a new content-addressed installation identity. The app is then signed, notarized and stapled, followed by the DMG. Signing never uses `codesign --deep`; verification uses it to inspect nested code. The offline DMG verification recreates the private venv, checks preserved signatures, loads the app's SDF kernel and meshes a test shape, and builds a test design in the packaged worker's sandbox, checking its file/network/process restrictions and the design's volume.
+
+To validate packaging without release credentials:
+
+```sh
+Scripts/release.sh --local --version 0.3.0 --build-number 100 \
+  --notes path/to/release-notes.md
+```
+
+Local outputs have a `-local` suffix and `distributable: false` metadata. They are ad-hoc signed and are never submitted for notarization. They validate packaging and runtime behavior; Developer ID, Gatekeeper and stapling checks run only in the production path. Local Python may require an ad-hoc-only library-validation exception because ad-hoc signatures have no signing team; that exception is excluded from production signing.
+
+The manually dispatched [release workflow](.github/workflows/release.yml) runs on a dedicated Apple Silicon macOS runner labeled `rad-release`. Configure the repository variables `RAD_SIGNING_IDENTITY` and `RAD_NOTARY_PROFILE` to reference its preconfigured keychain. Restrict the runner group to this workflow on the protected default branch. The workflow runs native tests, builds the verified artifacts and retains them; its optional final job creates a **draft** GitHub release. Review that draft and the remaining real-machine acceptance checks before publishing. The workflow never publishes a public release automatically.
+
+Before publication, also test a browser-downloaded, quarantined DMG on a clean standard-user Mac: install, eject, launch from Finder, connect the user's Codex, generate/save/reopen/export, and exercise offline use and failed saves. Automated package verification does not replace this live clean-machine check. Normal opening supports only the current directory-package format; the development archive converter is an explicit one-time tool.
+
+## Controls
+
+**Help → RAD Help** (`⌘?`) opens a separate window with the viewport mouse and keyboard controls. Reopening Help focuses the same window; closing it leaves the open designs intact.
+
+**New Design** (`⌘N`) opens an empty independent design window and leaves the existing design open. It starts with no geometry, conversation messages, revisions, or sample prompts, and does not launch a CAD build. Each independent design has its own conversation, history, viewport, agent and model selection and autosave file. **Open Design** opens a separate window, or brings an already-open design to the front. Menu actions apply to the active design. Closing a design’s last window saves it and stops its work; quitting RAD saves all open designs.
+
+Drop a `.rad` file on a design window's title bar, viewer, parts tree or conversation history to open it in that window. RAD validates the dropped file and saves the outgoing design before switching. If another window already shows that file, both windows share one document and autosave writer; closing one view leaves the other open. A corrupt or unreadable drop leaves the current design in place. The chat editor is an exception: dropping any file or folder there inserts its local path into the prompt, without inserting file contents or replacing the open design.
+
+**File → Open Recent** lists the 15 most recently opened or saved RAD designs and retains them across launches. Selecting one opens its design or focuses its existing window. Renaming a design updates its recent entry. **Clear Menu** clears these references without deleting any design files.
+
+| Action | Control |
+| --- | --- |
+| New design window | `⌘N` |
+| Select or deselect a surface point | Left-click on a part in the viewport |
+| Select or deselect a part in the viewport | `⌥`-click |
+| Select whole parts | Click in the parts tree |
+| Add or remove parts from the selection | `⌘`-click or `⇧`-click in the parts tree |
+| Select a group of parts | Click a folder in the parts tree |
+| Toggle part or group visibility | Eye button in the parts tree |
+| Assign part or group colors | **Color…** in the parts tree context menu |
+| Hide selected / show all parts | Context menu in the viewport or parts tree |
+| Move parts or folders | Drag onto a folder or the Parts header; or use **Move Selected To** in the tree context menu |
+| Create or rename folders and parts | Folder-plus button or tree context menu |
+| Deselect all parts and points | Double-click empty viewport space, Escape, or context menu |
+| Context menu | Right-click without dragging |
+| Rotate about the design’s geometric center | Right-click and drag |
+| Fit from front / back / left / right / top / bottom | Click the corresponding cube face |
+| Fit from the opposite direction | Click a face border on the orientation cube |
+| Fit from eight isometric directions | Click the corresponding cube corner |
+| Pan | Middle-drag or Shift + right-drag |
+| Zoom toward the current mouse location | Scroll |
+| Zoom toward the gesture anchor | Trackpad pinch |
+| Fit design | `F`, toolbar, or Design menu |
+| Isometric / front / top / right | `0` / `1` / `2` / `3` with viewport focused, or Design menu |
+| Search the conversation | `⌘F` (**Edit → Find**) or the magnifying-glass button in the Design pane; `Escape` hides the search |
+| Next / previous search match | `⌘G` / `⇧⌘G`, or `Return` / `⇧Return` in the search field |
+| Submit prompt | `Return` |
+| New line in prompt | `⌥Return` |
+| Add next queued request to the current request, or submit prompt when the queue is empty | `⌘Return` |
+| Save New / open design | `⌘S` / `⌘O` |
+| Save design as | `⇧⌘S` |
+| Export STL | `⇧⌘E` |
+| Export selected parts as STL | **Export STL…** in the parts tree context menu |
+
+The parts tree on the left preserves the program's named, nested assemblies. Codex organizes new designs into groups such as Case and PCB, with individual solid parts beneath them. Programs without an `Assembly` receive numbered part entries. You can create folders, rename labels inline using the tree’s **Rename** command (Return applies, Escape cancels), and move parts or entire folders; these changes remain with the design and are retained when Codex updates matching parts. **Ungroup** removes a folder while keeping its contents in the parent folder; empty folders have **Remove Folder** instead. Selecting a folder selects all its descendants; each eye button changes visibility for its part or entire folder. A minus badge marks folders containing both visible and hidden parts. Hidden parts remain in the tree so they can be shown again. Visibility affects the preview only. The main STL export includes the complete design; **Export STL…** in the tree context menu exports just the selected whole parts, including selected folders' descendants. Every part is a separate closed shell in millimeters, placed in the current assembly pose. **For 3D printing** exports the printing version with the parts oriented and laid out on the bed, and **Export individual parts** writes one file per part into a folder. Reference parts, such as a circuit board modeled inside its case, are shown and measured with the design but are not printed: the 3D printing layout and exports for printing leave them out.
+
+Moving assemblies can include mate connectors and fixed, revolute, and slider joints, with travel limits and closed linkages. Coupled joints follow another joint, so gears, belts, racks, cams, and indexing mechanisms such as Geneva drives move together from a single input; **Motion** shows coupled joints without separate controls. Ask Codex to create the mechanism, then move its parts directly in the viewport or use **Motion** in the Design pane to change joint positions or reset them. Positions are saved with each version; measurements and STL exports use the current pose. Motion describes rigid movement without collision response or physical simulation. `Examples/Geneva drive.rad` is a complete example and `Examples/Hinged arm.json` a small program example.
+
+Choose **Color…** from a part or folder’s context menu for curated swatches, recent colors used in this design, and the full macOS color picker. A folder colors its contained parts; a context menu on a selected part applies to the selected parts. **Default Color** sets the neutral gray finish. Colors stay attached to stable part identities across hierarchy edits and matching Codex refinements, and are saved with each revision. STL files carry no colors. Recent choices belong to the design. Updating colors reuses the existing geometry; selected parts keep their selection highlight until deselected.
+
+The viewport supports shaded, shaded with crease edges, translucent, and wireframe display. A separate Perspective / Isometric selector switches between perspective and parallel projection while preserving the camera pose. Both projections support rotation, panning, and cursor-relative zoom. The orientation cube follows the viewport camera. Click a labeled face to align the view, a gray face border to view from its opposite direction, or a corner for one of eight isometric directions. Each cube click smoothly turns to the chosen direction and centers and fits the complete design using the initial-view framing criteria while retaining the current projection. Reduce Motion skips these transitions; direct navigation remains immediate. Rotation uses the midpoint of the complete design’s bounding box, including all parts. Pan and cursor zoom keep that rotation pivot fixed. This view reference does not translate geometry or change CAD coordinates in part operations or STL exports. Whole parts are selected in the hierarchy or with Option-click. A click on a part selects a point on its surface and marks it; a click within 8 points of a selected point's marker removes that point, and selections keep their click order. Hover previews the point a click would add with a pale-gold marker, without selecting it or changing measurements; selected points use gold markers. Their owning parts and folders are marked partially selected in the tree. Right-click preserves the current selection. Double-click empty viewport space clears both part and point selections. Points belong to the build where they were picked: hiding their part, a new build or another version clears them. The design details below the parts tree show dimensions, volume, CAD program, and a revision selector. Agent, model and reasoning choices are available only in the conversation composer's combined menu beside Send, including custom model IDs. Each `.rad` design retains its own agent, model, reasoning level, and remembered effort for each model. New designs start from the chosen agent’s installed configuration. Settings contains the default save location and CAD thread count. Conversation messages, errors, source text, and CAD programs have standard copy icons with confirmation feedback.
+
+Selected parts receive the highlight color in the normal surface rendering and an outline of their viewport projection, so selecting a cube outlines its silhouette rather than every cube edge. A separate overlay keeps point markers visible through nearer geometry; picking still respects geometry visibility.
+
+Codex can answer questions or ask for clarification without changing the design. These replies appear in the conversation. Answer using the same composer at the bottom; replies run before paused queued refinements, and only a validated CAD result creates a new version.
+
+Submitting while RAD is working queues the follow-up above the composer. Each queued request keeps its captured model/reasoning choice and complete source snapshots. Edit it inline, remove it, or use its small grab handle to reorder it. After a successful design is validated and committed, RAD sends exactly the next queued request against that updated design. Stop or failure pauses the remaining queue; Resume continues it. Reopening a design also restores its queue paused. Pending requests and the unsent composer draft are saved with the design, sharing attachment bytes with conversation history. Save New keeps its existing latest-design-only behavior and leaves pending work with the original design.
+
+The **Add to current request** button on a queued item delivers it as supplemental user input to the running Codex turn. It does not interrupt the task or start another design task. The button is available only while Codex can accept live input, and the item remains queued until Codex acknowledges it. An uncertain or rejected delivery keeps the item and pauses automatic replay so it cannot be sent twice silently. Accepted supplemental messages become part of the conversation and that task's audit.
+
+The left panel contains Parts above Design, with a draggable divider. New designs use a 75% / 25% split; each design saves its chosen split, and selection or content changes never resize the panes. Design information appears first in the lower pane, followed by Measurements when geometry is selected. Point and part values appear immediately; minimum distances to a part come from the parts' signed distance fields and arrive asynchronously, without blocking navigation or CAD construction.
+
+Crease edges, where the surface turns sharply, keep a consistent width on screen through zoom, orbit and projection changes: a dark, depth-tested 1.6-point stroke drawn from cached GPU buffers. Grid guides keep their thin appearance.
+
+| Selection | Measurements |
+| --- | --- |
+| Point | X/Y/Z coordinates and surface normal |
+| Two points | Distance and signed X/Y/Z deltas in selection order |
+| Three points | Angle at the second point, triangle area, perimeter and side lengths |
+| Whole parts or folders | Part count, surface area, volume, bounding dimensions and limits, volume centroid |
+| Two parts, or a point and a part | Minimum distance, closest points and X/Y/Z deltas |
+
+Designs have no vertices, edges or faces to pick, so edge radii and face areas are not offered. Values are numeric, at the resolution of the preview mesh; a point paired with a part is first snapped to its surface. Mass is not inferred without material density. Measurements are regenerated for each build and are never embedded in `.rad` files.
+
+Viewport illumination combines ambient light with camera-relative directional lights: a main light above-right and a softer fill above-left. Their directions remain fixed in the view as you orbit, pan, zoom, or switch projection. Curved surfaces produce highlights from their normals and material properties.
+
+Newly loaded preview geometry prepares its drawing resources in the background before appearing. Camera interaction reuses those resources, and unrelated conversation or save-status updates leave unchanged materials intact. Each preview's display buffers are converted once and shared by the viewport, revisited versions, Finder thumbnails and agent renders.
+
+## Designs and history
+
+`.rad` designs are self-contained directory packages, presented by Finder as single documents. The top-level `project.json` contains identity, per-design settings, drafts, the queue, and references to revision, conversation, activity and asset-catalog indexes. Each section alternates between `index-1.json` and `index-2.json`; the manifest records its expected content hash. Revision recipes/parts, message chunks, activity records and catalog buckets (grouped by the first two hash characters) are immutable files, so a save rewrites only the catalog buckets whose assets changed. Saves write complete new dependencies first, atomically publish `project.json` last, and then clean up superseded dependencies. Unchanged dependencies are reused, so small settings edits do not rewrite programs or history.
+
+Exact payloads are stored once at `assets/sha256/<first-two-hash-characters>/<full-sha256>`, shared by revisions, attachments and execution snapshots. Suitable assets are compressed independently once; their identities hash the original uncompressed bytes. The normal opener accepts only the current version of this package format; designs saved by earlier versions do not open. There are no state, recovery or geometry-cache folders.
+
+State-only edits reuse cached history metadata, assets and verified thumbnails, and encode the root manifest once. History edits reuse unchanged section references, revision recipes/parts, task records and chunk contents; only changed records are encoded, with exact source assets shared across sections. Cached records retain validation of their payloads, while every save still checks current cross-section references and aggregate limits. An immediate save consumes pending draft/divider and audit timers whose contents it already includes.
+
+Different designs use independent package locks. Established saves retain their destination policy without rediscovering the default folder, and optional iCloud folder branding runs once per successfully checked directory identity. Unchanged save URLs and recent-project preferences are not republished. Snapshots compare cached thumbnail presentation metadata without resolving Parts colors; matching validated replays reuse the saved PNG, while actual recipe, color, visibility or view changes invalidate it. Thumbnail rendering remains asynchronous and outside required saving.
+
+The opt-in `ProjectAutosaveProfileTests` accepts `RAD_AUTOSAVE_PROFILE_SOURCE` and `RAD_AUTOSAVE_PROFILE_REPORT`. `testProfileStateOnlyAutosave` measures grid changes through actual AppState save completion on disposable copies; sidebar timings include the 650 ms editing debounce. `testProfileIncrementalHistoryAutosave` measures transcript growth, activity appends and version naming through direct and coordinated saves, including record/chunk encoding counts. Both verify persisted content, unchanged unrelated dependencies and the original design without machine-specific timing thresholds.
+
+The app bundles a Quick Look thumbnail extension. A package may contain one small, separately referenced PNG of its saved design; Finder can display it as a content thumbnail while the gold RAD mark remains the registered document icon. The thumbnail is generated asynchronously from validated geometry without moving the live viewport, and the extension only reads that image. Missing or damaged thumbnails never prevent opening or saving. After building and registering the app, `xcrun swift Scripts/check-thumbnail-scales.swift /tmp/rad-thumbnail-scales` verifies native content thumbnails at 128, 256 and 512 points with both 1× and 2× backing scales, using fresh disposable packages. Exported STL files, the build's native SDF graph and display meshes remain temporary. Every successful revision contains:
+
+- The complete Python program (RAD's radsdf modeling API), title, summary, and timestamp.
+- Stable part identities, the default parts hierarchy, user organization, visibility, and each folder's expanded/collapsed state.
+- Runtime version metadata (Python, NumPy and the SDF kernel) for newly built revisions.
+
+The design also contains **all chat messages**, complete attached source snapshots, and the selected revision. Opening a revision runs its saved CAD program locally and prepares its preview in the background; this does not contact Codex. Other revisions are rebuilt only when selected, and cached previews make subsequent visits immediate. Before accepting a build, RAD meshes every part and rejects parts that are empty, unbounded, open or enclose no volume. Later measurements and exports use the build's native SDF graph without executing the program again; that graph is a private, temporary session file, never a design asset. Rebuilding uses RAD's managed CAD runtime; the pinned environment is recorded in `Engine/requirements-lock.txt`. For a follow-up request, RAD makes saved snapshots available as local referenced files, so Codex can inspect them even after the original source paths disappear. Selecting an older revision retains the later revisions and the complete conversation. A follow-up prompt operates on the selected design and appends a new revision.
+
+Tool activity travels with the design too: each task retains its captured language model/reasoning level, start/end time, outcome, tool and command inputs/outputs, durations, and CAD candidate/producer source snapshots. Exact source bytes and activity text share the same deduplicated asset table as final programs and attachments. Generated render images, display metadata, native caches and STL exports remain temporary.
+
+Projection, rendering mode, and grid visibility are saved per design. Their viewport controls and **Design → Show Grid** autosave these choices; reopening or switching designs restores each file's options. Save New and full copies retain them. New designs start with perspective projection, edges rendering, and the grid visible.
+
+New designs begin saving automatically after you submit the first request. Until then, drafts and settings stay in memory and no `.rad` file is created. Files are saved in **iCloud Drive/RAD** when iCloud Drive is available, or **Documents/RAD** otherwise. Settings lets you select **iCloud Drive** directly or choose another default folder for new designs. The iCloud location is labeled **iCloud Drive**, with RAD files stored in its RAD folder. Opened designs continue saving to their existing location, including files outside that default folder. Filenames use the descriptive design title generated by Codex from the request. Each design retains its complete revision and conversation history. RAD restores the last design on launch. Explicit **Save Design As** creates a portable file at your chosen location.
+
+**Save New** opens a save dialog for an independent design containing only the latest validated design. Right-click a version in the version dropdown and choose **Save New…** to start from that version instead, without changing the current selection. Both actions preserve required input assets, parts organization, visibility, grid and Codex choices. Other revisions, all chat messages and task activity, drafts and queued requests are omitted. The open design keeps its complete history; Save New cannot replace it. **Save Design As** remains available for a complete copy.
+
+Click the filename at the top of the window to rename a design in place. Return applies the name; Escape cancels. The `.rad` file is renamed automatically, and your chosen name stays with the design when you change revisions or ask Codex for further changes. Existing files are preserved when names collide.
+
+The interface shows a save status only while changes are pending or when saving fails; there is no "saved" or "autosaved" confirmation. A failed autosave leaves the design unsaved, including after its window closes. On quit, RAD offers Save, Don’t Save and Cancel for each unsaved design. Cancel stops quitting; canceling a subsequent save dialog also returns to RAD. Don’t Save explicitly discards that design’s unsaved changes. Metadata encoding, individual asset compression and disk work run off the main UI thread. The package reader validates bounded files, content hashes and references, IDs, programs and hierarchy, and rejects symbolic links or paths outside the package. STL exports and temporary native geometry have a 512 MB (512,000,000-byte) per-file limit. Required unique asset payloads have a 1,024 MB expanded total limit, and the root manifest has a separate 32 MB limit. Exported STL files and native geometry remain temporary and are not saved in designs.
+
+Open the example designs in `Examples`: `Rubber duck.rad` (colored organic parts), `HDMI board case.rad` (a two-part printed case around a circuit board and components modeled as reference parts) and `Geneva drive.rad` (a coupled mechanism to move in the viewport). Each holds one validated version without conversation history. `Examples/*.json` are program examples, not complete designs, including these three designs' programs.
+
+## Architecture
+
+Developer naming uses **Project** for RAD documents and their internal state: source filenames, types, data structures, helpers, variables, tests, preference keys, and scene identifiers. The interface calls the same document a **Design** (for example, `ProjectWindowCoordinator` implements **New Design**). Keep this terminology boundary when adding code; external API/protocol identifiers and user-authored content retain their own names. Files keep the `.rad` suffix and top-level `project.json` filename.
+
+```text
+SwiftUI conversation + revision state
+               │
+               ▼
+Codex / Claude Code ── design program ──► sandboxed CAD worker
+                                                  │
+                                 radsdf SDF graph ─► native SDF kernel (C++)
+                                                  │
+                                     ┌────────────┴────────────┐
+                                     ▼                         ▼
+                              STL on export          Preview mesh + creases
+                                                               │
+                                                               ▼
+                                                       SceneKit / Metal
+```
+
+Swift owns the native interface, designs, camera, and agent lifecycle. A sandboxed Python worker runs the design program, which builds a signed distance field graph with RAD's radsdf module. RAD's native C++ kernel evaluates that graph and meshes each part with sharp-feature dual contouring on the configured CAD threads, so the UI stays available during modeling. Measurements, clearance checks, validation and STL exports evaluate the same graph in a separate long-lived worker without running the program again. [SDF-DESIGN.md](SDF-DESIGN.md) records the design and the decisions behind it.
+
+Codex runs in an isolated temporary task workspace using the `workspace-write` sandbox, initially without network access. RAD connects its own stdio MCP server on that invocation; it does not edit global Codex configuration. Claude Code runs in the same kind of task workspace with the same RAD tools, instructions and validated response format, and only RAD's MCP server for that task. Its sandbox limits commands and file edits to the task workspace, no host is pre-allowed, other permission prompts are declined rather than waiting for a person, and RAD keeps it from updating itself or saving sessions or memory for the task. Supplemental user messages join a running Claude task once Claude Code acknowledges them. RAD uses a private [Codex app-server](https://developers.openai.com/codex/app-server) for streamed progress, schema-constrained final responses and acknowledged same-turn steering. The initial context contains file references, brief metadata, and a bounded recent conversation. It never embeds source file contents, attached or historical source snapshots, the current design's saved program, or audit output. The current design is staged as `context/current-model.json` and referenced as **CURRENT MODEL FILE**. Source manifests provide the name, original provenance `path`, staged snapshot `readPath`, SHA-256, and byte count. Codex inspects these files and writes new work in its private workspace; original source files remain unchanged. Initial request size stays independent of referenced file size.
+
+Complete source snapshots stay in the portable design and remain available even when their original messages move beyond the recent conversation window or the original files no longer exist. RAD stages the saved data for each request instead of truncating files or replacing missing details with guessed geometry. The full conversation is retained locally. Codex design requests have no RAD-imposed elapsed-time limit; use Stop to cancel a request. Codex can correct kernel failures and rebuild repeatedly within its turn. Final construction is validated before commit; if it differs from the geometry built through the tools and fails validation, one additional repair turn remains available. Matching validated geometry is reused without another CAD build.
+
+Codex starts with a short plan and provides concise progress updates during substantial work. RAD displays these messages as they arrive and retains them in the saved conversation. The running task status includes its captured model and reasoning level, so changing the composer for the next request does not relabel ongoing work. The final design summary appears only after CAD validation succeeds; failures and cancellation retain their actual outcomes. Tool logs, private reasoning, and the structured CAD response are kept out of progress messages.
+
+Every Codex design task has these RAD tools available by default, with instructions to build, inspect, measure, validate and visually review the result before returning it:
+
+| Tool | Purpose |
+| --- | --- |
+| `rad_runtime` | Discover the selected Python, the SDF kernel version and the complete radsdf modeling guide |
+| `rad_request_permission` | Request a decision for an optional task-local download or dependency installation; performs no installation or execution |
+| `rad_versions` | List saved versions with stable IDs, history positions, custom names and the current marker |
+| `rad_version` | Resolve a version reference to metadata and local files for its complete program and original inputs |
+| `rad_build` | Build a complete local Python recipe into validated native geometry and a preview |
+| `rad_import` | Register a user-provided closed STL or OBJ mesh as a design input that programs use as a solid |
+| `rad_inspect` | Inspect build facts, paginated part statistics, motion, printing orientations, and signed distances, normals and ray hits at points |
+| `rad_get_part_colors` | Read paginated part/folder IDs, current colors without rebuilding |
+| `rad_set_part_colors` | Stage atomic part/folder color assignments or neutral defaults for the current design or a candidate |
+| `rad_measure` | Measure parts and surface points: coordinates, normals, distances, angles and minimum distances to parts |
+| `rad_validate` | Re-mesh every part finer than its preview and report open, non-manifold, split or vanishing surfaces and volume changes |
+| `rad_render` | Return a PNG image to Codex from a chosen standard view, projection, shading and optional part subset |
+| `rad_check_motion` | Sweep a mechanism joint and report clearance, contact and interference between moving parts |
+| `rad_screenshot` | Return an image of the current live RAD viewport; disclose an offscreen fallback if no view is attached |
+| `rad_export_stl` | Export the complete design, selected parts, a joint pose or the printing layout as binary STL into the task workspace |
+
+Codex can inspect and change current part colors without rebuilding geometry. Each part has one RGB value, regardless of who set it; the last successful assignment applies. Color tools use stable physical part IDs, support folder assignments and neutral default colors, and remain speculative until a successful final response. Current color-only changes use a normal conversational response; a geometry replacement uses its matching candidate's current colors. Other candidate and historical color changes remain isolated. New candidates retain existing current colors by stable ID, while historical replays use that saved version's current colors. `color=` values in the program's `Assembly` supply initial colors for new parts.
+
+Rendering uses RAD's camera, geometry, materials and lighting. Candidate renders do not move the user's camera or replace the open design; only the final validated result becomes a revision. Image data is delivered to Codex as an MCP image attachment, so it can review the result during the turn. Tool outputs use file references and concise geometry metadata, rather than complete source files or CAD programs.
+
+When a request references v3 or a custom version name, Codex can look it up from a task snapshot of the design's complete saved history. Version lookup does not rebuild geometry or change the selected version. It returns complete local recipe and original-input references; an explicit `rad_build` with the returned `versionID` can replay that version for inspection or rendering. Ambiguous names return candidates for clarification. Historical generated geometry is never imported as a frozen reference.
+
+The **Tool Activity** toggle beside the conversation settings opens a separate nonmodal pane. It is **hidden by default**, is never restored visible, and leaves the existing window layout intact. It shows live and saved task events with expandable complete inputs, outputs, source snapshots and standard copy buttons. Cancellation and interruption retain their outcomes. Private reasoning, final-response JSON and derived image payloads are excluded. RAD retains its own audit while using a private Codex app-server with an ephemeral thread per design request; transient task files are removed afterward. Live supplemental input uses the same active thread and turn. An oversized malformed CLI event produces an explicit incomplete-record diagnostic instead of silently claiming a complete log.
+
+External tools are user-managed. The bundled CAD baseline requires no extra installation. Before an optional download or dependency installation, Codex calls `rad_request_permission` with the proposed operation and reason. RAD returns a decision only; it does not install tools or run installation commands. If allowed, Codex executes the operation in an isolated temporary environment inside its task workspace. Task commands have no network access until a request is allowed in that task, and an allowed request enables network access for the rest of the task: Codex continues the same conversation in a new turn whose sandbox allows the network, and Claude Code's sandbox then allows each connection and web fetch. With Always deny, or before any allowed request, the sandbox blocks network access. That workspace is removed after the turn, and the final CAD program must replay with bundled CAD dependencies only. The shared CAD runtime, original files and global settings remain protected. Permission prompts offer Allow or Deny, with a checkbox to remember either choice for all future requests. The remembered policy is global to RAD on this Mac, stored outside `.rad` files, and editable in Settings as Ask each time, Always allow or Always deny. Every new proposed operation checks the current policy, including after an earlier automatic decision; saved chat and audit records never grant permission. Changing the policy affects future or pending permission requests, without stopping shell commands already running. Denied or canceled requests do not authorize an installation; Codex must not rephrase or retry the same operation without new user direction. Only pre-existing reference meshes are imported; geometry generated for a design is never imported, and all authored design geometry stays in the complete replayable CAD program.
+
+Design programs use RAD's **radsdf** modeling API: spheres, rounded boxes, cylinders, cones, capsules, tori, ellipsoids and half-spaces; circles, rounded rectangles, polygons, slots, ellipses and involute gear profiles that extrude (optionally tapered), revolve or loft into solids; booleans with optional smooth blends; shells, offsets, elongations, twists, mirrors, linear, polar and grid arrays and rigid placements; and named `Assembly` hierarchies with colors, printing directions, reference parts and motion. Every radsdf name is preloaded, with `math` and `np`; a program assigns its final shape, list of shapes or `Assembly` to `result`. The inspector exposes the program for review. Dimensions are millimeters. See [the engine protocol](Engine/README.md) and [the SDF design](SDF-DESIGN.md).
+
+Python programs saved for replay run in a separate macOS sandbox with access to the CAD runtime and their private build directory. They cannot access arbitrary user files, network services, or launch arbitrary commands. This replay-worker restriction is separate from Codex's writable task workspace and external tooling. The engine strips ambient credential environment variables, enforces a build deadline, validates every part's mesh, and exports STL itself. Meshes follow the preview resolution: features thinner than about two preview cells may not close, and the build names the part when they do not.
+
+## Import source designs
+
+Name an absolute local source path in a prompt, such as `Import the design from /path/to/design.fs`, or use the composer's paperclip. RAD snapshots supported UTF-8 sources (`.fs`, `.scad`, `.py`, `.json`, `.txt`, `.kicad_pcb`) locally and sends references and brief metadata when model generation is needed. Source contents are never inlined in the initial Codex prompt. Codex can open the staged snapshots with read-only tools, using scoped searches rather than dumping large source files. Paths with spaces can be quoted. Up to four files may be attached per request, with a 1 MiB per-file and 2 MiB combined limit. Missing, unreadable, and oversized files produce errors before generation.
+
+Source formats, including `.kicad_pcb`, are passed to Codex as ordinary source references. RAD does not provide a KiCad converter, download component libraries, or route requests by PCB/STEP keywords. If faithful conversion requires external software, Codex can use a user-provided tool or request permission for an optional task-local installation; a supported reference export also remains an option. Reference files such as STEP models can guide dimensions and placements, and their contents stay local rather than being included in the prompt. Closed STL and OBJ meshes, such as a scanned part or a component model dropped into the prompt, can be imported as solids: Codex registers the file with `rad_import`, the program combines it with its own geometry (fits, clearance pockets, mounts), and the exact file is saved with the design. Imported meshes keep their facets; RAD does not reconstruct smooth surfaces from them.
+
+Onshape FeatureScript and OpenSCAD are **translated into radsdf programs**, rather than executed by their original CAD systems. Codex must use source dimensions and describe the translation. If it cannot faithfully express the design, it reports the unsupported features and preserves the current design; it cannot substitute the existing design as a successful import. Approximations require an explicit user request. Source comments are treated as data, and source files are never modified by the import path.
+
+## External agents
+
+RAD can serve external agents running on the same Mac through MCP Streamable HTTP. In **Settings → External Agents**, enable the server, choose a port, and create a client credential. The default endpoint is `http://127.0.0.1:47522/mcp`. RAD must remain running. The listener binds only to IPv4 loopback; it does not make RAD available on the LAN or internet. A cloud-hosted agent's `127.0.0.1` refers to its own host and cannot reach this endpoint directly.
+
+Each client receives its own revocable credential and grants for reading, building, committing, exporting, capturing the live viewport, or managing designs. Grants can be restricted to selected designs. Copy the client configuration from Settings into an MCP client that supports Streamable HTTP and authorization headers. A typical configuration has this form; use the actual endpoint and credential supplied by RAD:
+
+```json
+{
+  "mcpServers": {
+    "rad": {
+      "url": "http://127.0.0.1:47522/mcp",
+      "headers": {
+        "Authorization": "Bearer <client-token>"
+      }
+    }
+  }
+}
+```
+
+The external agent writes a complete radsdf Python program and uses RAD's native CAD tools directly. RAD does not launch its internal Codex agent for these calls. Client configuration and bearer credentials remain on the Mac and are never saved into `.rad` files or tool activity.
+
+1. Call `rad_projects` to find an authorized open design, or use `rad_project_create` for a new independent design window. `rad_project_open` opens RAD's native design chooser; it does not accept an arbitrary filesystem path.
+2. Call `rad_task_begin` with the returned `projectID` and a concise `request`. Optional `model` and `reasoningEffort` describe the external agent for the audit; RAD does not choose or run that model. Retain the returned `taskID`, `expectedStateToken`, and `uploadURL`.
+3. Upload the complete program as a binary file using the client credential. For example, with the returned upload URL and credential in task-local environment variables:
+
+   ```sh
+   curl --fail-with-body \
+     --header "Authorization: Bearer $RAD_MCP_TOKEN" \
+     --header 'Content-Type: application/octet-stream' \
+     --data-binary @candidate.py \
+     "${RAD_UPLOAD_URL}?name=candidate.py"
+   ```
+
+   The upload returns an opaque `fileID`. Uploads do not grant access to arbitrary local paths, and never change the original file. Put references and brief metadata in agent context; do not paste program or asset contents into prompts.
+4. Call `rad_build` with `taskID`, `programID` set to the uploaded file ID, and the candidate's `title` and `summary`. Use `rad_inspect`, `rad_measure`, `rad_validate`, and `rad_render` to review and repair candidates. Existing tool arguments named `path`, `queryPath`, or similar accept task file IDs in this external interface. Tools return file IDs and authenticated download URLs, rather than requiring a shared filesystem. Render and screenshot tools return the exact PNG as MCP image content.
+5. Call `rad_commit` with `taskID`, the reviewed `artifactID`, `expectedStateToken`, and a unique `idempotencyKey`. Builds and color edits remain speculative until this call. A commit reuses the exact validated native geometry, publishes its revision, and uses RAD's existing autosave writer. A current-design color-only commit updates that revision while preserving history selection. A changed design produces a conflict instead of silently replacing newer work; repeated successful commit requests resolve to the existing revision, including after task cleanup or reopening an authorized design. Check `committed` separately from the response's `persistence.status`, which reports `memory`, `pending`, `saved`, or `failed` and includes an error when saving fails.
+6. Use `rad_task_status` to inspect the task, `rad_task_cancel` to stop it, and `rad_task_end` to release temporary files and candidates. All three take `taskID`. A committed task accepts status, downloads, commit retries, and cleanup; start a fresh task for further uploads or CAD operations. Exported files are temporary authenticated downloads; only complete replay programs become part of a saved design.
+
+Saved history, colors, native inspection, measurements and exports use the same CAD operations as RAD's internal agent. Task IDs keep work and activity separate across clients and designs. Ordinary renders do not move the live viewport. Optional dependency permission requests still use RAD's existing per-operation policy and owning design window. RAD restricts operations performed through its tools; an external agent remains responsible for its independently executed commands and installations.
+
+
+
+

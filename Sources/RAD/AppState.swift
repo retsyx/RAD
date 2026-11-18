@@ -1,0 +1,3080 @@
+import AppKit
+import Combine
+import SwiftUI
+import UniformTypeIdentifiers
+
+/// Observation tracks each property separately, so a view re-renders only
+/// when the state it actually reads changes.
+@MainActor
+@Observable
+final class AppState {
+    var messages: [ChatMessage] = []
+    let projectActivity = ProjectActivityStore()
+    var taskAudits: [ProjectTaskAudit] { projectActivity.tasks }
+    var activityImages: ProjectActivityImages { projectActivity.images }
+    @ObservationIgnored weak var viewportView: CADSceneView?
+    var revisions: [ProjectRevision] = [] {
+        didSet { agentStateGeneration &+= 1; projectThumbnailRevisionsChanged(from: oldValue) }
+    }
+    var selectedRevisionID: UUID? {
+        didSet {
+            if selectedRevisionID != oldValue {
+                cancelAssemblyGrab()
+                agentStateGeneration &+= 1; scheduleProjectThumbnail()
+            }
+        }
+    }
+    var mesh: PreviewMesh? {
+        didSet {
+            projectThumbnailMeshModel = mesh == nil ? nil : current
+            // Points lie on one build's surfaces. Even a replacement at the
+            // same artifact path must not keep old point selections.
+            pointSelectionOrigin = nil; selectedPointsGeometry = nil
+            loadAssemblyPose()
+            preparePrintView()
+            selectedPoints = []
+            refreshMeasurements()
+            scheduleProjectThumbnail()
+        }
+    }
+    var prompt = "" {
+        didSet { if prompt != oldValue { scheduleDebouncedAutosave() } }
+    }
+    private(set) var queuedRequests: [ProjectQueuedRequest] = []
+    private(set) var queuePaused = false
+    private(set) var isSendingQueuedRequestID: UUID?
+    private(set) var editingQueuedRequestID: UUID?
+    private(set) var isReadingQueuedAttachments = false
+    private(set) var isReadingDraftAttachments = false
+    private(set) var preparingQueuedRequestIDs: Set<UUID> = []
+    private(set) var canSteerQueuedRequests = false
+    private(set) var queuedRequestErrors: [UUID: String] = [:]
+    private(set) var queuePauseReason: String?
+    var isWorking = false {
+        didSet {
+            if isWorking && !oldValue { cancelAssemblyGrab() }
+            if oldValue && !isWorking { scheduleQueueAfterBusyOperation() }
+        }
+    }
+    var activity = "Ready"
+    private(set) var runningCodexSelection: String?
+    private(set) var codexSettings = CodexProjectSettings()
+    private(set) var projectName: String? {
+        didSet { if projectName != oldValue { agentStateGeneration &+= 1 } }
+    }
+    private(set) var recentPartColors: [PartColor] = []
+    private(set) var partsPaneFraction = 0.75
+    var error: String?
+    var displayMode: ViewportDisplayMode = .edges {
+        didSet {
+            if displayMode != oldValue { scheduleProjectThumbnail(); autosave() }
+        }
+    }
+    var projectionMode: ViewportProjectionMode = .perspective {
+        didSet {
+            if projectionMode != oldValue {
+                if isGrabbingAssembly { cancelAssemblyGrab() }
+                scheduleProjectThumbnail(); autosave()
+            }
+        }
+    }
+    var showGrid = true {
+        didSet {
+            if showGrid != oldValue { autosave() }
+        }
+    }
+    /// The 3D printing version view shows the program's printing version,
+    /// with its print-only features, in built coordinates.
+    var printVersionView = false {
+        didSet {
+            if printVersionView != oldValue { printViewChanged(layoutChanged: false); autosave() }
+        }
+    }
+    /// The 3D printing layout view orients each displayed part and packs the
+    /// parts on the build plate. Together with the printing version, it shows
+    /// exactly what is exported for printing. Hidden parts are only hidden;
+    /// the plate is not packed again.
+    var printLayoutView = false {
+        didSet {
+            if printLayoutView != oldValue { printViewChanged(layoutChanged: true); autosave() }
+        }
+    }
+    /// Either 3D printing view replaces the posed design display.
+    var showsPrintView: Bool { printVersionView || printLayoutView }
+    private(set) var isPreparingPrintView = false
+    private struct PrintViewKey: Equatable {
+        var build: String
+        var version: Bool
+        var layout: Bool
+    }
+    /// The displayed geometry and plate layout of the current build's 3D printing views.
+    private struct PrintViewGeometry {
+        var key: PrintViewKey
+        var preview: PreviewMesh
+        var transforms: [Int: [Double]]
+    }
+    private var printViewGeometry: PrintViewGeometry?
+    /// Session-only printing versions of recently displayed builds, keyed by
+    /// the ordinary build's identity, and the print orientations found so
+    /// far, keyed by the identity of the build they orient. The views and
+    /// STL export share them; neither is ever saved.
+    @ObservationIgnored private var printVersions: [String: PreviewMesh] = [:]
+    @ObservationIgnored private var printOrientationCache: [String: [Int: PrintOrientation]] = [:]
+    @ObservationIgnored private var printPreviewTasks: [String: Task<PreviewMesh, Error>] = [:]
+    @ObservationIgnored private var printViewTask: Task<Void, Never>?
+    @ObservationIgnored private var printViewToken = UUID()
+    /// A layout toggle frames the next shown 3D printing display.
+    @ObservationIgnored private var fitsPrintViewWhenShown = false
+    /// Printing versions build on their own engine, so they never cancel a
+    /// design build or agent validation running on the main engine.
+    private let printEngine = EngineService()
+    var viewportCommand: ViewportCommand? {
+        didSet { if viewportCommand != oldValue && isGrabbingAssembly { cancelAssemblyGrab() } }
+    }
+    var projectURL: URL?
+    var saveStatus: String?
+    /// Saves started this session. Changes made while an autosave is being
+    /// written share one follow-up save rather than starting their own.
+    /// Regression tests compare it, like `projectThumbnailWork`.
+    @ObservationIgnored private(set) var startedSaves = 0
+    private(set) var saveConflict: ProjectSaveConflict?
+    private(set) var hasUnsavedChanges = false
+    var notice: String?
+    var selectedSolids: Set<Int> = [] {
+        didSet { if selectedSolids != oldValue { refreshMeasurements() } }
+    }
+    /// Surface points picked in the viewport, in selection order, in their
+    /// parts' built coordinates.
+    private(set) var selectedPoints: [CADSurfacePoint] = [] {
+        didSet {
+            guard selectedPoints != oldValue else { return }
+            let solids = Set(selectedPoints.map(\.solidIndex))
+            if solids != pointSelectedSolids { pointSelectedSolids = solids }
+            refreshMeasurements()
+        }
+    }
+    /// Solids owning the selected points. Kept with the selection so each
+    /// parts-tree row does not rebuild it.
+    private(set) var pointSelectedSolids: Set<Int> = []
+    /// A build's design or printing version, whose surfaces the points lie on.
+    private struct PointSelectionGeometry {
+        var preview: PreviewMesh
+        var printVersion: Bool
+    }
+    /// The user's point selection on the geometry where it was made.
+    /// Switching to the other build and back restores the selection.
+    private struct PointSelectionOrigin {
+        var geometry: PointSelectionGeometry
+        var points: [CADSurfacePoint]
+    }
+    @ObservationIgnored private var pointSelectionOrigin: PointSelectionOrigin?
+    /// The geometry `selectedPoints` lie on. While a 3D printing view is
+    /// being prepared, it remains the previously displayed geometry.
+    @ObservationIgnored private var selectedPointsGeometry: PointSelectionGeometry?
+    private(set) var measurementReport: CADMeasurementReport?
+    private(set) var assemblyPose: AssemblyPose?
+    private(set) var isSolvingAssembly = false
+    private(set) var assemblyMotionError: String?
+    private(set) var isGrabbingAssembly = false
+    private var assemblyMotionTask: Task<Void, Never>?
+    private var assemblyMotionToken = UUID()
+    private var requestedJointPositions: [String: Double] = [:]
+    private final class AssemblyGrabSession {
+        let ownerID: UUID
+        let revisionID: UUID
+        let projectSessionID: UUID
+        let geometryToken: UUID
+        let solidIndex: Int
+        let context: AssemblyGrabContext
+        var pendingTarget: [Double]?
+        var lastTarget: [Double]?
+        var ended = false
+
+        init(ownerID: UUID, revisionID: UUID, projectSessionID: UUID, geometryToken: UUID,
+             solidIndex: Int, context: AssemblyGrabContext) {
+            self.ownerID = ownerID; self.revisionID = revisionID; self.projectSessionID = projectSessionID
+            self.geometryToken = geometryToken; self.solidIndex = solidIndex; self.context = context
+        }
+    }
+    private var assemblyGrabSession: AssemblyGrabSession?
+    private var assemblyGrabTask: Task<Void, Never>?
+    private let assemblyGrabSolver: @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose
+    private(set) var measurementError: String?
+    private(set) var isMeasuring = false
+    var selectedPartNodeIDs: Set<String> = []
+    var hiddenSolids: Set<Int> = [] {
+        didSet {
+            if hiddenSolids != oldValue {
+                if let grabbed = assemblyGrabSession?.solidIndex, hiddenSolids.contains(grabbed) { cancelAssemblyGrab() }
+                agentStateGeneration &+= 1; scheduleProjectThumbnail()
+            }
+        }
+    }
+    var pendingAttachments: [SourceAttachment] = [] {
+        didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
+    }
+    var onOpenProject: ((URL) -> Void)?
+    var onRecentProjectChanged: ((URL, URL?) -> Void)?
+    var onProjectAgentInvalidated: (() -> Void)?
+    private var agentStateGeneration: UInt64 = 0
+    var awaitingResponse: Bool {
+        !isWorking && messages.last(where: { $0.role == "assistant" && $0.phase != "commentary" })?.phase == "response"
+    }
+    var submissionWillQueue: Bool {
+        isWorking || isSendingQueuedRequestID != nil || (!queuedRequests.isEmpty && !awaitingResponse)
+    }
+    private let codex = CodexService()
+    @ObservationIgnored private var agentPreferenceSubscription: AnyCancellable?
+    private let engine = EngineService()
+    private var operation: Task<Void, Never>?
+    private var operationID = UUID()
+    private var generationFeedback: CodexConversationFeedback?
+    private var autosaveDebounceTask: Task<Void, Never>?
+    private var steeringTask: Task<Void, Never>?
+    private var queueSourceTasks: [UUID: Task<Void, Never>] = [:]
+    private var queueSourceTokens: [UUID: UUID] = [:]
+    private var queueCanAdvance = false
+    private var steeringAvailable = false
+    private struct QueuedRequestComposerDraft {
+        var prompt: String
+        var attachments: [SourceAttachment]
+        var codexSettings: CodexProjectSettings
+    }
+    private var queuedRequestComposerDraft: QueuedRequestComposerDraft?
+    private var queuedEditorInitialAttachments: [SourceAttachment] = []
+    private var queuedEditorReferenceTargets: [String: String] = [:]
+    private var queuedAttachmentTask: Task<Void, Never>?
+    private var queuedAttachmentToken = UUID()
+    private var promptAttachmentReads: [PromptAttachmentInput] = []
+    private var loaded = false
+    private var projectReady = false
+    private var projectSavingEnabled = false
+    private var pendingProjectRename = false
+    private var builtRevisionID: UUID? {
+        didSet {
+            if builtRevisionID != oldValue { scheduleProjectThumbnail() }
+            if let builtRevisionID { retainRecentRevisionPreviews(including: builtRevisionID) }
+        }
+    }
+    /// Recently displayed revisions keep their session previews for fast
+    /// history navigation. Older ones rebuild from their saved program when
+    /// shown again; previews are never part of the saved design.
+    static let retainedRevisionPreviews = 4
+    private var recentPreviewRevisionIDs: [UUID] = []
+    private var projectSessionID = UUID()
+    private var projectID = UUID()
+    private var autosavedProjectURL: URL?
+    private var projectFileOrigin: ProjectFileOrigin?
+    private var projectThumbnailTask: Task<Void, Never>?
+    private var projectThumbnailToken = UUID()
+    private var projectThumbnailInput: ProjectThumbnail.Input?
+    private var projectThumbnailData: Data?
+    private var projectThumbnailMeshModel: ModelSpec?
+    private var projectThumbnailRevisionGeneration: UInt64 = 0
+    private struct ProjectThumbnailPresentation: Equatable {
+        var revisionID: UUID
+        var generation: UInt64
+        var validationHash: String?
+        var projection: ViewportProjectionMode
+        var display: ViewportDisplayMode
+        var hiddenSolids: Set<Int>
+    }
+    private var projectThumbnailImagePresentation: ProjectThumbnailPresentation?
+    private struct ProjectThumbnailInputKey: Equatable {
+        var presentation: ProjectThumbnailPresentation
+        var buildID: String
+    }
+    private var projectThumbnailInputKey: ProjectThumbnailInputKey?
+    private var projectThumbnailCachedInput: ProjectThumbnail.Input?
+    struct ProjectThumbnailWork {
+        var inputResolutions = 0
+        var scheduledRenders = 0
+        var renders = 0
+        var reusedImages = 0
+    }
+    private(set) var projectThumbnailWork = ProjectThumbnailWork()
+    private let projectThumbnailRenderer: @MainActor (PreviewMesh, ProjectThumbnail.Input) async throws -> Data
+    private var saveConflictPromptTask: Task<Void, Never>?
+    private var presentedSaveConflict: ProjectSaveConflict?
+    private var autosaveSequence = 0
+    /// The design session whose autosave is being written, and whether a
+    /// change arrived while it was. Shared windows share this one writer.
+    private struct AutosaveWrite {
+        var session: UUID
+        var followUp = false
+    }
+    private var autosaveWrite: AutosaveWrite?
+    private var preserveUnreadableSession = false
+    private let autosaveStore: ProjectAutosaveStore
+    private let runtimeOverride: String?
+    private var isActiveProject = false
+    private var lastNotedRecentURL: URL?
+    private var lastRememberedProjectURL: URL?
+    private var measurementTask: Task<Void, Never>?
+    private var measurementToken = UUID()
+    private struct MeasurementKey: Hashable {
+        var buildID: String
+        var points: [CADSurfacePoint]
+        var solids: [Int]
+        var transforms: [AssemblySolidTransform]
+    }
+    private var measurementCache: [MeasurementKey: CADMeasurementReport] = [:]
+
+    init(autosaveStore: ProjectAutosaveStore = ProjectAutosaveStore(), python: String? = nil,
+         thumbnailRenderer: @escaping @MainActor (PreviewMesh, ProjectThumbnail.Input) async throws -> Data = { preview, input in
+             try await ProjectThumbnail.render(preview: preview, projection: input.projection, display: input.display,
+                                               hiddenSolids: input.hiddenSolids, solidColors: input.solidColors)
+         },
+         assemblyGrabSolver: @escaping @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose = {
+             try $0.solve(positions: $1, screenPoint: $2)
+         }) {
+        self.autosaveStore = autosaveStore
+        runtimeOverride = python
+        projectThumbnailRenderer = thumbnailRenderer
+        self.assemblyGrabSolver = assemblyGrabSolver
+        projectActivity.onChange = { [weak self] in
+            guard let self else { return }
+            self.autosaveSequence += 1
+            if !self.hasUnsavedChanges { self.hasUnsavedChanges = true }
+        }
+        projectActivity.onSaveRequested = { [weak self] in self?.autosave() }
+        agentPreferenceSubscription = NotificationCenter.default.publisher(for: AgentVendorPreference.changed)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.adoptPreferredAgentIfUnused() } }
+    }
+
+    /// The first-launch agent choice can arrive after a new window opened. Only
+    /// a design that has never sent a request follows it; others keep their own.
+    private func adoptPreferredAgentIfUnused() {
+        guard projectReady, !projectSavingEnabled, messages.isEmpty, revisions.isEmpty, queuedRequests.isEmpty,
+              !isWorking, editingQueuedRequestID == nil else { return }
+        selectAgentVendor(AgentVendorPreference.defaultVendor)
+    }
+
+    private static let recentProjectPathKey = "lastAutosavedProjectPath"
+    private static let recentProjectIDKey = "lastAutosavedProjectID"
+    static var recentProjectURL: URL? {
+        UserDefaults.standard.string(forKey: recentProjectPathKey).map { URL(fileURLWithPath: $0) }
+    }
+
+    var posedPreview: PreviewMesh? {
+        guard var preview = mesh else { return nil }
+        preview.assemblyPose = assemblyPose
+        return preview
+    }
+
+    /// The geometry the viewport shows: the printing version in the 3D
+    /// printing version view, otherwise the build. It is nil while a 3D
+    /// printing view is being prepared.
+    var displayedMesh: PreviewMesh? {
+        guard showsPrintView else { return mesh }
+        guard let mesh, let shown = printViewGeometry, shown.key == printViewKey(for: mesh) else { return nil }
+        return shown.preview
+    }
+
+    /// Displays of one build, the design and its printing version, share the
+    /// viewport camera.
+    var viewportCameraKey: String? { mesh.map(Self.printKey) }
+
+    /// Reference parts are not printed, so the 3D printing layout view leaves
+    /// them out of the displayed plate entirely.
+    var displayedOmittedSolids: Set<Int> {
+        guard printLayoutView, let preview = displayedMesh else { return [] }
+        return Set(preview.referenceSolids ?? [])
+    }
+
+    /// Rigid placements applied to `displayedMesh`.
+    var displayedSolidTransforms: [Int: [Double]] {
+        guard showsPrintView else { return assemblyPose?.solidTransforms ?? [:] }
+        return displayedMesh == nil ? [:] : printViewGeometry?.transforms ?? [:]
+    }
+
+    var current: ModelSpec? { revisions.first(where: { $0.id == selectedRevisionID })?.model }
+    var title: String { projectName ?? revisions.last?.model.title ?? "Untitled design" }
+    /// The header names the active file, including any collision suffix chosen
+    /// by the store. Only an explicit pending rename shows a requested name;
+    /// ordinary autosaves must keep the actual filename stable.
+    var projectDisplayName: String {
+        if !pendingProjectRename, let projectURL { return projectURL.deletingPathExtension().lastPathComponent }
+        return title
+    }
+    var canRenameProject: Bool { projectReady && !preserveUnreadableSession }
+    var projectEditingID: UUID { projectSessionID }
+    var hasStartedProjectSession: Bool { loaded }
+    var projectDocumentID: UUID { projectID }
+    var partTree: [PartNode] {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return [] }
+        if let layout = revision.partLayout { return layout.nodes }
+        if let parts = revision.parts { return parts }
+        if let preview = revision.preview { return Self.defaultParts(for: preview) }
+        return []
+    }
+    var solidColors: [Int: PartColor] {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return [:] }
+        return PartColorState.solidColors(in: partTree, overrides: revision.partColors ?? [:])
+    }
+    private var currentSolidCount: Int {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return 0 }
+        if let parts = revision.parts { return parts.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0 }
+        return revision.preview?.solids ?? (partTree.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0)
+    }
+    var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking && !isSolvingAssembly }
+    var canManipulateAssembly: Bool {
+        !isWorking && !showsPrintView && builtRevisionID == selectedRevisionID && mesh?.assemblyMotion != nil
+    }
+
+    func setPartsPaneFraction(_ fraction: Double) {
+        guard fraction.isFinite, (0...1).contains(fraction), fraction != partsPaneFraction else { return }
+        partsPaneFraction = fraction
+        scheduleDebouncedAutosave()
+    }
+    /// Whole parts plus the parts owning selected points: the targets of
+    /// hiding and coloring. Exports take whole-part selections only.
+    var selectedPartSolids: Set<Int> { selectedSolids.union(pointSelectedSolids) }
+    var canExportSelectedParts: Bool { canExport && !selectedSolids.isEmpty }
+    var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !selectedPoints.isEmpty }
+    var canSaveProject: Bool { projectReady && projectSavingEnabled && !preserveUnreadableSession }
+    var canSaveNew: Bool { canSaveProject && !revisions.isEmpty && !isWorking }
+    var python: String { runtimeOverride ?? EngineService.defaultPython }
+    var agentVendor: AgentVendor { codexSettings.vendor }
+    var executable: String { agentVendor.configuredExecutable }
+    var model: String { codexSettings.model }
+    var reasoningEffort: CodexReasoningEffort {
+        let effort = CodexReasoningEffort(rawValue: codexSettings.reasoningEffort) ?? .defaultConfiguration
+        let catalog = CodexModelCatalog.catalog(for: agentVendor)
+        guard effort != .defaultConfiguration, catalog.matches(executable: executable),
+              let selected = CodexModelSelection.effectiveModel(id: model, models: catalog.models,
+                                                                configuredModelID: catalog.configuredModelID),
+              !selected.reasoningEfforts.contains(where: { $0.id == effort.rawValue }) else { return effort }
+        // Catalog capabilities can change while RAD is running. Keep the
+        // captured request pair valid even before the picker refreshes.
+        let fallback = CodexModelSelection.normalizedEffort(effort.rawValue, for: selected) ?? ""
+        return CodexReasoningEffort(rawValue: fallback) ?? .defaultConfiguration
+    }
+    var threads: Int { let count = UserDefaults.standard.integer(forKey: "workerThreads"); return count > 0 ? count : ProcessInfo.processInfo.activeProcessorCount }
+    var activityStatus: String {
+        guard let runningCodexSelection else { return activity }
+        return "\(activity) · \(runningCodexSelection)"
+    }
+
+    func renameProject(to enteredName: String) throws {
+        guard canRenameProject else { throw RADError.message("Open a design before renaming it.") }
+        // A literal basename can itself end in .rad. Committing the unchanged
+        // field must not strip that suffix as though it were a new extension.
+        guard enteredName != projectDisplayName else { return }
+        let name = try ProjectNaming.userName(enteredName)
+        guard name != projectDisplayName else { return }
+        pendingProjectRename = true
+        projectName = name
+        autosave()
+    }
+
+    func revisionName(for id: UUID) -> String {
+        guard let index = revisions.firstIndex(where: { $0.id == id }) else { return "" }
+        return revisions[index].name ?? "v\(index + 1)"
+    }
+
+    /// Naming is independent of history navigation and native CAD preparation.
+    func renameRevision(id: UUID, to enteredName: String) throws {
+        guard let index = revisions.firstIndex(where: { $0.id == id }) else {
+            throw RADError.message("This design version no longer exists.")
+        }
+        let name = try ProjectRevisionNaming.userName(enteredName)
+        guard revisions[index].name != name else { return }
+        revisions[index].name = name
+        autosave()
+    }
+
+    func selectCodexModel(_ id: String) {
+        let selected = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard selected.utf8.count <= 256,
+              selected.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else { return }
+        var settings = codexSettings
+        let catalog = CodexModelCatalog.catalog(for: settings.vendor)
+        settings.reasoningEffort = CodexModelSelection.selectModel(selected, currentModel: settings.model,
+                                                                  currentEffort: settings.reasoningEffort,
+                                                                  models: catalog.matches(executable: executable) ? catalog.models : [],
+                                                                  configuredModelID: catalog.matches(executable: executable) ? catalog.configuredModelID : nil,
+                                                                  preferences: &settings.reasoningByModel)
+        settings.model = selected
+        updateCodexSettings(normalizedCodexSettings(settings))
+    }
+
+    /// Switching agents keeps each agent's last model and reasoning choice in
+    /// this design; an agent chosen for the first time starts from its own
+    /// installed configuration.
+    func selectAgentVendor(_ vendor: AgentVendor) {
+        guard vendor != codexSettings.vendor else { return }
+        var settings = codexSettings
+        settings.switchAgent(to: vendor)
+        updateCodexSettings(normalizedCodexSettings(settings))
+    }
+
+    func selectCodexReasoningEffort(_ value: String) {
+        guard CodexReasoningEffort(rawValue: value) != nil else { return }
+        var settings = codexSettings
+        settings.reasoningEffort = value
+        settings = normalizedCodexSettings(settings)
+        CodexModelSelection.rememberEffort(settings.reasoningEffort, for: settings.model,
+                                           preferences: &settings.reasoningByModel)
+        updateCodexSettings(settings)
+    }
+
+    func normalizeCodexSelection() {
+        guard projectReady else { return }
+        updateCodexSettings(normalizedCodexSettings(codexSettings))
+    }
+
+    private func updateCodexSettings(_ settings: CodexProjectSettings) {
+        guard settings != codexSettings else { return }
+        codexSettings = settings
+        if projectReady { autosave() }
+    }
+
+    private func normalizedCodexSettings(_ settings: CodexProjectSettings) -> CodexProjectSettings {
+        let catalog = CodexModelCatalog.catalog(for: settings.vendor)
+        guard catalog.matches(executable: settings.vendor.configuredExecutable), !catalog.isLoading else { return settings }
+        return Self.normalizedCodexSettings(settings, models: catalog.models,
+                                            configuredModelID: catalog.configuredModelID,
+                                            configuredReasoningEffort: catalog.configuredReasoningEffort)
+    }
+
+    /// Resolve an initial CLI default once, then retain the project's explicit
+    /// selection even if another file or the CLI configuration chooses differently.
+    static func normalizedCodexSettings(_ original: CodexProjectSettings, models: [CodexModelDescriptor],
+                                        configuredModelID: String?, configuredReasoningEffort: String?) -> CodexProjectSettings {
+        var settings = original
+        if settings.model.isEmpty {
+            guard let initialModel = configuredModelID.flatMap({ $0.isEmpty ? nil : $0 }) ?? models.first(where: \.isDefault)?.id else { return settings }
+            settings.model = initialModel
+            if settings.reasoningEffort.isEmpty, let configuredReasoningEffort,
+               CodexReasoningEffort(rawValue: configuredReasoningEffort) != nil {
+                settings.reasoningEffort = configuredReasoningEffort
+            }
+        }
+        if let selected = models.first(where: { $0.id == settings.model }) {
+            settings.reasoningEffort = CodexModelSelection.normalizedEffort(settings.reasoningEffort, for: selected) ?? ""
+        }
+        CodexModelSelection.rememberEffort(settings.reasoningEffort, for: settings.model,
+                                           preferences: &settings.reasoningByModel)
+        return settings
+    }
+
+    func start(restoringRecent: Bool = true, opening url: URL? = nil, restoringProjectID: UUID? = nil) {
+        guard !loaded else { return }; loaded = true
+        if let url { openProject(url, restoringProjectID: restoringProjectID); return }
+        if !restoringRecent { newProject(); return }
+        let token = UUID()
+        let recentURL = Self.recentProjectURL
+        let recentID = UserDefaults.standard.string(forKey: Self.recentProjectIDKey).flatMap(UUID.init(uuidString:))
+        operationID = token; isWorking = true; activity = "Restoring session…"
+        operation = Task {
+            do {
+                let saved: RADProject
+                let source: URL?
+                if recentURL != nil || recentID != nil {
+                    guard let restored = try await autosaveStore.restoreRecent(preferredURL: recentURL, projectID: recentID) else {
+                        throw RADError.message("The last design could not be found. Open its .rad file to continue.")
+                    }
+                    saved = restored.project; source = restored.url
+                } else if let restored = try await autosaveStore.restoreRecent(preferredURL: nil, projectID: nil) {
+                    saved = restored.project; source = restored.url
+                } else {
+                    guard operationID == token else { return }
+                    newProject()
+                    return
+                }
+                guard operationID == token else { return }
+                restore(saved)
+                autosavedProjectURL = source; projectURL = source
+                projectReady = true
+                if let source { rememberAutosavedProject(source) }
+                if !loadStoredRevision(), let model = current { buildExisting(model) }
+                else if current == nil { isWorking = false; activity = "Ready"; operation = nil }
+                if source == nil || saved.projectID == nil || saved.codexSettings != codexSettings { autosave() }
+            } catch {
+                guard operationID == token else { return }
+                preserveUnreadableSession = true
+                self.error = "The previous design could not be restored. Its file has been preserved. Open a design or start a new design.\n\n\(error.localizedDescription)"
+                saveStatus = "Not saved: \(error.localizedDescription)"
+                isWorking = false; activity = "Design could not be restored"; operation = nil
+            }
+        }
+    }
+
+    func prepareToQuit() async {
+        onProjectAgentInvalidated?()
+        await finishAssemblyMotion(cancelActiveGrab: true)
+        cancel()
+        cancelProjectThumbnail(clearImage: false)
+        projectActivity.cancelPendingSave()
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        await waitForPromptAttachments()
+        await waitForQueuedSources()
+        do { try await flushProject() }
+        catch { saveStatus = "Not saved: \(error.localizedDescription)" }
+        await autosaveStore.releaseCachedProjects()
+    }
+
+    func flushForReplacement() async throws {
+        onProjectAgentInvalidated?()
+        await finishAssemblyMotion(cancelActiveGrab: true)
+        let wasGenerating = generationFeedback != nil
+        cancel()
+        cancelProjectThumbnail(clearImage: false)
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        await waitForPromptAttachments()
+        await waitForQueuedSources()
+        if wasGenerating {
+            messages.append(ChatMessage(role: "system", content: "Generation canceled. The last validated design is still available."))
+        }
+        try await flushProject()
+        await autosaveStore.releaseCachedProjects()
+    }
+
+    private func flushProject() async throws {
+        await finishAssemblyMotion()
+        guard canSaveProject else { return }
+        if let saveConflict { throw saveConflict }
+        // This snapshot supersedes any follow-up of an autosave in progress.
+        if autosaveWrite?.session == projectSessionID { autosaveWrite?.followUp = false }
+        autosaveSequence += 1
+        let sequence = autosaveSequence, sessionID = projectSessionID
+        hasUnsavedChanges = true
+        let preferExactName = pendingProjectRename
+        do {
+            let url = try await autosaveStore.write(project: projectSnapshot(), projectID: projectID, title: autosaveTitle,
+                                                   sequence: sequence, preferredURL: autosavedProjectURL,
+                                                   preferExactName: preferExactName)
+            guard projectSessionID == sessionID else { return }
+            autosavedProjectURL = url
+            rememberAutosavedProject(url)
+            if sequence == autosaveSequence {
+                if projectURL != url { projectURL = url }
+                pendingProjectRename = false
+                hasUnsavedChanges = false
+                saveStatus = nil
+            }
+        } catch {
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                recordSaveFailure(error)
+            }
+            throw error
+        }
+    }
+
+    /// A quit-time recovery copy preserves the complete design. Unlike the
+    /// ordinary Save As action, it is awaited and does not retry cloud autosave.
+    func saveProjectForQuit(to url: URL) async throws {
+        await finishAssemblyMotion(cancelActiveGrab: true)
+        guard canSaveProject else { return }
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        let sequence = autosaveSequence, sessionID = projectSessionID
+        do {
+            let origin = try await autosaveStore.writeCopy(projectSnapshot(), to: url)
+            onRecentProjectChanged?(url, nil)
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                projectFileOrigin = origin
+                autosavedProjectURL = url
+                if projectURL != url { projectURL = url }
+                pendingProjectRename = false
+                hasUnsavedChanges = false
+                saveStatus = nil
+            }
+        } catch {
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                saveStatus = "Not saved: \(error.localizedDescription)"
+            }
+            throw error
+        }
+    }
+
+    func stopGeneration() {
+        cancel()
+        messages.append(ChatMessage(role: "system", content: "Generation canceled. The last validated design is still available."))
+        activity = "Canceled"; autosave()
+    }
+
+    func newProject() {
+        onProjectAgentInvalidated?()
+        cancel()
+        cancelProjectThumbnail()
+        projectReady = false
+        projectSavingEnabled = false
+        saveConflict = nil
+        presentedSaveConflict = nil
+        saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
+        projectFileOrigin = nil
+        projectSessionID = UUID()
+        projectID = UUID()
+        autosavedProjectURL = nil
+        lastNotedRecentURL = nil
+        lastRememberedProjectURL = nil
+        measurementCache = [:]
+        preserveUnreadableSession = false
+        projectURL = nil
+        saveStatus = nil
+        hasUnsavedChanges = false
+        pendingProjectRename = false
+        projectName = nil
+        recentPartColors = []
+        partsPaneFraction = 0.75
+        showGrid = true
+        printVersionView = false
+        printLayoutView = false
+        resetPrintGeometry()
+        projectionMode = .perspective
+        displayMode = .edges
+        codexSettings = normalizedCodexSettings(CodexProjectSettings(vendor: AgentVendorPreference.defaultVendor))
+        messages = []; revisions = []; selectedRevisionID = nil; recentPreviewRevisionIDs = []
+        projectActivity.restore()
+        resetQueueWork()
+        queuedRequests = []; queuePaused = false
+        mesh = nil; builtRevisionID = nil; prompt = ""; error = nil; notice = nil; pendingAttachments = []
+        viewportCommand = nil
+        selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = []
+        projectReady = true
+    }
+
+    func submit() {
+        guard !isReadingPromptAttachments else { return }
+        if editingQueuedRequestID != nil {
+            commitEditingQueuedRequest()
+            return
+        }
+        let enteredText = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !enteredText.isEmpty || !pendingAttachments.isEmpty else { return }
+        guard enteredText.utf8.count <= 1_000_000 else {
+            error = "The request exceeds the design file's 1 MB message limit."; return
+        }
+        let enqueue = submissionWillQueue
+        guard !enqueue || queuedRequests.count < 10_000 else {
+            error = "The design already contains the maximum number of queued requests."; return
+        }
+        normalizeCodexSelection()
+        var settings = codexSettings
+        settings.reasoningEffort = reasoningEffort.rawValue
+        let selection = capturedRequestSelection()
+        do { try selection?.validate() }
+        catch { self.error = error.localizedDescription; return }
+        let request = ProjectQueuedRequest(content: enteredText, attachments: pendingAttachments.isEmpty ? nil : pendingAttachments,
+                                           codexSettings: settings, selection: selection)
+        // A submitted request starts persistence, even if it is later canceled
+        // or fails. Drafts and settings alone must not create an empty file.
+        projectSavingEnabled = true
+        prompt = ""; pendingAttachments = []
+        if enqueue {
+            queuedRequests.append(request)
+            if generationFeedback == nil { queueCanAdvance = true }
+            prepareQueuedSources(for: request.id)
+            autosave()
+            drainQueueIfPossible()
+        } else {
+            queuePaused = false
+            startRequest(request)
+        }
+    }
+
+    private func capturedRequestSelection() -> ProjectSelectionContext? {
+        guard let revisionID = selectedRevisionID else { return nil }
+        // 3D printing view selections refer to the displayed geometry in its
+        // built coordinates, never to the plate layout. While a view is being
+        // prepared, selected points still lie on their previous geometry.
+        if showsPrintView {
+            let geometry = displayedMesh.map(displayedPointGeometry) ?? selectedPointsGeometry
+            return ProjectSelectionContext.capture(revisionID: revisionID, preview: geometry?.preview, nodes: partTree,
+                selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedPoints: selectedPoints,
+                printVersion: geometry?.printVersion ?? printVersionView)
+        }
+        return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
+            selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedPoints: selectedPoints,
+            assemblyPose: assemblyPose)
+    }
+
+    func editQueuedRequest(id: UUID, text: String) {
+        guard text.utf8.count <= 1_000_000 else {
+            error = "The request exceeds the design file's 1 MB message limit."; return
+        }
+        guard id != isSendingQueuedRequestID, let index = queuedRequests.firstIndex(where: { $0.id == id }),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(queuedRequests[index].attachments ?? []).isEmpty else { return }
+        queuedRequests[index].content = text
+        prepareQueuedSources(for: id)
+        autosave()
+    }
+
+    var canBeginEditingQueuedRequests: Bool { !isReadingDraftAttachments }
+
+    var canCommitQueuedRequest: Bool {
+        guard let id = editingQueuedRequestID, id != isSendingQueuedRequestID,
+              queuedRequests.contains(where: { $0.id == id }), !isReadingQueuedAttachments else { return false }
+        return prompt.utf8.count <= 1_000_000 &&
+            (!prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty)
+    }
+
+    func beginEditingQueuedRequest(id: UUID) {
+        guard canBeginEditingQueuedRequests, id != isSendingQueuedRequestID,
+              let request = queuedRequests.first(where: { $0.id == id }), editingQueuedRequestID != id else { return }
+        if queuedRequestComposerDraft == nil {
+            queuedRequestComposerDraft = QueuedRequestComposerDraft(prompt: prompt, attachments: pendingAttachments,
+                                                                   codexSettings: codexSettings)
+        }
+        cancelQueuedAttachmentRead()
+        editingQueuedRequestID = id
+        queuedEditorInitialAttachments = request.attachments ?? []
+        queuedEditorReferenceTargets = Dictionary(SourceImport.referencedURLs(in: request.content).map {
+            ($0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path)
+        }, uniquingKeysWith: { first, _ in first })
+        prompt = request.content
+        pendingAttachments = queuedEditorInitialAttachments
+        codexSettings = normalizedCodexSettings(request.codexSettings ?? queuedRequestComposerDraft!.codexSettings)
+        refreshSteeringAvailability()
+    }
+
+    @discardableResult
+    func commitEditingQueuedRequest() -> Bool {
+        guard let id = editingQueuedRequestID, id != isSendingQueuedRequestID,
+              !isReadingQueuedAttachments, let index = queuedRequests.firstIndex(where: { $0.id == id }) else { return false }
+        guard prompt.utf8.count <= 1_000_000 else {
+            error = "The request exceeds the design file's 1 MB message limit."; return false
+        }
+        guard canCommitQueuedRequest else { return false }
+        normalizeCodexSelection()
+        let latest = queuedRequests[index]
+        let references = SourceImport.referencedURLs(in: prompt)
+        let referencePaths = Set(references.map { $0.standardizedFileURL.path })
+        let originalPaths = Set(SourceImport.referencedURLs(in: latest.content).map { $0.standardizedFileURL.path })
+        let initialAttachmentPaths = Set(queuedEditorInitialAttachments.map(\.path))
+        let referencedTargets = Set(references.map { reference in
+            queuedEditorReferenceTargets[reference.standardizedFileURL.path] ?? reference.resolvingSymlinksInPath().path
+        })
+        // Source capture can finish after editing begins. Retain those exact
+        // snapshots for unchanged references instead of rereading their files.
+        let lateAttachments = (latest.attachments ?? []).filter {
+            !initialAttachmentPaths.contains($0.path) &&
+                (referencePaths == originalPaths || referencedTargets.contains($0.path))
+        }
+        let attachments: [SourceAttachment]
+        do { attachments = try Self.mergedSources(lateAttachments, pendingAttachments) }
+        catch { self.error = error.localizedDescription; return false }
+        let attachmentPaths = Set(attachments.map(\.path))
+        let allOriginalAttachmentsRetained = (latest.attachments ?? []).allSatisfy { attachmentPaths.contains($0.path) }
+        let verified = (latest.capturedSourcePaths ?? []).filter { path in
+            guard referencePaths.contains(path) else { return false }
+            return allOriginalAttachmentsRetained || attachmentPaths.contains(queuedEditorReferenceTargets[path] ?? path)
+        }
+        var settings = codexSettings
+        settings.reasoningEffort = reasoningEffort.rawValue
+        queuedRequests[index].content = prompt
+        queuedRequests[index].attachments = attachments.isEmpty ? nil : attachments
+        queuedRequests[index].codexSettings = settings
+        queuedRequests[index].capturedSourcePaths = verified.isEmpty ? nil : verified
+        prepareQueuedSources(for: id)
+        restoreQueuedRequestComposerDraft()
+        refreshSteeringAvailability()
+        autosave()
+        drainQueueIfPossible()
+        return true
+    }
+
+    func cancelEditingQueuedRequest() {
+        guard editingQueuedRequestID != nil else { return }
+        restoreQueuedRequestComposerDraft()
+        refreshSteeringAvailability()
+        autosave()
+        drainQueueIfPossible()
+    }
+
+    func endEditingQueuedRequest(id: UUID) {
+        guard editingQueuedRequestID == id else { return }
+        cancelEditingQueuedRequest()
+    }
+
+    private func restoreQueuedRequestComposerDraft() {
+        cancelQueuedAttachmentRead()
+        let draft = queuedRequestComposerDraft
+        queuedRequestComposerDraft = nil
+        editingQueuedRequestID = nil
+        queuedEditorInitialAttachments = []
+        queuedEditorReferenceTargets = [:]
+        if let draft {
+            prompt = draft.prompt
+            pendingAttachments = draft.attachments
+            codexSettings = draft.codexSettings
+        }
+    }
+
+    func removeQueuedRequest(id: UUID) {
+        guard id != isSendingQueuedRequestID else { return }
+        queueSourceTasks.removeValue(forKey: id)?.cancel()
+        queueSourceTokens.removeValue(forKey: id)
+        preparingQueuedRequestIDs.remove(id)
+        queuedRequestErrors.removeValue(forKey: id)
+        queuedRequests.removeAll { $0.id == id }
+        if editingQueuedRequestID == id { restoreQueuedRequestComposerDraft() }
+        refreshSteeringAvailability()
+        autosave()
+        drainQueueIfPossible()
+    }
+
+    func moveQueuedRequest(id: UUID, beforeID: UUID?) {
+        guard id != beforeID, id != isSendingQueuedRequestID,
+              let index = queuedRequests.firstIndex(where: { $0.id == id }),
+              beforeID == nil || queuedRequests.contains(where: { $0.id == beforeID }) else { return }
+        let request = queuedRequests.remove(at: index)
+        let target = beforeID.flatMap { targetID in queuedRequests.firstIndex(where: { $0.id == targetID }) } ?? queuedRequests.endIndex
+        queuedRequests.insert(request, at: target)
+        autosave()
+    }
+
+    func resumeQueue() {
+        guard !queuedRequests.isEmpty else { return }
+        queuePaused = false
+        queuePauseReason = nil
+        queueCanAdvance = true
+        autosave()
+        drainQueueIfPossible()
+    }
+
+    func sendQueuedRequestNow(id: UUID) {
+        guard canSteerQueuedRequests, codex.canSteer, !preparingQueuedRequestIDs.contains(id),
+              let request = queuedRequests.first(where: { $0.id == id }), let auditID = projectActivity.activeTaskID else { return }
+        let token = operationID, session = projectSessionID
+        isSendingQueuedRequestID = id
+        refreshSteeringAvailability()
+        steeringTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let content = request.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Use the attached source files as additional information for the current design request." : request.content
+                let origin = request.selection.flatMap { selection in self.revisions.first { $0.id == selection.revisionID }?.model }
+                let turn = try await self.codex.steer(prompt: content, attachments: request.attachments ?? [],
+                                                      selection: request.selection, selectionModel: origin)
+                guard self.projectSessionID == session, self.operationID == token, self.isSendingQueuedRequestID == id else { return }
+                // Keep the item in the queue until this acknowledgement. A
+                // final result may arrive while the steering RPC is in flight.
+                let message = ChatMessage(role: "user", content: content, date: request.date, attachments: request.attachments,
+                                          selection: request.selection)
+                if let audit = self.projectActivity.task(id: auditID), let userMessageID = audit.userMessageID,
+                   let revision = self.revisions.last(where: { $0.userMessageID == userMessageID }),
+                   let responseID = revision.responseMessageID,
+                   let responseIndex = self.messages.firstIndex(where: { $0.id == responseID }) {
+                    self.messages.insert(message, at: responseIndex)
+                } else { self.messages.append(message) }
+                self.projectActivity.acknowledgeSteering(taskID: auditID, requestID: id, messageID: message.id,
+                                                        content: content, turn: turn)
+                self.queuedRequests.removeAll { $0.id == id }
+                self.queuedRequestErrors.removeValue(forKey: id)
+                self.isSendingQueuedRequestID = nil
+                self.steeringTask = nil
+                self.refreshSteeringAvailability()
+                self.autosave()
+                self.drainQueueIfPossible()
+            } catch {
+                guard self.projectSessionID == session, self.operationID == token, self.isSendingQueuedRequestID == id else { return }
+                self.isSendingQueuedRequestID = nil
+                self.steeringTask = nil
+                self.refreshSteeringAvailability()
+                // A failed RPC can have an uncertain delivery outcome. Do
+                // not automatically replay information Codex may have received.
+                self.queuePaused = true
+                let diagnostic = "Delivery to the running task could not be confirmed. The request remains queued; review the result before resuming.\n\n\(error.localizedDescription)"
+                self.queuedRequestErrors[id] = diagnostic
+                self.queuePauseReason = diagnostic
+                self.error = diagnostic
+                self.autosave()
+                self.drainQueueIfPossible()
+            }
+        }
+    }
+
+    private func setSteeringAvailable(_ available: Bool) {
+        steeringAvailable = available
+        refreshSteeringAvailability()
+    }
+
+    private func refreshSteeringAvailability() {
+        canSteerQueuedRequests = steeringAvailable && isWorking && generationFeedback != nil &&
+            isSendingQueuedRequestID == nil && editingQueuedRequestID == nil
+    }
+
+    private func prepareQueuedSources(for id: UUID) {
+        queueSourceTasks.removeValue(forKey: id)?.cancel()
+        queueSourceTokens.removeValue(forKey: id)
+        preparingQueuedRequestIDs.remove(id)
+        guard let request = queuedRequests.first(where: { $0.id == id }) else { return }
+        let captured = request.attachments ?? []
+        let references = SourceImport.referencedURLs(in: request.content)
+        let urls = unpreparedSourceURLs(for: request)
+        let missingPaths = Set(urls.map { $0.standardizedFileURL.path })
+        let verified = Self.uniqueReferencePaths(references.filter { !missingPaths.contains($0.standardizedFileURL.path) })
+        if let index = queuedRequests.firstIndex(where: { $0.id == id }) {
+            queuedRequests[index].capturedSourcePaths = verified.isEmpty ? nil : verified
+        }
+        guard !urls.isEmpty else {
+            queuedRequestErrors.removeValue(forKey: id)
+            return
+        }
+        let token = UUID(), session = projectSessionID
+        queueSourceTokens[id] = token
+        preparingQueuedRequestIDs.insert(id)
+        queueSourceTasks[id] = Task { [weak self] in
+            do {
+                let read = try await Task.detached(priority: .userInitiated) { try SourceImport.load(urls: urls) }.value
+                guard let self, self.projectSessionID == session, self.queueSourceTokens[id] == token,
+                      let index = self.queuedRequests.firstIndex(where: { $0.id == id }) else { return }
+                self.queuedRequests[index].attachments = try Self.mergedSources(captured, read)
+                self.queuedRequests[index].capturedSourcePaths = Self.uniqueReferencePaths(references)
+                self.finishQueuedSourcePreparation(id: id)
+                self.queuedRequestErrors.removeValue(forKey: id)
+                self.autosave()
+                self.drainQueueIfPossible()
+            } catch {
+                guard let self, self.projectSessionID == session, self.queueSourceTokens[id] == token else { return }
+                self.finishQueuedSourcePreparation(id: id)
+                self.queuePaused = true
+                let diagnostic = "A queued request's source files could not be prepared. The request remains queued.\n\n\(error.localizedDescription)"
+                self.queuedRequestErrors[id] = diagnostic
+                self.queuePauseReason = diagnostic
+                self.error = diagnostic
+                self.autosave()
+            }
+        }
+    }
+
+    private func finishQueuedSourcePreparation(id: UUID) {
+        queueSourceTasks.removeValue(forKey: id)
+        queueSourceTokens.removeValue(forKey: id)
+        preparingQueuedRequestIDs.remove(id)
+    }
+
+    private func drainQueueIfPossible() {
+        guard queueCanAdvance, !queuePaused, !isWorking, isSendingQueuedRequestID == nil,
+              editingQueuedRequestID == nil, let first = queuedRequests.first,
+              !preparingQueuedRequestIDs.contains(first.id) else { return }
+        if !unpreparedSourceURLs(for: first).isEmpty { prepareQueuedSources(for: first.id); return }
+        queuedRequests.removeFirst()
+        queuedRequestErrors.removeValue(forKey: first.id)
+        // startRequest saves the queue removal together with the sent user
+        // message and audit. Never persist an intermediate handoff that could
+        // lose the request from both pending work and conversation history.
+        startRequest(first)
+    }
+
+    private func unpreparedSourceURLs(for request: ProjectQueuedRequest) -> [URL] {
+        let verifiedReferences = Set(request.capturedSourcePaths ?? [])
+        let capturedFiles = Set((request.attachments ?? []).map {
+            URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path
+        })
+        return SourceImport.referencedURLs(in: request.content).filter { url in
+            guard url.host == nil || url.host == "" || url.host?.lowercased() == "localhost" else { return true }
+            // Exact original references remain authoritative even if a file
+            // alias was removed or now points at different source bytes.
+            if verifiedReferences.contains(url.standardizedFileURL.path) { return false }
+            return !capturedFiles.contains(url.standardizedFileURL.resolvingSymlinksInPath().path)
+        }
+    }
+
+    private static func uniqueReferencePaths(_ urls: [URL]) -> [String] {
+        var seen = Set<String>()
+        return urls.map { $0.standardizedFileURL.path }.filter { seen.insert($0).inserted }
+    }
+
+    private func scheduleDebouncedAutosave() {
+        guard canSaveProject else { return }
+        // Invalidate older in-flight writes immediately, and coalesce typing
+        // or divider dragging before serializing the complete project.
+        autosaveSequence += 1
+        // Observation notifies on every assignment. Typing must not invalidate
+        // views that show the unchanged dirty state.
+        if !hasUnsavedChanges { hasUnsavedChanges = true }
+        autosaveDebounceTask?.cancel()
+        let session = projectSessionID
+        autosaveDebounceTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(650)) } catch { return }
+            guard let self, self.projectSessionID == session, !Task.isCancelled else { return }
+            self.autosaveDebounceTask = nil
+            self.autosave()
+        }
+    }
+
+    private func scheduleQueueAfterBusyOperation() {
+        guard queueCanAdvance, !queuePaused, !queuedRequests.isEmpty else { return }
+        let session = projectSessionID
+        Task { [weak self] in
+            await Task.yield()
+            guard let self, self.projectSessionID == session, !self.isWorking, !self.queuePaused else { return }
+            if let error = self.error {
+                self.queuePaused = true
+                self.queuePauseReason = error
+                self.autosave()
+            } else { self.drainQueueIfPossible() }
+        }
+    }
+
+    private func resetQueueWork() {
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        steeringTask?.cancel(); steeringTask = nil
+        for task in queueSourceTasks.values { task.cancel() }
+        queueSourceTasks.removeAll(); queueSourceTokens.removeAll(); preparingQueuedRequestIDs = []
+        isSendingQueuedRequestID = nil; editingQueuedRequestID = nil
+        cancelQueuedAttachmentRead()
+        queuedRequestComposerDraft = nil
+        queuedEditorInitialAttachments = []
+        queuedEditorReferenceTargets = [:]
+        isReadingDraftAttachments = false
+        queuedRequestErrors = [:]; queuePauseReason = nil
+        queueCanAdvance = false
+        setSteeringAvailable(false)
+    }
+
+    private func waitForQueuedSources() async {
+        for task in Array(queueSourceTasks.values) { await task.value }
+    }
+
+    private func startRequest(_ request: ProjectQueuedRequest) {
+        guard !isWorking else { return }
+        queueCanAdvance = false
+        setSteeringAvailable(false)
+        let hasImages = (request.attachments ?? []).contains(where: \.isImage)
+        let fallback = hasImages
+            ? "Create or refine the design using the attached image references and any attached source files. Explain any dimensional assumptions."
+            : "Import the attached source design as faithfully as possible. Explain any unsupported features; do not substitute another design."
+        let text = request.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback : request.content
+        let previous = current
+        let previousLayout = selectedPartLayout
+        let previouslyHidden = hiddenPartIDs
+        let sourceRevisionID = selectedRevisionID
+        let previousColors = Self.completePartColors(in: previousLayout.nodes,
+            stored: revisions.first(where: { $0.id == sourceRevisionID })?.partColors ?? [:])
+        let previousPreview = posedPreview
+        let previousSolidColors = PartColorState.solidColors(in: previousLayout.nodes, overrides: previousColors)
+        let previousHiddenSolids = hiddenSolids
+        let versions = ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID)
+        let selectionModels = Dictionary(uniqueKeysWithValues: revisions.map { ($0.id, $0.model) })
+        let selectionModel = request.selection.flatMap { selectionModels[$0.revisionID] }
+        let history = messages
+        let attached = request.attachments ?? []
+        let userMessage = ChatMessage(role: "user", content: text, attachments: attached.isEmpty ? nil : attached,
+                                      selection: request.selection)
+        messages.append(userMessage)
+        error = nil; notice = nil; isWorking = true; activity = "Designing…"
+        let token = UUID(); operationID = token
+        let feedback = CodexConversationFeedback()
+        generationFeedback = feedback
+        let settings = request.codexSettings ?? codexSettings
+        let vendor = settings.vendor
+        let path = vendor.configuredExecutable, modelName = settings.model, runtime = python, cores = threads
+        let effort = CodexReasoningEffort(rawValue: settings.reasoningEffort) ?? .defaultConfiguration
+        let catalog = CodexModelCatalog.catalog(for: vendor)
+        let modelStatus = vendor.displayName + " · " + CodexModelSelection.statusLabel(modelID: modelName, effort: effort,
+                                                          models: catalog.matches(executable: path) ? catalog.models : [],
+                                                          configuredModelID: catalog.matches(executable: path) ? catalog.configuredModelID : nil,
+                                                          configuredReasoningEffort: catalog.matches(executable: path) ? catalog.configuredReasoningEffort : nil)
+        projectActivity.beginCodex(userMessageID: userMessage.id, agent: vendor, model: modelName, effort: effort.rawValue)
+        autosave()
+        operation = Task { [self] in
+            let progress: @Sendable (String) -> Void = { [weak self] status in
+                feedback.enqueueActivity(status)
+                Task { @MainActor in
+                    self?.drainGenerationFeedback(feedback, token: token)
+                }
+            }
+            let commentary: @Sendable (String, CodexProgressMessage) -> Void = { [weak self] scope, message in
+                feedback.enqueue(message, scope: scope)
+                Task { @MainActor in
+                    self?.drainGenerationFeedback(feedback, token: token)
+                }
+            }
+            let toolActivity: @Sendable (String, ProjectActivityEvent) -> Void = { [weak self] scope, event in
+                feedback.enqueue(event, scope: scope)
+                Task { @MainActor in self?.drainGenerationFeedback(feedback, token: token) }
+            }
+            func briefDiagnostic(_ failure: Error) -> String {
+                EngineFailureDiagnostic.repairText(for: failure)
+            }
+            do {
+                activity = "Reading referenced source files…"
+                runningCodexSelection = modelStatus
+                // Snapshot only explicit source-file references. The agent
+                // chooses whether to inspect directories or invoke a converter.
+                let sourceURLs = unpreparedSourceURLs(for: request)
+                let read = try await Task.detached(priority: .userInitiated) { try SourceImport.load(urls: sourceURLs) }.value
+                guard operationID == token else { return }
+                try Task.checkCancellation()
+                let sources = try Self.mergedSources(attached, read)
+                if let index = messages.firstIndex(where: { $0.id == userMessage.id }) {
+                    messages[index].attachments = sources.isEmpty ? nil : sources
+                }
+                autosave()
+                guard vendor.resolveExecutable(path) != nil else { throw RADError.message(vendor.setupMessage) }
+                let result = try await codex.generate(vendor: vendor, prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
+                                                    executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
+                                                    onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
+                                                    python: runtime, threads: cores, engine: engine, currentPreview: previousPreview,
+                                                    viewport: viewportView, hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
+                                                    onSteeringAvailability: { [weak self] available in
+                    Task { @MainActor in
+                        guard let self, self.operationID == token else { return }
+                        self.setSteeringAvailable(available)
+                    }
+                }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
+                // Take the single-use validated geometry before any early exit,
+                // so the service never retains it past this request.
+                var validatedPreview: PreviewMesh?, validatedPrintPreview: PreviewMesh?
+                if case .ready(let candidate) = result {
+                    (validatedPreview, validatedPrintPreview) = codex.validatedPreviews(for: candidate)
+                }
+                guard operationID == token else { return }
+                drainGenerationFeedback(feedback, token: token)
+                try Task.checkCancellation()
+                var spec: ModelSpec
+                switch result {
+                case .ready(let project): spec = project
+                case .response(let message):
+                    try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
+                                                  matching: previous, startedWith: previousColors)
+                    finishConversationResponse(message)
+                    return
+                }
+                activity = "Building solid geometry…"
+                var preview: PreviewMesh
+                var printPreview: PreviewMesh?
+                do {
+                    if let validated = validatedPreview {
+                        preview = validated
+                        recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
+                            title: "Final design matches validated CAD geometry", status: "completed",
+                            output: "Reused the geometry built through RAD tools; no additional program replay was needed."))
+                    } else {
+                        recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
+                            title: "Validate final CAD program", status: "running"))
+                        preview = try await engine.buildPreview(spec, python: runtime, threads: cores)
+                        recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
+                            title: "Validate final CAD program", status: "completed",
+                            output: "\(preview.solids) valid solids; volume \(preview.volume) mm³."))
+                    }
+                    guard operationID == token else { return }
+                    try Task.checkCancellation()
+                    printPreview = try await validatedPrintVersion(of: spec, design: preview, reusing: validatedPrintPreview,
+                                                                   python: runtime, threads: cores)
+                    guard operationID == token else { return }
+                    try Task.checkCancellation()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard operationID == token else { return }
+                    try Task.checkCancellation()
+                    // Repair only a design the worker ran and rejected; runtime,
+                    // sandbox, time-limit and engine failures stand as they are.
+                    guard let failure = error as? EngineBuildFailure, failure.isRepairable else { throw error }
+                    let diagnostic = briefDiagnostic(failure)
+                    recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
+                        title: "Final CAD validation failed", status: "failed", output: failure.message))
+                    messages.append(ChatMessage(role: "system", content: "CAD validation failed: \(diagnostic)\nRepairing the design (one attempt)."))
+                    activity = "Repairing the geometry…"
+                    autosave()
+                    let repairRequest = """
+                    Repair the current design for the original request below. The CAD engine rejected its CAD program.
+
+                    Original request: \(text)
+                    CAD validation error: \(diagnostic)
+
+                    Preserve the intended shape and dimensions. Fix or simplify the failing operations and return the complete replacement design.
+                    """
+                    let repairResult = try await codex.generate(vendor: vendor, prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout, partColors: previousColors,
+                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
+                                                     onMessage: { commentary("repair", $0) }, onActivity: { toolActivity("repair", $0) },
+                                                     python: runtime, threads: cores, engine: engine, viewport: viewportView,
+                                                     hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
+                                                     onSteeringAvailability: { [weak self] available in
+                        Task { @MainActor in
+                            guard let self, self.operationID == token else { return }
+                            self.setSteeringAvailable(available)
+                        }
+                    }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
+                    if case .ready(let candidate) = repairResult {
+                        (validatedPreview, validatedPrintPreview) = codex.validatedPreviews(for: candidate)
+                    }
+                    guard operationID == token else { return }
+                    drainGenerationFeedback(feedback, token: token)
+                    try Task.checkCancellation()
+                    switch repairResult {
+                    case .ready(let project): spec = project
+                    case .response(let message):
+                        try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
+                                                      matching: previous, startedWith: previousColors)
+                        finishConversationResponse(message)
+                        return
+                    }
+                    activity = "Validating the repaired geometry…"
+                    if let validated = validatedPreview { preview = validated }
+                    else { preview = try await engine.buildPreview(spec, python: runtime, threads: cores) }
+                    guard operationID == token else { return }
+                    try Task.checkCancellation()
+                    printPreview = try await validatedPrintVersion(of: spec, design: preview, reusing: validatedPrintPreview,
+                                                                   python: runtime, threads: cores)
+                    guard operationID == token else { return }
+                    try Task.checkCancellation()
+                    messages.append(ChatMessage(role: "system", content: "CAD repair passed solid geometry validation."))
+                    recordTaskEvent(ProjectActivityEvent(id: "repair:validation", category: "validation",
+                        title: "Repaired design passed CAD validation", status: "completed",
+                        output: "\(preview.solids) valid solids; volume \(preview.volume) mm³."))
+                    autosave()
+                }
+                guard operationID == token else { return }
+                try Task.checkCancellation()
+                let sourceRevision = revisions.first(where: { $0.id == sourceRevisionID })
+                if let previous, sourceRevision?.model != previous {
+                    throw RADError.message("The original design version changed before the update could be applied.")
+                }
+                let liveLayout = sourceRevision?.partLayout ?? previousLayout
+                let liveHidden = Set(sourceRevision?.hiddenSolids ?? [])
+                let hiddenIDs = sourceRevision?.hiddenSolids == nil ? previouslyHidden : Set(liveLayout.nodes.flatMap(\.flattened).filter {
+                    !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: liveHidden)
+                }.map(\.id))
+                // The printing views and export reuse the validated printing version.
+                if let printPreview { printVersions[Self.printKey(preview)] = printPreview }
+                try commit(spec, preview: preview, previousLayout: liveLayout, previouslyHidden: hiddenIDs, userMessageID: userMessage.id,
+                           previousColors: Self.completePartColors(in: liveLayout.nodes, stored: sourceRevision?.partColors ?? [:]),
+                           colorChanges: codex.partColorChanges,
+                           startedColors: previousColors)
+            } catch is CancellationError {
+                if operationID == token {
+                    queuePaused = true; queueCanAdvance = false
+                    setSteeringAvailable(false)
+                    finishGenerationFeedback()
+                    finishTaskAudit(status: "canceled")
+                    messages.append(ChatMessage(role: "system", content: "Generation canceled. The last validated design is still available."))
+                    isWorking = false; activity = "Canceled"; operation = nil
+                    autosave()
+                }
+            } catch {
+                guard operationID == token else { return }
+                queuePaused = true; queueCanAdvance = false
+                queuePauseReason = error.localizedDescription
+                setSteeringAvailable(false)
+                finishGenerationFeedback()
+                recordTaskEvent(ProjectActivityEvent(id: "task:failure", category: "diagnostic",
+                    title: "Design task failed", status: "failed", output: error.localizedDescription))
+                finishTaskAudit(status: "failed")
+                self.error = error.localizedDescription
+                self.messages.append(ChatMessage(role: "system", content: "Design could not be completed: \(briefDiagnostic(error))"))
+                self.activity = "Design needs attention"; self.isWorking = false; self.operation = nil
+                self.autosave()
+            }
+        }
+    }
+
+    private func finishConversationResponse(_ response: String) {
+        // A question or explanation completes the turn without replacing the
+        // design. Keep pending work paused so the next composer submission can
+        // answer this response before unrelated queued refinements continue.
+        queuePaused = true; queueCanAdvance = false; queuePauseReason = nil
+        setSteeringAvailable(false)
+        finishGenerationFeedback()
+        finishTaskAudit(status: "completed")
+        messages.append(ChatMessage(role: "assistant", content: response, phase: "response"))
+        error = nil; activity = "Ready"; isWorking = false; operation = nil
+        autosave()
+    }
+
+    private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:], colorChanges: [CADPartColorChange] = [], startedColors: [String: PartColor] = [:]) throws {
+        let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
+        _ = try appendValidatedRevision(spec, preview: preview, previousLayout: previousLayout,
+            previouslyHidden: previouslyHidden, previousColors: previousColors, colorChanges: colorChanges,
+            startedColors: startedColors, date: response.date, userMessageID: userMessageID, responseMessageID: response.id)
+        finishGenerationFeedback()
+        finishTaskAudit(status: "completed")
+        messages.append(response)
+        activity = "Ready"; isWorking = false; operation = nil; error = nil
+        setSteeringAvailable(false)
+        queueCanAdvance = true
+        autosave()
+        drainQueueIfPossible()
+    }
+
+    /// Both agent entry points publish through the same revision transaction.
+    /// Callers own task completion; this operation never finishes another task.
+    @discardableResult
+    private func appendValidatedRevision(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout?,
+        previouslyHidden: Set<String>, previousColors: [String: PartColor], colorChanges: [CADPartColorChange],
+        startedColors: [String: PartColor], date: Date = Date(), userMessageID: UUID? = nil,
+        responseMessageID: UUID? = nil) throws -> UUID {
+        let defaults = Self.defaultParts(for: preview)
+        let layout = previousLayout?.reconciled(with: defaults, allowingPlacementChanges: Set(spec.reorganizePartIDs ?? [])) ?? PartLayout(nodes: defaults)
+        try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids)
+        let colors = try Self.partColors(applying: colorChanges, in: layout.nodes,
+                                        current: previousColors, startedWith: startedColors)
+        let hidden = Set(layout.nodes.flatMap(\.flattened).filter { previouslyHidden.contains($0.id) }.flatMap(\.solidIndices))
+        let revision = ProjectRevision(model: spec, date: date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
+                                      userMessageID: userMessageID, responseMessageID: responseMessageID,
+                                      partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash,
+                                      jointPositions: preview.assemblyPose?.positions)
+        revisions.append(revision)
+        selectedRevisionID = revision.id; builtRevisionID = revision.id
+        mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
+        viewportCommand = ViewportCommand(.fit)
+        return revision.id
+    }
+
+    private func drainGenerationFeedback(_ feedback: CodexConversationFeedback, token: UUID) {
+        guard operationID == token, generationFeedback === feedback else { return }
+        var conversation = messages
+        let update = feedback.apply(to: &conversation)
+        if update.messagesChanged { messages = conversation }
+        if let latestActivity = update.activity, activity != latestActivity { activity = latestActivity }
+        for event in update.events { recordTaskEvent(event) }
+    }
+
+    private func finishGenerationFeedback() {
+        runningCodexSelection = nil
+        guard let feedback = generationFeedback else { return }
+        var conversation = messages
+        let update = feedback.apply(to: &conversation)
+        if update.messagesChanged { messages = conversation }
+        for event in update.events { recordTaskEvent(event) }
+        feedback.close()
+        generationFeedback = nil
+    }
+
+    func recordTaskEvent(_ incoming: ProjectActivityEvent) {
+        projectActivity.record(incoming)
+    }
+
+    func recordTaskEvent(_ incoming: ProjectActivityEvent, taskID id: UUID) {
+        projectActivity.record(incoming, taskID: id)
+    }
+
+    private func finishTaskAudit(status: String) {
+        projectActivity.finishActive(status: status)
+    }
+
+    var isReadingPromptAttachments: Bool { isReadingDraftAttachments || isReadingQueuedAttachments }
+
+    func attachSourceFiles() {
+        guard !isReadingPromptAttachments else { return }
+        let editID = editingQueuedRequestID, session = projectSessionID
+        let panel = NSOpenPanel()
+        panel.title = "Attach images or CAD source"
+        panel.allowedContentTypes = [.image] + SourceImport.supportedExtensions.sorted().compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return }
+        guard projectSessionID == session, editingQueuedRequestID == editID else { return }
+        attachSourceFiles(urls: panel.urls)
+    }
+
+    func attachSourceFiles(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        readPromptAttachments(.files(urls))
+    }
+
+    func attachPromptImages(_ images: [PromptImagePayload]) {
+        guard !images.isEmpty else { return }
+        readPromptAttachments(.images(images))
+    }
+
+    private func readPromptAttachments(_ input: PromptAttachmentInput) {
+        guard promptAttachmentReads.count < SourceImport.maximumAttachmentCount else {
+            error = "Too many attachments are being added. Wait for them to finish, then try again."
+            return
+        }
+        promptAttachmentReads.append(input)
+        isReadingDraftAttachments = editingQueuedRequestID == nil
+        isReadingQueuedAttachments = editingQueuedRequestID != nil
+        guard queuedAttachmentTask == nil else { return }
+        let token = queuedAttachmentToken, session = projectSessionID, editID = editingQueuedRequestID
+        queuedAttachmentTask = Task { [weak self] in
+            while let self, self.projectSessionID == session, self.queuedAttachmentToken == token,
+                  self.editingQueuedRequestID == editID, !Task.isCancelled, !self.promptAttachmentReads.isEmpty {
+                let next = self.promptAttachmentReads.removeFirst()
+                do {
+                    let read = try await Task.detached(priority: .userInitiated) { try next.attachments() }.value
+                    guard self.projectSessionID == session, self.queuedAttachmentToken == token,
+                          self.editingQueuedRequestID == editID, !Task.isCancelled else { return }
+                    self.pendingAttachments = try Self.mergedSources(self.pendingAttachments, read)
+                } catch {
+                    guard self.projectSessionID == session, self.queuedAttachmentToken == token,
+                          self.editingQueuedRequestID == editID, !Task.isCancelled else { return }
+                    self.error = error.localizedDescription
+                }
+            }
+            guard let self, self.projectSessionID == session, self.queuedAttachmentToken == token else { return }
+            self.isReadingQueuedAttachments = false
+            self.isReadingDraftAttachments = false
+            self.queuedAttachmentTask = nil
+        }
+    }
+
+    private func waitForPromptAttachments() async {
+        while let task = queuedAttachmentTask { await task.value }
+    }
+
+    private func cancelQueuedAttachmentRead() {
+        queuedAttachmentTask?.cancel(); queuedAttachmentTask = nil
+        queuedAttachmentToken = UUID()
+        promptAttachmentReads = []
+        isReadingQueuedAttachments = false
+        isReadingDraftAttachments = false
+    }
+
+    func removeAttachment(id: UUID) { pendingAttachments.removeAll { $0.id == id } }
+
+    private var selectedPartLayout: PartLayout {
+        revisions.first(where: { $0.id == selectedRevisionID })?.partLayout ?? PartLayout(nodes: partTree)
+    }
+
+    var collapsedPartFolderIDs: Set<String> { Set(selectedPartLayout.collapsedNodeIDs) }
+
+    private var hiddenPartIDs: Set<String> {
+        Set(partTree.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: hiddenSolids) }.map(\.id))
+    }
+
+    func selectParts(_ solids: Set<Int>, extending: Bool = false) {
+        let valid = solids.intersection(Set(0..<currentSolidCount))
+        selectedSolids = extending ? selectedSolids.symmetricDifference(valid) : valid
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: [], in: partTree)
+    }
+
+    func selectPartNodes(_ ids: Set<String>, extending: Bool = false) {
+        let nodes = partTree.flatMap(\.flattened)
+        let valid = ids.intersection(Set(nodes.map(\.id)))
+        let clickedSolids = Set(nodes.filter { valid.contains($0.id) }.flatMap { $0.allSolidIndices })
+        var preferred = valid
+        if extending {
+            preferred.formUnion(selectedPartNodeIDs)
+            for node in nodes where valid.contains(node.id) && node.allSolidIndices.isEmpty && selectedPartNodeIDs.contains(node.id) {
+                preferred.remove(node.id)
+            }
+            if !clickedSolids.isEmpty && clickedSolids.isSubset(of: selectedSolids) { selectedSolids.subtract(clickedSolids) }
+            else { selectedSolids.formUnion(clickedSolids) }
+        } else { selectedSolids = clickedSolids }
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: partTree)
+    }
+
+    func togglePartNode(_ id: String, extendingRange: Bool = false) {
+        guard extendingRange else { selectPartNodes([id], extending: true); return }
+        let tree = partTree
+        let range = PartSelection.range(toggling: id, in: tree,
+                                        collapsedNodeIDs: Set(selectedPartLayout.collapsedNodeIDs),
+                                        selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs)
+        guard let clicked = range.first(where: { $0.id == id }) else {
+            selectPartNodes([id], extending: true)
+            return
+        }
+        let solids = Set(range.flatMap(\.allSolidIndices))
+        let ids = Set(range.map(\.id))
+        let deselecting = PartSelectionPresentation(solidIndices: clicked.allSolidIndices, selectedSolids: selectedSolids,
+                                                   pointSelectedSolids: [], explicitlySelected: selectedPartNodeIDs.contains(id)).isFull
+        let preferred = deselecting ? selectedPartNodeIDs.subtracting(range.flatMap(\.allNodeIDs)) : selectedPartNodeIDs.union(ids)
+        if deselecting { selectedSolids.subtract(solids) }
+        else { selectedSolids.formUnion(solids) }
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: tree)
+    }
+
+    /// Replaces the viewport's point selection, keeping valid points on
+    /// visible parts of the displayed build in their selection order.
+    func selectPoints(_ points: [CADSurfacePoint]) {
+        guard let preview = displayedMesh else { return }
+        var seen = Set<CADSurfacePoint>()
+        let valid = points.filter {
+            $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hiddenSolids.contains($0.solidIndex) &&
+                seen.insert($0).inserted
+        }
+        let geometry = displayedPointGeometry(preview)
+        selectedPointsGeometry = geometry
+        pointSelectionOrigin = valid.isEmpty ? nil : PointSelectionOrigin(geometry: geometry, points: valid)
+        selectedPoints = valid
+    }
+
+    func clearSelections() {
+        selectedSolids = []
+        selectedPartNodeIDs = []
+        pointSelectionOrigin = nil
+        selectedPoints = []
+        refreshMeasurements()
+    }
+
+    private func displayedPointGeometry(_ preview: PreviewMesh) -> PointSelectionGeometry {
+        PointSelectionGeometry(preview: preview, printVersion: showsPrintView && printVersionView)
+    }
+
+    /// Points lie on one build's surfaces. When the design and its printing
+    /// version replace each other, show the user's points only on the build
+    /// where they were selected; the other build shows none.
+    private func showPointSelection() {
+        guard let preview = displayedMesh else { return }
+        let shown = displayedPointGeometry(preview)
+        let changed = selectedPointsGeometry.map { Self.printKey($0.preview) } != Self.printKey(preview)
+        selectedPointsGeometry = shown
+        guard changed else { return }
+        guard let origin = pointSelectionOrigin, Self.printKey(origin.geometry.preview) == Self.printKey(preview) else {
+            selectedPoints = []
+            return
+        }
+        selectedPoints = origin.points.filter { !hiddenSolids.contains($0.solidIndex) }
+    }
+
+    private func cancelMeasurement() {
+        measurementTask?.cancel()
+        measurementTask = nil
+        measurementToken = UUID()
+        isMeasuring = false
+    }
+
+    private func finishAssemblyMotion(cancelActiveGrab: Bool = false) async {
+        if cancelActiveGrab && isGrabbingAssembly { cancelAssemblyGrab() }
+        await assemblyMotionTask?.value
+        // One worker drains the latest queued pointer target through mouse-up.
+        await assemblyGrabTask?.value
+    }
+
+    func beginAssemblyGrab(ownerID: UUID, solidIndex: Int, point: [Double], projection: AssemblyGrabProjection) -> Bool {
+        guard canManipulateAssembly, !isSolvingAssembly, assemblyGrabSession == nil,
+              !hiddenSolids.contains(solidIndex), let preview = mesh, (0..<preview.solids).contains(solidIndex),
+              let motion = preview.assemblyMotion, let pose = assemblyPose, let revisionID = selectedRevisionID else { return false }
+        do {
+            guard let context = try motion.prepareGrab(parts: preview.parts ?? partTree, positions: pose.positions,
+                                                       solidIndex: solidIndex, point: point, projection: projection) else { return false }
+            assemblyGrabSession = AssemblyGrabSession(ownerID: ownerID, revisionID: revisionID,
+                projectSessionID: projectSessionID, geometryToken: assemblyMotionToken, solidIndex: solidIndex, context: context)
+            isGrabbingAssembly = true
+            assemblyMotionError = nil
+            return true
+        } catch {
+            assemblyMotionError = error.localizedDescription
+            return false
+        }
+    }
+
+    func moveAssemblyGrab(ownerID: UUID, screenPoint: [Double]) {
+        guard let session = assemblyGrabSession, session.ownerID == ownerID, !session.ended,
+              canManipulateAssembly, screenPoint.count == 2,
+              screenPoint.allSatisfy({ $0.isFinite && abs($0) <= 1e9 }), session.lastTarget != screenPoint else { return }
+        session.lastTarget = screenPoint
+        session.pendingTarget = screenPoint
+        if assemblyGrabTask == nil { startAssemblyGrabWorker(session) }
+    }
+
+    func endAssemblyGrab(ownerID: UUID) {
+        guard let session = assemblyGrabSession, session.ownerID == ownerID, !session.ended else { return }
+        session.ended = true
+        isGrabbingAssembly = false
+        if assemblyGrabTask == nil { assemblyGrabSession = nil }
+    }
+
+    func cancelAssemblyGrab(ownerID: UUID? = nil) {
+        guard let session = assemblyGrabSession, ownerID == nil || session.ownerID == ownerID else { return }
+        assemblyGrabSession = nil
+        assemblyGrabTask?.cancel(); assemblyGrabTask = nil
+        isGrabbingAssembly = false
+        if assemblyMotionTask == nil { isSolvingAssembly = false }
+        requestedJointPositions = assemblyPose?.positions ?? [:]
+    }
+
+    private func isCurrentAssemblyGrab(_ session: AssemblyGrabSession) -> Bool {
+        assemblyGrabSession === session && projectSessionID == session.projectSessionID &&
+            selectedRevisionID == session.revisionID && assemblyMotionToken == session.geometryToken && !isWorking
+    }
+
+    private func startAssemblyGrabWorker(_ session: AssemblyGrabSession) {
+        isSolvingAssembly = true
+        assemblyGrabTask = Task { [weak self] in
+            while let self, self.isCurrentAssemblyGrab(session), !Task.isCancelled {
+                guard let target = session.pendingTarget else {
+                    self.assemblyGrabTask = nil
+                    self.isSolvingAssembly = false
+                    if session.ended { self.assemblyGrabSession = nil }
+                    return
+                }
+                session.pendingTarget = nil
+                let context = session.context, positions = self.assemblyPose?.positions ?? [:]
+                let solver = self.assemblyGrabSolver
+                let calculation = Task.detached(priority: .userInitiated) { try await solver(context, positions, target) }
+                do {
+                    let pose = try await withTaskCancellationHandler { try await calculation.value }
+                        onCancel: { calculation.cancel() }
+                    guard self.isCurrentAssemblyGrab(session), !Task.isCancelled else { return }
+                    self.acceptAssemblyPose(pose, revisionID: session.revisionID)
+                } catch is CancellationError {
+                    if self.isCurrentAssemblyGrab(session) { self.cancelAssemblyGrab(ownerID: session.ownerID) }
+                    return
+                } catch {
+                    guard self.isCurrentAssemblyGrab(session), !Task.isCancelled else { return }
+                    self.assemblyMotionError = error.localizedDescription
+                    // Retain the last valid pose and allow the next cursor
+                    // target to recover without abandoning the grab.
+                }
+            }
+        }
+    }
+
+    private func acceptAssemblyPose(_ pose: AssemblyPose, revisionID: UUID, fit: Bool = false) {
+        assemblyMotionError = nil
+        if assemblyPose != pose {
+            assemblyPose = pose
+            requestedJointPositions = pose.positions
+            agentStateGeneration &+= 1
+            refreshMeasurements()
+        }
+        if fit { viewportCommand = ViewportCommand(.fit) }
+        if let index = revisions.firstIndex(where: { $0.id == revisionID }), revisions[index].jointPositions != pose.positions {
+            revisions[index].jointPositions = pose.positions
+            scheduleDebouncedAutosave()
+        }
+    }
+
+    private func loadAssemblyPose() {
+        cancelAssemblyGrab()
+        assemblyMotionTask?.cancel(); assemblyMotionTask = nil
+        assemblyMotionToken = UUID()
+        isSolvingAssembly = false; assemblyMotionError = nil
+        assemblyPose = mesh?.assemblyPose
+        requestedJointPositions = assemblyPose?.positions ?? [:]
+        guard let motion = mesh?.assemblyMotion else { return }
+        let saved = revisions.first(where: { $0.id == selectedRevisionID })?.jointPositions
+        if let saved, saved != assemblyPose?.positions {
+            requestAssemblyPose(positions: saved, driving: nil, fit: true)
+        } else if assemblyPose == nil {
+            requestAssemblyPose(positions: Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) }),
+                                driving: nil, fit: true)
+        }
+    }
+
+    func jointPosition(_ joint: AssemblyJoint) -> Double {
+        requestedJointPositions[joint.id] ?? assemblyPose?.positions[joint.id] ?? joint.position
+    }
+
+    func setJointPosition(_ id: String, to value: Double) {
+        guard !isWorking, value.isFinite, let motion = mesh?.assemblyMotion,
+              motion.joints.contains(where: { $0.id == id && $0.type != .fixed }), motion.driver(of: id) == nil else { return }
+        cancelAssemblyGrab()
+        var positions = requestedJointPositions
+        positions[id] = value
+        requestAssemblyPose(positions: positions, driving: id)
+    }
+
+    func resetAssemblyMotion() {
+        guard !isWorking, let motion = mesh?.assemblyMotion else { return }
+        cancelAssemblyGrab()
+        requestAssemblyPose(positions: Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) }), driving: nil)
+    }
+
+    private func requestAssemblyPose(positions: [String: Double], driving: String?, fit: Bool = false) {
+        guard let preview = mesh, let motion = preview.assemblyMotion, let revisionID = selectedRevisionID else { return }
+        assemblyMotionTask?.cancel()
+        let token = UUID(); assemblyMotionToken = token
+        requestedJointPositions = positions
+        isSolvingAssembly = true; assemblyMotionError = nil
+        let parts = preview.parts ?? partTree
+        let calculation = Task.detached(priority: .userInitiated) {
+            try motion.solve(parts: parts, positions: positions, driving: driving)
+        }
+        assemblyMotionTask = Task { [weak self] in
+            do {
+                let pose = try await withTaskCancellationHandler { try await calculation.value }
+                    onCancel: { calculation.cancel() }
+                guard let self, self.assemblyMotionToken == token, self.selectedRevisionID == revisionID,
+                      self.mesh?.buildID == preview.buildID, !Task.isCancelled else { return }
+                self.isSolvingAssembly = false; self.assemblyMotionTask = nil
+                self.acceptAssemblyPose(pose, revisionID: revisionID, fit: fit)
+            } catch is CancellationError {
+            } catch {
+                guard let self, self.assemblyMotionToken == token else { return }
+                self.isSolvingAssembly = false; self.assemblyMotionTask = nil
+                self.requestedJointPositions = self.assemblyPose?.positions ?? [:]
+                self.assemblyMotionError = error.localizedDescription
+            }
+        }
+    }
+
+    private static func printKey(_ preview: PreviewMesh) -> String { preview.buildID }
+
+    /// A final program that reads `rad.print` must also build a valid 3D
+    /// printing version with the design's parts before it is accepted.
+    private func validatedPrintVersion(of spec: ModelSpec, design: PreviewMesh, reusing reused: PreviewMesh?,
+                                       python: String, threads: Int) async throws -> PreviewMesh? {
+        guard design.printVersion == true else { return nil }
+        let event = "final:print-validation"
+        let printing: PreviewMesh
+        do {
+            if let reused {
+                printing = reused
+            } else {
+                recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
+                    title: "Validate 3D printing version", status: "running"))
+                printing = try await engine.buildPreview(spec, print: true, python: python, threads: threads)
+            }
+        } catch let failure as EngineBuildFailure {
+            recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
+                title: "3D printing version validation failed", status: "failed", output: failure.message))
+            throw EngineBuildFailure(kind: failure.kind, message: "The 3D printing version of this design failed. \(failure.message)",
+                report: "The rad.print = True build failed: " + EngineFailureDiagnostic.repairText(for: failure))
+        }
+        do { try PrintLayout.validateParts(of: printing, matching: design) }
+        catch {
+            recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
+                title: "3D printing version validation failed", status: "failed", output: error.localizedDescription))
+            throw error
+        }
+        recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
+            title: "3D printing version passed CAD validation", status: "completed",
+            output: reused == nil ? "\(printing.solids) valid solids; volume \(printing.volume) mm³."
+                : "Reused the 3D printing version built through RAD tools."))
+        return printing
+    }
+
+    private func printViewChanged(layoutChanged: Bool) {
+        cancelAssemblyGrab()
+        // Placing or unplacing the parts frames the view again. Switching
+        // between the design and its printing version keeps the camera.
+        if layoutChanged { fitsPrintViewWhenShown = true }
+        preparePrintView()
+        if !showsPrintView {
+            if fitsPrintViewWhenShown, mesh != nil { viewportCommand = ViewportCommand(.fit) }
+            fitsPrintViewWhenShown = false
+        }
+        refreshMeasurements()
+    }
+
+    private func printViewKey(for mesh: PreviewMesh) -> PrintViewKey {
+        PrintViewKey(build: Self.printKey(mesh), version: printVersionView, layout: printLayoutView)
+    }
+
+    /// Show the current build's printing version and/or its displayed
+    /// geometry oriented and packed once for all parts. Changing visibility
+    /// never repacks the plate.
+    private func preparePrintView() {
+        let build = mesh.flatMap { mesh -> (key: PrintViewKey, preview: PreviewMesh, model: ModelSpec)? in
+            let key = printViewKey(for: mesh)
+            guard let revision = revisions.first(where: { $0.id == selectedRevisionID }),
+                  revision.preview.map(Self.printKey) == key.build else { return nil }
+            return (key, mesh, revision.model)
+        }
+        for (key, task) in printPreviewTasks where key != build?.key.build {
+            task.cancel(); printPreviewTasks[key] = nil
+        }
+        guard showsPrintView, let build else {
+            printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
+            if printViewGeometry != nil { printViewGeometry = nil }
+            isPreparingPrintView = false
+            showPointSelection()
+            return
+        }
+        let key = build.key
+        if printViewGeometry?.key == key { return }
+        printViewTask?.cancel(); printViewTask = nil
+        let token = UUID(); printViewToken = token
+        let solids = PrintLayout.printedSolids(Set(0..<build.preview.solids), of: build.preview)
+        // Geometry and orientations found earlier this session show at once.
+        if let cached = cachedPrintView(key, build: build.preview, solids: solids) {
+            showPrintView(cached)
+            return
+        }
+        printViewGeometry = nil
+        isPreparingPrintView = true
+        printViewTask = Task { [weak self] in
+            var preparingVersion = key.version
+            do {
+                guard let self else { return }
+                var preview = build.preview
+                if key.version { preview = try await self.printVersion(of: build.preview, model: build.model) }
+                preparingVersion = false
+                var transforms: [Int: [Double]] = [:]
+                if key.layout {
+                    transforms = try await PrintLayout.transforms(for: solids,
+                        orientations: self.printOrientations(of: preview, solids: solids))
+                }
+                guard self.printViewToken == token, !Task.isCancelled else { return }
+                self.printViewTask = nil
+                self.showPrintView(PrintViewGeometry(key: key, preview: preview, transforms: transforms))
+                self.refreshMeasurements()
+            } catch is CancellationError {
+            } catch {
+                guard let self, self.printViewToken == token else { return }
+                self.isPreparingPrintView = false; self.printViewTask = nil
+                if preparingVersion {
+                    self.error = "The 3D printing version could not be prepared. \(error.localizedDescription)"
+                    self.printVersionView = false
+                } else {
+                    self.error = "The 3D printing layout could not be prepared. \(error.localizedDescription)"
+                    self.printLayoutView = false
+                }
+            }
+        }
+    }
+
+    private func cachedPrintView(_ key: PrintViewKey, build: PreviewMesh, solids: Set<Int>) -> PrintViewGeometry? {
+        var preview = build
+        if key.version, build.printVersion == true {
+            guard let printing = printVersions[key.build] else { return nil }
+            preview = printing
+        }
+        guard key.layout else { return PrintViewGeometry(key: key, preview: preview, transforms: [:]) }
+        guard let orientations = printOrientationCache[Self.printKey(preview)],
+              solids.isSubset(of: orientations.keys) else { return nil }
+        return PrintViewGeometry(key: key, preview: preview,
+                                 transforms: PrintLayout.transforms(for: solids, orientations: orientations))
+    }
+
+    private func showPrintView(_ geometry: PrintViewGeometry) {
+        printViewGeometry = geometry
+        isPreparingPrintView = false
+        showPointSelection()
+        if fitsPrintViewWhenShown {
+            fitsPrintViewWhenShown = false
+            viewportCommand = ViewportCommand(.fit)
+        }
+    }
+
+    /// The build's printing version. A program that never reads `rad.print`
+    /// prints its ordinary geometry.
+    private func printVersion(of preview: PreviewMesh, model: ModelSpec) async throws -> PreviewMesh {
+        guard preview.printVersion == true else { return preview }
+        let key = Self.printKey(preview)
+        if let cached = printVersions[key] { return cached }
+        let task: Task<PreviewMesh, Error>
+        if let pending = printPreviewTasks[key] { task = pending }
+        else {
+            let engine = printEngine, runtime = python, cores = threads
+            task = Task { @MainActor in
+                let result = try await engine.buildPreview(model, print: true, python: runtime, threads: cores)
+                try PrintLayout.validateParts(of: result, matching: preview)
+                return result
+            }
+            printPreviewTasks[key] = task
+        }
+        defer { if printPreviewTasks[key] == task { printPreviewTasks[key] = nil } }
+        let built = try await task.value
+        try Task.checkCancellation()
+        if let cached = printVersions[key] { return cached }
+        printVersions[key] = built
+        prunePrintGeometries()
+        return built
+    }
+
+    /// Print orientations for at least `solids` of `geometry`, found once
+    /// per geometry and part.
+    private func printOrientations(of geometry: PreviewMesh, solids: Set<Int>) async throws -> [Int: PrintOrientation] {
+        let key = Self.printKey(geometry)
+        let known = printOrientationCache[key] ?? [:]
+        let missing = solids.subtracting(known.keys)
+        guard !missing.isEmpty else { return known }
+        let found = try await engine.printOrientations(geometry, solids: missing, python: python, threads: threads)
+        try Task.checkCancellation()
+        var orientations = printOrientationCache[key] ?? [:]
+        orientations.merge(found) { current, _ in current }
+        printOrientationCache[key] = orientations
+        prunePrintGeometries()
+        return orientations
+    }
+
+    /// Keep printing versions and orientations only for builds retained by
+    /// the session history.
+    private func prunePrintGeometries() {
+        let builds = Set(revisions.compactMap { $0.preview.map(Self.printKey) })
+        printVersions = printVersions.filter { builds.contains($0.key) }
+        let geometries = builds.union(printVersions.values.map(Self.printKey))
+        printOrientationCache = printOrientationCache.filter { geometries.contains($0.key) }
+    }
+
+    private func resetPrintGeometry() {
+        printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
+        printPreviewTasks.values.forEach { $0.cancel() }
+        printPreviewTasks = [:]
+        printVersions = [:]
+        printOrientationCache = [:]
+        printViewGeometry = nil
+        isPreparingPrintView = false
+        fitsPrintViewWhenShown = false
+    }
+
+    private func refreshMeasurements() {
+        cancelMeasurement()
+        measurementError = nil
+        guard let preview = displayedMesh, hasMeasurementSelection else { measurementReport = nil; return }
+        let points = selectedPoints, solids = selectedSolids
+        let transforms = displayedSolidTransforms
+        let key = MeasurementKey(buildID: preview.buildID, points: points, solids: solids.sorted(),
+                                 transforms: AssemblySolidTransform.records(transforms))
+        if let cached = measurementCache[key] { measurementReport = cached; return }
+        do { measurementReport = try CADMeasurements.report(preview, points: points, solids: solids, solidTransforms: transforms) }
+        catch { measurementReport = nil; measurementError = error.localizedDescription; return }
+        // Two parts, or a point and a part, add the worker's minimum distance.
+        guard CADMeasurements.workerEntities(points: points, solids: solids) != nil else { return }
+        let token = measurementToken, sessionID = projectSessionID
+        let runtime = python, cores = threads
+        isMeasuring = true
+        measurementTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(120))
+                guard let self else { return }
+                let report = try await self.engine.measure(preview, points: points, solids: solids, solidTransforms: transforms,
+                                                          python: runtime, threads: cores)
+                guard self.measurementToken == token, self.projectSessionID == sessionID,
+                      self.displayedMesh?.buildID == preview.buildID, !Task.isCancelled else { return }
+                if self.measurementCache.count >= 128 { self.measurementCache.removeAll() }
+                self.measurementCache[key] = report
+                self.measurementReport = report
+                self.isMeasuring = false
+                self.measurementTask = nil
+            } catch is CancellationError {
+            } catch {
+                guard let self, self.measurementToken == token, self.projectSessionID == sessionID else { return }
+                self.measurementError = error.localizedDescription
+                self.isMeasuring = false
+                self.measurementTask = nil
+            }
+        }
+    }
+
+    private func colorTargets(for nodeID: String) -> [PartNode] {
+        let nodes = partTree.flatMap(\.flattened)
+        guard let clicked = nodes.first(where: { $0.id == nodeID }) else { return [] }
+        let clickedSolids = clicked.allSolidIndices
+        let targets = !clickedSolids.isEmpty && clickedSolids.isSubset(of: selectedPartSolids) ? selectedPartSolids : clickedSolids
+        return nodes.filter { !$0.solidIndices.isEmpty && !Set($0.solidIndices).isDisjoint(with: targets) }
+    }
+
+    func partColor(for nodeID: String) -> PartColor? {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return nil }
+        let targets = colorTargets(for: nodeID)
+        let colors = Self.completePartColors(in: partTree, stored: revision.partColors ?? [:])
+        guard let first = targets.first, let color = colors[first.id],
+              targets.allSatisfy({ colors[$0.id] == color }) else { return nil }
+        return color
+    }
+
+    func setPartColor(_ color: PartColor?, for nodeID: String) {
+        guard color?.isValid != false,
+              let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
+        let targets = colorTargets(for: nodeID)
+        guard !targets.isEmpty else { return }
+        var colors = revisions[index].partColors ?? [:]
+        for node in targets {
+            colors[node.id] = color ?? (node.color == nil ? nil : PartColorState.defaultFinish)
+        }
+        let changed = colors != (revisions[index].partColors ?? [:])
+        var recent = recentPartColors
+        if let color {
+            recent.removeAll { $0 == color }
+            recent.insert(color, at: 0)
+            recent = Array(recent.prefix(PartColor.maximumRecentCount))
+        }
+        guard changed || recent != recentPartColors else { return }
+        revisions[index].partColors = colors.isEmpty ? nil : colors
+        recentPartColors = recent
+        autosave()
+    }
+
+    /// Apply only a successful turn's staged display edits to its captured
+    /// source revision. Navigating history must not redirect those edits.
+    func applyAgentPartColorChanges(_ changes: [CADPartColorChange], to sourceRevisionID: UUID?,
+                                   matching source: ModelSpec?, startedWith snapshot: [String: PartColor]) throws {
+        guard !changes.isEmpty else { return }
+        guard let sourceRevisionID, let source,
+              let index = revisions.firstIndex(where: { $0.id == sourceRevisionID }),
+              revisions[index].model == source else {
+            throw RADError.message("The original design version changed before its colors could be applied.")
+        }
+        let revision = revisions[index]
+        let nodes = revision.partLayout?.nodes ?? revision.parts ?? revision.preview.map(Self.defaultParts(for:)) ?? []
+        let colors = try Self.partColors(applying: changes, in: nodes,
+                                        current: Self.completePartColors(in: nodes, stored: revision.partColors ?? [:]),
+                                        startedWith: snapshot)
+        revisions[index].partColors = colors.isEmpty ? nil : colors
+    }
+
+    /// A task can replace existing colors; a newer edit made during that
+    /// task remains current on the physical parts it changed.
+    static func partColors(applying changes: [CADPartColorChange], in nodes: [PartNode],
+                           current: [String: PartColor], startedWith snapshot: [String: PartColor]) throws -> [String: PartColor] {
+        let retained = retainedPartColors(current, in: nodes) ?? [:]
+        let colors = completePartColors(in: nodes, stored: retained)
+        var result = try PartColorState.applyingPhysical(changes: changes, to: colors, in: nodes)
+        let physicalIDs = Set(nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
+        for id in snapshot.keys where physicalIDs.contains(id) && current[id] != snapshot[id] {
+            result[id] = current[id] ?? PartColorState.defaultFinish
+        }
+        return result
+    }
+
+    /// Capture every physical part's current RGB, including the neutral finish.
+    /// Stable IDs retain these values when a later build supplies new parts.
+    static func completePartColors(in nodes: [PartNode], stored: [String: PartColor]) -> [String: PartColor] {
+        let colors = PartColorState.resolved(in: nodes, overrides: stored)
+        var result: [String: PartColor] = [:]
+        for node in nodes.flatMap(\.flattened) where !node.solidIndices.isEmpty {
+            result[node.id] = colors[node.id] ?? PartColorState.defaultFinish
+        }
+        return result
+    }
+
+    /// Stable part identities preserve colors across refinements. Only an
+    /// explicit rebuild of the same program may migrate old generic IDs.
+    static func retainedPartColors(_ colors: [String: PartColor], in nodes: [PartNode],
+                                   remappingGenericFrom previous: [PartNode] = []) -> [String: PartColor]? {
+        let parts = nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }
+        let ids = Set(parts.map(\.id))
+        var result = colors.filter { ids.contains($0.key) }
+        for old in previous.flatMap(\.flattened) where old.solidIndices.count == 1 && old.id == "solid/\(old.solidIndices[0])" {
+            guard !ids.contains(old.id), let color = colors[old.id] else { continue }
+            let matches = parts.filter { $0.solidIndices == old.solidIndices }
+            if matches.count == 1, let id = matches.first?.id, result[id] == nil { result[id] = color }
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    func togglePartVisibility(_ solids: Set<Int>) {
+        let valid = solids.intersection(Set(0..<currentSolidCount))
+        guard !valid.isEmpty else { return }
+        if hiddenSolids.isDisjoint(with: valid) { hiddenSolids.formUnion(valid) }
+        else { hiddenSolids.subtract(valid) }
+        selectedSolids.subtract(hiddenSolids)
+        pointSelectionOrigin?.points.removeAll { hiddenSolids.contains($0.solidIndex) }
+        selectedPoints.removeAll { hiddenSolids.contains($0.solidIndex) }
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)
+        persistPartVisibility()
+    }
+
+    func hideSelectedParts() {
+        let visibleSelection = selectedPartSolids.subtracting(hiddenSolids)
+        guard !visibleSelection.isEmpty else { return }
+        hiddenSolids.formUnion(visibleSelection)
+        clearSelections()
+        persistPartVisibility()
+    }
+
+    func showAllParts() {
+        guard !hiddenSolids.isEmpty else { return }
+        hiddenSolids = []
+        persistPartVisibility()
+    }
+
+    private func persistPartVisibility() {
+        guard let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
+        revisions[index].hiddenSolids = hiddenSolids.sorted()
+        autosave()
+    }
+
+    func movePartNodes(_ ids: Set<String>, toParent parentID: String?) {
+        editPartLayout { try $0.move(ids, toParent: parentID) }
+    }
+
+    func createPartFolder(named name: String, parentID: String? = nil) {
+        editPartLayout { _ = try $0.createFolder(named: name, parentID: parentID) }
+    }
+
+    func renamePartNode(_ id: String, to name: String) {
+        editPartLayout { try $0.rename(id, to: name) }
+    }
+
+    func ungroupPartFolder(_ id: String) {
+        editPartLayout { try $0.ungroup(id) }
+    }
+
+    func isPartFolderExpanded(_ id: String) -> Bool {
+        !selectedPartLayout.collapsedNodeIDs.contains(id)
+    }
+
+    func setPartFolderExpanded(_ id: String, isExpanded: Bool) {
+        guard let node = partTree.flatMap(\.flattened).first(where: { $0.id == id }), node.isGroup,
+              isPartFolderExpanded(id) != isExpanded else { return }
+        editPartLayout { try $0.setExpanded(isExpanded, for: id) }
+    }
+
+    func resetPartHierarchy() {
+        guard let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }),
+              let defaults = revisions[index].parts ?? revisions[index].preview.map(Self.defaultParts(for:)) else { return }
+        let folderIDs = Set(defaults.flatMap(\.flattened).filter(\.isGroup).map(\.id))
+        let collapsed = selectedPartLayout.collapsedNodeIDs.filter { folderIDs.contains($0) }
+        revisions[index].partLayout = PartLayout(nodes: defaults, collapsedNodeIDs: collapsed)
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: [], in: defaults)
+        autosave()
+    }
+
+    private func editPartLayout(_ edit: (inout PartLayout) throws -> Void) {
+        guard let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
+        do {
+            var layout = selectedPartLayout
+            try edit(&layout)
+            try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: currentSolidCount)
+            revisions[index].partLayout = layout
+            selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: layout.nodes)
+            autosave()
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private static func mergedSources(_ existing: [SourceAttachment], _ added: [SourceAttachment]) throws -> [SourceAttachment] {
+        try SourceImport.mergeAttachments(existing: existing, added: added)
+    }
+
+    func cancel(preservingAssemblyMotion: Bool = false) {
+        if !preservingAssemblyMotion || isGrabbingAssembly { cancelAssemblyGrab() }
+        if !preservingAssemblyMotion {
+            assemblyMotionTask?.cancel(); assemblyMotionTask = nil
+            assemblyMotionToken = UUID(); isSolvingAssembly = false
+            requestedJointPositions = assemblyPose?.positions ?? [:]
+        }
+        queuePaused = true; queueCanAdvance = false
+        queuePauseReason = nil
+        steeringTask?.cancel(); steeringTask = nil
+        isSendingQueuedRequestID = nil
+        setSteeringAvailable(false)
+        cancelMeasurement()
+        let hadGenerationFeedback = generationFeedback != nil
+        finishGenerationFeedback()
+        finishTaskAudit(status: "canceled")
+        operationID = UUID()
+        operation?.cancel(); operation = nil
+        codex.cancel(); engine.cancel()
+        isWorking = false; activity = "Ready"
+        if hadGenerationFeedback { autosave() }
+    }
+
+    func selectRevision(_ id: UUID) {
+        guard id != selectedRevisionID, let revision = revisions.first(where: { $0.id == id }) else { return }
+        cancel(); selectedRevisionID = id
+        if !loadStoredRevision() { buildExisting(revision.model) }
+        autosave()
+    }
+
+    func rebuild() { if let current { cancel(); buildExisting(current) } }
+
+    private func buildExisting(_ spec: ModelSpec) {
+        let token = UUID(); operationID = token
+        let revisionID = selectedRevisionID, runtime = python, cores = threads
+        let validatedHash = revisions.first(where: { $0.id == revisionID })?.validatedHash
+        let previousLayout = selectedPartLayout, previouslyHidden = hiddenSolids
+        isWorking = true; activity = "Building solid geometry…"; error = nil
+        operation = Task {
+            do {
+                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores, validatedHash: validatedHash)
+                guard operationID == token, !Task.isCancelled else { return }
+                if let index = revisions.firstIndex(where: { $0.id == revisionID }) {
+                    let defaults = Self.defaultParts(for: preview)
+                    let oldNodes = revisions[index].partLayout?.nodes ?? revisions[index].parts ?? previousLayout.nodes
+                    let migrated = (revisions[index].partLayout ?? previousLayout).remappingGenericParts(to: defaults)
+                    let layout = migrated.reconciled(with: defaults)
+                    try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids)
+                    let oldHidden = Set(revisions[index].hiddenSolids ?? previouslyHidden.sorted())
+                    let hiddenIDs = Set(migrated.nodes.flatMap(\.flattened).filter {
+                        !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: oldHidden)
+                    }.map(\.id))
+                    revisions[index].preview = preview
+                    revisions[index].validatedHash = preview.validatedHash ?? revisions[index].validatedHash
+                    if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
+                    revisions[index].parts = defaults
+                    revisions[index].partLayout = layout
+                    revisions[index].partColors = Self.retainedPartColors(revisions[index].partColors ?? [:], in: layout.nodes,
+                                                                          remappingGenericFrom: oldNodes)
+                    hiddenSolids = Set(layout.nodes.flatMap(\.flattened).filter { hiddenIDs.contains($0.id) }.flatMap(\.solidIndices))
+                    revisions[index].hiddenSolids = hiddenSolids.sorted()
+                }
+                mesh = preview; builtRevisionID = revisionID; selectedSolids = []; selectedPartNodeIDs = []
+                viewportCommand = ViewportCommand(.fit)
+                isWorking = false; activity = "Ready"; operation = nil
+                autosave()
+            } catch is CancellationError {
+                if operationID == token { isWorking = false; operation = nil }
+            } catch {
+                guard operationID == token else { return }
+                self.error = error.localizedDescription; isWorking = false; activity = "Engine unavailable"; operation = nil
+            }
+        }
+    }
+
+    func saveNewProject(revisionID: UUID? = nil) {
+        guard canSaveNew else { return }
+        let snapshot: RADProject
+        do { snapshot = try SaveNewProject.snapshot(from: projectSnapshot(), revisionID: revisionID) }
+        catch { self.error = error.localizedDescription; return }
+        let sessionID = projectSessionID, sourceID = projectID, sourceURL = projectURL
+        let panel = NSSavePanel()
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.SaveNewProject")
+        panel.title = "Save New"
+        panel.prompt = "Save New"
+        panel.allowedContentTypes = [UTType(filenameExtension: "rad") ?? .package]
+        panel.directoryURL = projectURL?.deletingLastPathComponent() ?? ProjectAutosaveStore.defaultDirectory
+        panel.nameFieldStringValue = "\(safeName(title)) copy.rad"
+        guard SavePanelPresentation.runModal(panel) == .OK, let target = panel.url,
+              projectSessionID == sessionID else { return }
+        var newProject = snapshot
+        newProject.projectName = target.deletingPathExtension().lastPathComponent
+        Task {
+            do {
+                try await autosaveStore.writeCopy(newProject, to: target, preserving: sourceURL, projectID: sourceID)
+                onRecentProjectChanged?(target, nil)
+            } catch {
+                guard projectSessionID == sessionID else { return }
+                self.error = "Could not save the new design. \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func saveProject(as newLocation: Bool = false) {
+        guard canSaveProject else { return }
+        // The regular Save command flushes the open project. Save As
+        // still offers an explicit portable copy at a user-selected location.
+        if !newLocation {
+            if saveConflict != nil {
+                presentedSaveConflict = nil
+                presentSaveConflict(in: viewportView?.window)
+                return
+            }
+            autosave()
+            return
+        }
+        let panel = NSSavePanel()
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.SaveProject")
+        panel.title = "Save RAD design"
+        panel.allowedContentTypes = [UTType(filenameExtension: "rad") ?? .package]
+        panel.nameFieldStringValue = "\(safeName(title)).rad"
+        guard SavePanelPresentation.runModal(panel) == .OK, let target = panel.url else { return }
+        let snapshot = projectSnapshot(), sessionID = projectSessionID
+        startedSaves += 1
+        saveStatus = "Saving…"
+        Task {
+            do {
+                try await autosaveStore.writeCopy(snapshot, to: target)
+                onRecentProjectChanged?(target, nil)
+                guard projectSessionID == sessionID else { return }
+                autosave()
+            } catch {
+                if projectSessionID == sessionID {
+                    self.error = error.localizedDescription
+                    saveStatus = "Not saved: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func openProject() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "rad") ?? .package]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let onOpenProject { onOpenProject(url) }
+        else { openProject(url) }
+    }
+
+    func openProject(_ url: URL, restoringProjectID: UUID? = nil) {
+        cancel(); isWorking = true; activity = "Opening design…"
+        let wasReady = projectReady
+        projectReady = false
+        let token = UUID(); operationID = token
+        operation = Task {
+            do {
+                let project: RADProject
+                let source: URL
+                if let restoringProjectID,
+                   let restored = try await autosaveStore.restoreRecent(preferredURL: url, projectID: restoringProjectID) {
+                    project = restored.project; source = restored.url
+                } else {
+                    project = try await Task.detached(priority: .userInitiated) { try ProjectAutosaveStore.readProject(from: url) }.value
+                    source = url
+                }
+                guard operationID == token else { return }
+                loadProject(project, from: source)
+            } catch {
+                guard operationID == token else { return }
+                projectReady = wasReady
+                self.error = "Unable to open design. \(error.localizedDescription)"; isWorking = false; activity = "Ready"
+            }
+        }
+    }
+
+    /// Commit an already validated file after the receiving window's old
+    /// document has been safely flushed. Opening can never partially replace it.
+    func loadProject(_ project: RADProject, from source: URL) {
+        loaded = true
+        cancel()
+        restore(project)
+        autosavedProjectURL = source
+        projectURL = source
+        isWorking = false
+        projectReady = true
+        noteRecentProject(at: source)
+        if !loadStoredRevision(), let current { buildExisting(current) }
+        autosave()
+    }
+
+    func exportSTL() {
+        guard canExport else { return }
+        let panel = NSSavePanel()
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.ExportSTL")
+        panel.title = "Export design"
+        panel.allowedContentTypes = [UTType(filenameExtension: "stl") ?? .data]
+        panel.nameFieldStringValue = "\(safeName(title)).stl"
+        let options = STLExportOptionsView(panel: panel, projectName: STLIndividualExport.folderName(for: title))
+        panel.accessoryView = options
+        guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url else { return }
+        exportSTL(to: url, for3DPrinting: options.for3DPrinting,
+                  exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
+    }
+
+    func exportSelectedPartsSTL(_ solidIndices: Set<Int>? = nil) {
+        let solids = (solidIndices ?? selectedSolids).intersection(Set(0..<currentSolidCount))
+        guard canExport, !solids.isEmpty else { return }
+        let revisionID = selectedRevisionID, sessionID = projectSessionID
+        let panel = NSSavePanel()
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.ExportSelectedPartsSTL")
+        panel.title = "Export selected parts"
+        panel.allowedContentTypes = [UTType(filenameExtension: "stl") ?? .data]
+        panel.nameFieldStringValue = "\(safeName(title)) selected parts.stl"
+        let options = STLExportOptionsView(panel: panel, projectName: STLIndividualExport.folderName(for: title))
+        panel.accessoryView = options
+        guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url,
+              revisionID == selectedRevisionID, sessionID == projectSessionID else { return }
+        exportSTL(to: url, solidIndices: solids, for3DPrinting: options.for3DPrinting,
+                  exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
+    }
+
+    /// Export the captured geometry at its current placement. The engine
+    /// caches session bytes by geometry, selected solids and placement.
+    /// For 3D printing, export the printing version with the 3D printing
+    /// view's orientations, packing only the exported parts.
+    func exportSTL(to url: URL, solidIndices: Set<Int>? = nil, for3DPrinting: Bool = false,
+                   exportIndividualParts: Bool = false, replaceExisting: Bool = false) {
+        guard canExport, let preview = posedPreview, let revisionID = selectedRevisionID,
+              let revision = revisions.first(where: { $0.id == revisionID }) else { return }
+        if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
+        let nodes = revision.partLayout?.nodes ?? revision.parts ?? Self.defaultParts(for: preview)
+        let token = UUID(), sessionID = projectSessionID
+        operationID = token
+        let runtime = python, cores = threads
+        isWorking = true; activity = "Exporting STL…"; error = nil
+        operation = Task {
+            do {
+                let output: (files: [Data], parts: [STLIndividualExport.Part])
+                do {
+                    output = try await stlExportOutput(preview, model: revision.model, solidIndices: solidIndices, nodes: nodes,
+                                                       for3DPrinting: for3DPrinting, individualParts: exportIndividualParts,
+                                                       python: runtime, threads: cores)
+                } catch EngineExportError.nativeArtifactUnavailable {
+                    // Replay can enumerate solids differently. Bind the
+                    // captured subset to fresh stable ownership.
+                    var rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                    if let motion = rebuilt.assemblyMotion {
+                        rebuilt.assemblyPose = try motion.solve(parts: rebuilt.parts ?? [], positions: preview.assemblyPose?.positions ?? [:])
+                    }
+                    guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                          !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
+                    let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
+                    try cacheReplayedPreview(rebuilt, at: index)
+                    output = try await stlExportOutput(rebuilt, model: revision.model,
+                                                       solidIndices: solidIndices == nil ? nil : restored.selected,
+                                                       nodes: restored.layout?.nodes ?? restored.parts,
+                                                       for3DPrinting: for3DPrinting, individualParts: exportIndividualParts,
+                                                       python: runtime, threads: cores)
+                }
+                guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                      !Task.isCancelled, revisions.contains(where: { $0.id == revisionID }) else { return }
+                let writing = Task.detached(priority: .userInitiated) {
+                    try Task.checkCancellation()
+                    if exportIndividualParts {
+                        try STLIndividualExport.write(output.files, parts: output.parts, to: url,
+                                                      replaceExisting: replaceExisting)
+                    } else {
+                        try output.files[0].write(to: url, options: .atomic)
+                    }
+                }
+                try await withTaskCancellationHandler {
+                    try await writing.value
+                } onCancel: { writing.cancel() }
+                guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                      !Task.isCancelled else { return }
+                notice = "STL exported · \(url.lastPathComponent)"
+                activity = "Ready"; isWorking = false; operation = nil
+            } catch is CancellationError {
+                if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
+            } catch {
+                guard operationID == token, projectSessionID == sessionID else { return }
+                self.error = "Export failed. \(error.localizedDescription)"
+                activity = "Export needs attention"; isWorking = false; operation = nil
+            }
+        }
+    }
+
+    private func stlExportOutput(_ preview: PreviewMesh, model: ModelSpec, solidIndices: Set<Int>?, nodes: [PartNode],
+                                 for3DPrinting: Bool, individualParts: Bool,
+                                 python: String, threads: Int) async throws -> (files: [Data], parts: [STLIndividualExport.Part]) {
+        var source = preview
+        var selection = solidIndices
+        var transforms: [Int: [Double]]?
+        // Exports for 3D printing always use both the printing version and its
+        // plate layout, as the two 3D printing views together show them.
+        // Reference parts are never printed.
+        if for3DPrinting {
+            let requested = solidIndices ?? Set(0..<preview.solids)
+            let exported = PrintLayout.printedSolids(requested, of: preview)
+            guard !exported.isEmpty else {
+                throw RADError.message(solidIndices == nil ? "Every part of this design is a reference part, which is not printed."
+                    : "The selected parts are reference parts, which are not printed.")
+            }
+            if exported != requested { selection = exported }
+            source = try await printVersion(of: preview, model: model)
+            transforms = try await PrintLayout.transforms(for: exported,
+                orientations: printOrientations(of: source, solids: exported))
+        }
+        if individualParts {
+            let parts = STLIndividualExport.parts(in: nodes, selected: selection, solidCount: source.solids)
+            let files = try await engine.exportSTLParts(source, parts: parts.map(\.solidIndices),
+                                                        solidTransforms: transforms, python: python, threads: threads)
+            return (files, parts)
+        }
+        let data = try await engine.exportSTL(source, solidIndices: selection,
+                                              solidTransforms: transforms, python: python, threads: threads)
+        return ([data], [])
+    }
+
+    private func safeName(_ name: String) -> String {
+        let safe = name.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_")).inverted).joined()
+        return safe.isEmpty ? "Design" : String(safe.prefix(100))
+    }
+    private var autosaveTitle: String { title }
+
+    private func rememberAutosavedProject(_ url: URL) {
+        guard projectReady else { return }
+        // Ordinary saves keep their established URL. Canonicalization and
+        // recent-menu updates are needed only for a newly opened/moved file.
+        if url != lastRememberedProjectURL || (lastNotedRecentURL == nil && onRecentProjectChanged != nil) {
+            let canonical = ProjectFileOrigin.canonicalURL(url)
+            if canonical != lastNotedRecentURL { noteRecentProject(at: canonical) }
+            lastRememberedProjectURL = url
+        }
+        guard isActiveProject else { return }
+        if UserDefaults.standard.string(forKey: Self.recentProjectPathKey) != url.path {
+            UserDefaults.standard.set(url.path, forKey: Self.recentProjectPathKey)
+        }
+        if UserDefaults.standard.string(forKey: Self.recentProjectIDKey) != projectID.uuidString {
+            UserDefaults.standard.set(projectID.uuidString, forKey: Self.recentProjectIDKey)
+        }
+    }
+
+    func noteProjectOpened(fallbackURL: URL? = nil) {
+        guard projectReady, !preserveUnreadableSession,
+              let url = autosavedProjectURL ?? projectURL ?? fallbackURL else { return }
+        noteRecentProject(at: url)
+    }
+
+    private func noteRecentProject(at url: URL) {
+        guard let onRecentProjectChanged else { return }
+        let canonical = ProjectFileOrigin.canonicalURL(url)
+        let previous = lastNotedRecentURL.flatMap { $0 == canonical ? nil : $0 }
+        onRecentProjectChanged(canonical, previous)
+        lastNotedRecentURL = canonical
+    }
+
+    func setActiveProject(_ active: Bool) {
+        isActiveProject = active
+        if active, let url = autosavedProjectURL { rememberAutosavedProject(url) }
+    }
+
+    private func restore(_ project: RADProject) {
+        onProjectAgentInvalidated?()
+        cancelProjectThumbnail()
+        projectReady = false
+        // Existing files retain normal autosaving, including empty archives.
+        projectSavingEnabled = true
+        saveConflict = nil
+        presentedSaveConflict = nil
+        saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
+        projectFileOrigin = project.fileOrigin
+        hasUnsavedChanges = false
+        resetQueueWork()
+        projectSessionID = UUID()
+        projectID = project.projectID ?? UUID()
+        autosavedProjectURL = nil
+        lastNotedRecentURL = nil
+        lastRememberedProjectURL = nil
+        measurementCache = [:]
+        preserveUnreadableSession = false
+        pendingProjectRename = false
+        projectName = project.projectName
+        recentPartColors = project.recentPartColors ?? []
+        partsPaneFraction = project.partsPaneFraction
+        projectActivity.restore(project.taskAudits ?? [])
+        showGrid = project.showGrid ?? true
+        resetPrintGeometry()
+        projectionMode = project.projectionMode ?? .perspective
+        displayMode = project.displayMode ?? .edges
+        codexSettings = normalizedCodexSettings(project.codexSettings ?? CodexProjectSettings())
+        messages = project.messages; revisions = project.revisions; recentPreviewRevisionIDs = []
+        selectedRevisionID = project.selectedRevisionID ?? revisions.last?.id
+        mesh = nil; builtRevisionID = nil
+        // Set after the previous design's geometry is gone, so it never
+        // starts printing work for that design.
+        printVersionView = project.printVersionView ?? false
+        printLayoutView = project.printLayoutView ?? false
+        queuedRequests = project.queuedRequests ?? []
+        // Reopening a file restores intent, never starts agent work by itself.
+        queuePaused = !queuedRequests.isEmpty
+        prompt = project.draftPrompt ?? ""
+        pendingAttachments = project.draftAttachments ?? []
+        error = nil; notice = nil; saveStatus = nil
+        selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = []
+        // Package loading already checks this optional image against its
+        // persisted presentation identity. Keep it during replay; a matching
+        // validation receipt can bind it to the new session's artifact paths.
+        if let bytes = project.thumbnailData,
+           let revision = revisions.first(where: { $0.id == selectedRevisionID }) {
+            projectThumbnailData = bytes
+            projectThumbnailImagePresentation = ProjectThumbnailPresentation(revisionID: revision.id,
+                generation: projectThumbnailRevisionGeneration, validationHash: revision.validatedHash,
+                projection: projectionMode, display: displayMode, hiddenSolids: Set(revision.hiddenSolids ?? []))
+        }
+    }
+    private func autosave() {
+        guard canSaveProject else { return }
+        // This snapshot includes the latest draft, divider and audit edits.
+        // Their pending timers would only request the same save again.
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        projectActivity.cancelPendingSave()
+        hasUnsavedChanges = true
+        autosaveSequence += 1
+        guard saveConflict == nil else { return }
+        // One autosave is written at a time. However many changes arrive
+        // meanwhile, a single follow-up then writes the latest snapshot.
+        if autosaveWrite?.session == projectSessionID {
+            autosaveWrite?.followUp = true
+            if saveStatus == nil { saveStatus = "Saving…" }
+            return
+        }
+        let snapshot = projectSnapshot(), sequence = autosaveSequence, sessionID = projectSessionID
+        let documentID = projectID, name = autosaveTitle, preferredURL = autosavedProjectURL
+        let preferExactName = pendingProjectRename
+        autosaveWrite = AutosaveWrite(session: sessionID)
+        startedSaves += 1
+        saveStatus = "Saving…"
+        Task {
+            do {
+                let url = try await autosaveStore.write(project: snapshot, projectID: documentID, title: name,
+                                                       sequence: sequence, preferredURL: preferredURL,
+                                                       preferExactName: preferExactName)
+                if projectSessionID == sessionID, autosaveSequence == sequence {
+                    if projectURL != url { projectURL = url }
+                    autosavedProjectURL = url
+                    rememberAutosavedProject(url)
+                    pendingProjectRename = false
+                    hasUnsavedChanges = false
+                    saveStatus = nil
+                }
+            } catch {
+                if projectSessionID == sessionID, autosaveSequence == sequence { recordSaveFailure(error) }
+            }
+            finishAutosaveWrite(session: sessionID)
+        }
+    }
+
+    private func finishAutosaveWrite(session: UUID) {
+        guard let write = autosaveWrite, write.session == session else { return }
+        autosaveWrite = nil
+        if write.followUp, projectSessionID == session { autosave() }
+    }
+
+    private func recordSaveFailure(_ failure: Error) {
+        saveStatus = "Not saved: \(failure.localizedDescription)"
+        if let conflict = failure as? ProjectSaveConflict { saveConflict = conflict }
+    }
+
+    /// Shared document views coalesce onto one native conflict sheet.
+    func presentSaveConflict(in window: NSWindow?,
+        choose: @escaping @MainActor (ProjectSaveConflict, NSWindow) async -> ProjectSaveConflictPrompt.Choice = ProjectSaveConflictPrompt.choose) {
+        guard let window, let conflict = saveConflict, saveConflictPromptTask == nil,
+              presentedSaveConflict != conflict else { return }
+        presentedSaveConflict = conflict
+        let session = projectSessionID
+        saveConflictPromptTask = Task { [weak self] in
+            let choice = await choose(conflict, window)
+            guard let self, self.projectSessionID == session else { return }
+            self.saveConflictPromptTask = nil
+            do { try await self.resolveSaveConflict(choice) }
+            catch { self.recordSaveFailure(error) }
+        }
+    }
+
+    func retrySaveConflict(in window: NSWindow?) {
+        presentedSaveConflict = nil
+        presentSaveConflict(in: window)
+    }
+
+    func resolveSaveConflict(_ choice: ProjectSaveConflictPrompt.Choice) async throws {
+        guard let conflict = saveConflict, projectReady, !preserveUnreadableSession else { return }
+        if case .cancel = choice { return }
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        autosaveSequence += 1
+        let sequence = autosaveSequence, session = projectSessionID
+        var snapshot = projectSnapshot()
+        startedSaves += 1
+        saveStatus = "Saving…"; hasUnsavedChanges = true
+        do {
+            switch choice {
+            case .cancel: return
+            case .overwrite:
+                let url = try await autosaveStore.write(project: snapshot, projectID: projectID, title: autosaveTitle,
+                    sequence: sequence, preferredURL: conflict.file.url, preferExactName: pendingProjectRename,
+                    resolving: conflict)
+                guard projectSessionID == session else { return }
+                autosavedProjectURL = url
+                if projectURL != url { projectURL = url }
+                rememberAutosavedProject(url)
+                pendingProjectRename = false
+            case .saveAs(let target):
+                guard !conflict.file.matches(target) else {
+                    throw RADError.message("Choose a different filename to preserve the other design file.")
+                }
+                let name = try ProjectNaming.userName(target.deletingPathExtension().lastPathComponent)
+                let identity = UUID()
+                snapshot.projectID = identity
+                snapshot.projectName = name
+                snapshot.fileOrigin = nil
+                let origin = try await autosaveStore.writeCopy(snapshot, to: target,
+                    preserving: conflict.file.url, projectID: projectID)
+                guard projectSessionID == session else { return }
+                projectID = identity; projectName = name; projectFileOrigin = origin
+                autosavedProjectURL = target
+                projectURL = target
+                pendingProjectRename = false
+                noteRecentProject(at: target)
+            }
+            saveConflict = nil
+            if autosaveSequence == sequence {
+                hasUnsavedChanges = false; saveStatus = nil
+            } else { autosave() }
+        } catch {
+            if projectSessionID == session { recordSaveFailure(error) }
+            throw error
+        }
+    }
+
+    @discardableResult
+    func loadStoredRevision() -> Bool {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return false }
+        mesh = nil; builtRevisionID = nil; selectedSolids = []; selectedPartNodeIDs = []
+        hiddenSolids = Set(revision.hiddenSolids ?? [])
+        if let preview = revision.preview {
+            // Session previews retain their native solid artifact for a later
+            // export. Returning to a visited revision needs no worker process.
+            mesh = preview; builtRevisionID = revision.id
+            viewportCommand = ViewportCommand(.fit)
+            activity = "Ready"; isWorking = false; operation = nil
+            return true
+        }
+
+        // Generated geometry is reconstructed from the exact saved program. A
+        // saved receipt that no longer matches is earned again by this build.
+        let token = UUID(); operationID = token
+        let runtime = python, cores = threads
+        isWorking = true; activity = "Preparing preview…"; error = nil
+        operation = Task {
+            do {
+                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                guard operationID == token, selectedRevisionID == revision.id, !Task.isCancelled,
+                      let index = revisions.firstIndex(where: { $0.id == revision.id }) else { return }
+                // Only transient geometry changes here. User edits made while
+                // the worker was busy remain authoritative.
+                let receipt = revisions[index].validatedHash
+                try cacheReplayedPreview(preview, at: index)
+                if revisions[index].validatedHash != receipt { autosave() }
+                viewportCommand = ViewportCommand(.fit)
+                activity = "Ready"; isWorking = false; operation = nil
+            } catch is CancellationError {
+                if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
+            } catch {
+                guard operationID == token else { return }
+                self.error = error.localizedDescription
+                activity = "Preview needs attention"; isWorking = false; operation = nil
+            }
+        }
+        return true
+    }
+
+    private func retainRecentRevisionPreviews(including id: UUID) {
+        recentPreviewRevisionIDs.removeAll { $0 == id }
+        recentPreviewRevisionIDs.append(id)
+        let overflow = recentPreviewRevisionIDs.count - Self.retainedRevisionPreviews
+        guard overflow > 0 else { return }
+        let evicted = Set(recentPreviewRevisionIDs.prefix(overflow))
+        recentPreviewRevisionIDs.removeFirst(overflow)
+        guard revisions.contains(where: { $0.preview != nil && evicted.contains($0.id) }) else { return }
+        // One assignment publishes the eviction. Releasing the last copy of a
+        // preview also releases its build folder.
+        var updated = revisions
+        for index in updated.indices where updated[index].preview != nil && evicted.contains(updated[index].id) {
+            updated[index].preview = nil
+        }
+        revisions = updated
+        prunePrintGeometries()
+    }
+
+    private func cacheReplayedPreview(_ generated: PreviewMesh, at index: Int) throws {
+        let restored = try Self.restoredPartState(for: revisions[index], preview: generated, selected: selectedSolids)
+        var preview = generated
+        preview.parts = restored.parts
+        revisions[index].parts = restored.parts
+        revisions[index].partLayout = restored.layout
+        revisions[index].hiddenSolids = restored.hidden.sorted()
+        revisions[index].preview = preview
+        revisions[index].validatedHash = preview.validatedHash ?? revisions[index].validatedHash
+        if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
+        mesh = preview; builtRevisionID = revisions[index].id
+        hiddenSolids = restored.hidden; selectedSolids = restored.selected
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)
+    }
+
+    /// Kernel versions can enumerate the same named solids in a different
+    /// order. Retain user structure and names, replacing only solid ownership.
+    static func restoredPartState(for revision: ProjectRevision, preview: PreviewMesh, selected: Set<Int>) throws
+        -> (parts: [PartNode], layout: PartLayout?, hidden: Set<Int>, selected: Set<Int>) {
+        let generated = Self.defaultParts(for: preview)
+        let previous = revision.parts ?? revision.partLayout?.nodes ?? generated
+        try ProjectStore.validatePartHierarchy(previous, solidCount: preview.solids)
+        try ProjectStore.validatePartHierarchy(generated, solidCount: preview.solids)
+        let oldOwners = Dictionary(uniqueKeysWithValues: previous.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map { ($0.id, $0.solidIndices) })
+        let newOwners = Dictionary(uniqueKeysWithValues: generated.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map { ($0.id, $0.solidIndices) })
+        let generic = oldOwners.allSatisfy { id, indices in indices.count == 1 && id == "solid/\(indices[0])" }
+        var mapping: [Int: Int] = [:]
+        if generic {
+            // Early generic-only histories have no semantic identities; their
+            // program order is the sole available ownership reference.
+            mapping = Dictionary(uniqueKeysWithValues: (0..<preview.solids).map { ($0, $0) })
+        } else {
+            guard Set(oldOwners.keys) == Set(newOwners.keys) else {
+                throw RADError.message("The saved program rebuilt different part identities. Use Rebuild Design to reconcile the changed geometry.")
+            }
+            for (identity, oldIndices) in oldOwners {
+                guard let newIndices = newOwners[identity], oldIndices.count == newIndices.count else {
+                    throw RADError.message("The saved program rebuilt a different number of solids for a part. Use Rebuild Design to reconcile the changed geometry.")
+                }
+                for (old, new) in zip(oldIndices, newIndices) { mapping[old] = new }
+            }
+        }
+        func remapped(_ nodes: [PartNode]) -> [PartNode] {
+            nodes.map { node in
+                var updated = node
+                updated.solidIndices = node.solidIndices.compactMap { mapping[$0] }
+                if let children = node.children { updated.children = remapped(children) }
+                return updated
+            }
+        }
+        var layout = revision.partLayout
+        if let original = layout { layout?.nodes = remapped(original.nodes) }
+        if let layout { try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids) }
+        return (remapped(previous), layout, Set((revision.hiddenSolids ?? []).compactMap { mapping[$0] }),
+                Set(selected.compactMap { mapping[$0] }))
+    }
+
+    private static func defaultParts(for preview: PreviewMesh) -> [PartNode] {
+        preview.parts ?? (0..<preview.solids).map {
+            PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
+        }
+    }
+
+    private func projectSnapshot() -> RADProject {
+        // Editing borrows the composer, but its temporary text and control
+        // choices must never overwrite the user's suspended unsent request.
+        let draft = queuedRequestComposerDraft
+        let draftPrompt = draft?.prompt ?? prompt
+        let draftAttachments = draft?.attachments ?? pendingAttachments
+        return RADProject(messages: messages, revisions: revisions, selectedRevisionID: selectedRevisionID,
+                   projectID: projectID, codexSettings: draft?.codexSettings ?? codexSettings, projectName: projectName,
+                   showGrid: showGrid,
+                   printVersionView: printVersionView ? true : nil, printLayoutView: printLayoutView ? true : nil,
+                   projectionMode: projectionMode, displayMode: displayMode,
+                   recentPartColors: recentPartColors.isEmpty ? nil : recentPartColors,
+                   taskAudits: taskAudits.isEmpty ? nil : taskAudits,
+                   queuedRequests: queuedRequests.isEmpty ? nil : queuedRequests,
+                   draftPrompt: draftPrompt.isEmpty ? nil : draftPrompt,
+                   draftAttachments: draftAttachments.isEmpty ? nil : draftAttachments,
+                   queuePaused: queuedRequests.isEmpty ? nil : queuePaused,
+                   partsPaneFraction: partsPaneFraction, fileOrigin: projectFileOrigin,
+                   thumbnailData: currentProjectThumbnailPresentation() == projectThumbnailImagePresentation ? projectThumbnailData : nil)
+    }
+
+    /// This descriptor is cheap to compare during an unrelated autosave. Its
+    /// generation changes only for the selected recipe or effective colors.
+    private func currentProjectThumbnailPresentation() -> ProjectThumbnailPresentation? {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return nil }
+        return ProjectThumbnailPresentation(revisionID: revision.id, generation: projectThumbnailRevisionGeneration,
+            validationHash: revision.validatedHash, projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids)
+    }
+
+    private static func projectThumbnailNodes(_ revision: ProjectRevision) -> [PartNode] {
+        revision.partLayout?.nodes ?? revision.parts ?? revision.preview?.parts ?? []
+    }
+
+    private func projectThumbnailRevisionsChanged(from previous: [ProjectRevision]) {
+        // An unrendered history selection can still retain the previous
+        // version's image. Editing that inactive version must invalidate it.
+        if let imageID = projectThumbnailImagePresentation?.revisionID, imageID != selectedRevisionID,
+           Self.projectThumbnailRevisionChanged(previous.first(where: { $0.id == imageID }),
+                                                revisions.first(where: { $0.id == imageID })) {
+            projectThumbnailInput = nil; projectThumbnailData = nil; projectThumbnailImagePresentation = nil
+        }
+        let old = previous.first(where: { $0.id == selectedRevisionID })
+        let new = revisions.first(where: { $0.id == selectedRevisionID })
+        guard Self.projectThumbnailRevisionChanged(old, new) else { return }
+        projectThumbnailRevisionGeneration &+= 1
+        if var image = projectThumbnailImagePresentation, image.revisionID != selectedRevisionID {
+            // The inactive-image check above proved this other version's
+            // presentation unchanged. A selected version's edits must not
+            // invalidate that image when navigation returns to its owner.
+            image.generation = projectThumbnailRevisionGeneration
+            projectThumbnailImagePresentation = image
+        }
+        projectThumbnailInputKey = nil; projectThumbnailCachedInput = nil
+        scheduleProjectThumbnail()
+    }
+
+    private static func projectThumbnailRevisionChanged(_ old: ProjectRevision?, _ new: ProjectRevision?) -> Bool {
+        var changed = !sameProjectThumbnailRecipe(old?.model, new?.model) || old?.validatedHash != new?.validatedHash || old?.jointPositions != new?.jointPositions
+        if !changed, let old, let new {
+            let oldNodes = Self.projectThumbnailNodes(old), newNodes = Self.projectThumbnailNodes(new)
+            if oldNodes != newNodes || old.partColors != new.partColors {
+                changed = PartColorState.solidColors(in: oldNodes, overrides: old.partColors ?? [:]) !=
+                          PartColorState.solidColors(in: newNodes, overrides: new.partColors ?? [:])
+            }
+        }
+        return changed
+    }
+
+    private static func sameProjectThumbnailRecipe(_ first: ModelSpec?, _ second: ModelSpec?) -> Bool {
+        guard let first, let second else { return first == nil && second == nil }
+        let firstInputs = first.inputAssets ?? [], secondInputs = second.inputAssets ?? []
+        return first.units == second.units && first.script == second.script &&
+            firstInputs.count == secondInputs.count && zip(firstInputs, secondInputs).allSatisfy { pair in
+                pair.0.id == pair.1.id && pair.0.format == pair.1.format && pair.0.data == pair.1.data
+            }
+    }
+
+    private func currentProjectThumbnailInput() -> ProjectThumbnail.Input? {
+        guard let mesh, let selectedRevisionID, builtRevisionID == selectedRevisionID,
+              Self.sameProjectThumbnailRecipe(current, projectThumbnailMeshModel),
+              let presentation = currentProjectThumbnailPresentation() else { return nil }
+        let receipt = mesh.validatedHash
+        guard presentation.validationHash == receipt else { return nil }
+        let key = ProjectThumbnailInputKey(presentation: presentation, buildID: mesh.buildID)
+        if key == projectThumbnailInputKey { return projectThumbnailCachedInput }
+        let input = ProjectThumbnail.Input(revisionID: selectedRevisionID, buildID: mesh.buildID, validationHash: receipt,
+            projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids, solidColors: solidColors)
+        projectThumbnailInputKey = key; projectThumbnailCachedInput = input
+        projectThumbnailWork.inputResolutions += 1
+        return input
+    }
+
+    private func cancelProjectThumbnail(clearImage: Bool = true) {
+        projectThumbnailToken = UUID()
+        projectThumbnailTask?.cancel(); projectThumbnailTask = nil
+        if clearImage {
+            projectThumbnailInput = nil; projectThumbnailData = nil; projectThumbnailImagePresentation = nil
+            projectThumbnailInputKey = nil; projectThumbnailCachedInput = nil
+        }
+    }
+
+    /// Coalesce presentation edits without delaying typing, geometry acceptance,
+    /// or normal saves. Stale captures cannot attach to a replacement design.
+    private func scheduleProjectThumbnail() {
+        projectThumbnailTask?.cancel()
+        let token = UUID(), session = projectSessionID
+        projectThumbnailToken = token
+        projectThumbnailTask = nil
+        guard projectReady, let input = currentProjectThumbnailInput(),
+              let presentation = currentProjectThumbnailPresentation() else { return }
+        if presentation == projectThumbnailImagePresentation, projectThumbnailData != nil,
+           projectThumbnailInput == input || (presentation.validationHash != nil && presentation.validationHash == input.validationHash) {
+            if projectThumbnailInput != input { projectThumbnailWork.reusedImages += 1 }
+            projectThumbnailInput = input
+            return
+        }
+        projectThumbnailWork.scheduledRenders += 1
+        projectThumbnailTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(350))
+                guard let self, self.projectSessionID == session, self.projectThumbnailToken == token,
+                      self.currentProjectThumbnailPresentation() == presentation,
+                      self.currentProjectThumbnailInput() == input, let preview = self.posedPreview else { return }
+                self.projectThumbnailWork.renders += 1
+                let data = try await self.projectThumbnailRenderer(preview, input)
+                guard !Task.isCancelled, self.projectSessionID == session, self.projectThumbnailToken == token,
+                      self.currentProjectThumbnailPresentation() == presentation,
+                      self.currentProjectThumbnailInput() == input else { return }
+                self.projectThumbnailInput = input
+                self.projectThumbnailData = data
+                self.projectThumbnailImagePresentation = presentation
+                self.projectThumbnailTask = nil
+                self.autosave()
+            } catch {
+                // Finder can fall back to the registered RAD icon. Thumbnail
+                // failure must never fail a required save or interrupt CAD work.
+                guard let self, self.projectSessionID == session, self.projectThumbnailToken == token else { return }
+                self.projectThumbnailTask = nil
+            }
+        }
+    }
+}
+
+extension AppState {
+    var agentStateToken: String { "\(projectSessionID.uuidString):\(agentStateGeneration)" }
+
+    func agentSnapshot() -> ProjectAgentSnapshot {
+        ProjectAgentSnapshot(projectID: projectID, editingID: projectSessionID, stateToken: agentStateToken,
+            current: current, preview: builtRevisionID == selectedRevisionID ? posedPreview : nil,
+            versions: ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID),
+            partLayout: selectedPartLayout, partColors: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:],
+            hiddenSolids: hiddenSolids, solidColors: solidColors)
+    }
+
+    func beginExternalAgentAudit(id: UUID, client: ProjectExternalAgentIdentity, request: String,
+                                 model: String? = nil, effort: String? = nil) throws {
+        guard projectReady, !preserveUnreadableSession else {
+            throw RADError.message("The design is unavailable for another agent task.")
+        }
+        try projectActivity.beginExternal(id: id, client: client, request: request, model: model, effort: effort)
+        projectSavingEnabled = true
+        autosave()
+    }
+
+    func finishExternalAgentAudit(id: UUID, status: String) {
+        guard projectActivity.finishExternal(id: id, status: status) else { return }
+        autosave()
+    }
+
+    func externalAgentReceipt(clientID: String, key: String) -> ProjectTaskAudit? {
+        projectActivity.externalReceipt(clientID: clientID, key: key)
+    }
+
+    func commitExternalAgent(_ candidate: ProjectAgentCandidate, taskID: UUID, artifactID: String,
+                             expectedStateToken: String, key: String, snapshot: ProjectAgentSnapshot) throws -> UUID {
+        guard projectReady, !preserveUnreadableSession, projectID == snapshot.projectID,
+              projectSessionID == snapshot.editingID, agentStateToken == expectedStateToken,
+              expectedStateToken == snapshot.stateToken, !isWorking else {
+            throw ProjectAgentError.conflict("The design changed or is busy. Start a new task against its current state before committing.")
+        }
+        guard projectActivity.isRunningExternal(id: taskID) else { throw ProjectAgentError.unavailable }
+        try ProjectStore.validateModel(candidate.model)
+        guard revisions.count < 1_000 else { throw RADError.message("The design already has the maximum number of versions.") }
+        let revisionID: UUID
+        if artifactID == "current", let selectedRevisionID, current == candidate.model {
+            try applyAgentPartColorChanges(candidate.colorChanges, to: selectedRevisionID,
+                matching: current, startedWith: snapshot.partColors)
+            revisionID = selectedRevisionID
+        } else {
+            revisionID = try appendValidatedRevision(candidate.model, preview: candidate.preview,
+                previousLayout: selectedPartLayout, previouslyHidden: hiddenPartIDs,
+                previousColors: Self.completePartColors(in: partTree, stored: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:]),
+                colorChanges: candidate.colorChanges, startedColors: snapshot.partColors)
+        }
+        projectActivity.recordExternalCommit(taskID: taskID, revisionID: revisionID, key: key, artifactID: artifactID)
+        error = nil
+        autosave()
+        return revisionID
+    }
+
+    /// Await the existing writer without canceling any other design work.
+    func flushExternalAgentCommit() async throws { try await flushProject() }
+
+    var agentPersistenceStatus: [String: Any] {
+        var value: [String: Any] = ["status": hasUnsavedChanges ? "pending" : (projectURL == nil ? "memory" : "saved")]
+        if let saveStatus, saveStatus.hasPrefix("Not saved:") { value["status"] = "failed"; value["error"] = saveStatus }
+        return value
+    }
+}

@@ -1,0 +1,585 @@
+import Darwin
+import Foundation
+
+/// A lost acknowledgement is not proof that the additional information was
+/// rejected. The queue must pause instead of silently replaying uncertain input.
+enum CodexSteeringError: LocalizedError {
+    case unavailable
+    case rejected(String)
+    case uncertain(String)
+
+    var mayHaveBeenAccepted: Bool {
+        if case .uncertain = self { return true }
+        return false
+    }
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: return "This task is no longer accepting information. The follow-up remains queued."
+        case .rejected(let detail): return "The additional information was not accepted: \(detail) The follow-up remains queued."
+        case .uncertain(let detail): return "\(detail) The information may have been received. Review the conversation before resuming the queue."
+        }
+    }
+}
+
+/// One private app-server process and one ephemeral thread per RAD generation.
+/// The input pipe stays open so additional information can steer its active turn.
+final class CodexAppServerJob: @unchecked Sendable {
+    private enum Purpose: Equatable { case initialize, threadStart, turnStart, steer, interrupt }
+    private struct PendingRPC {
+        var purpose: Purpose
+        var deadline: Date?
+        var expectedTurnID: String?
+        var continuation: CheckedContinuation<String, Error>?
+    }
+    private enum Terminal {
+        case completed(Data), failed(String), interrupted
+    }
+    private struct Message {
+        var text: String
+        var phase: String?
+    }
+
+    private let process = Process()
+    private lazy var pipes = AgentProcessPipes(process)
+    private let lock = NSLock()
+    private var cancelled = false
+    private var cancellationDate: Date?
+    private var running = false
+    private var finished = false
+    private var threadID: String?
+    private var turnID: String?
+    /// Turn sandboxes start without network access until a permission grant.
+    private var networkAccess = false
+    private var networkRestartPending = false
+    private var networkOperation = ""
+    private var terminal: Terminal?
+    private var completedAt: Date?
+    private var nextRequestID = 1
+    private var pending: [Int: PendingRPC] = [:]
+    private var outbound: [Data] = []
+    private var publishedAvailability = false
+    private let directory: URL
+    private let activityWorkspace: CADAgentWorkspace?
+    private let model: String
+    private let effort: String?
+    private let schema: Data
+    private let onProgress: @Sendable (String) -> Void
+    private let onMessage: @Sendable (CodexProgressMessage) -> Void
+    private let onActivity: @Sendable (ProjectActivityEvent) -> Void
+    private let onSteeringAvailability: @Sendable (Bool) -> Void
+    // Stream state below is touched only by the utility I/O thread.
+    private var lines = AgentLineBuffer(maximumBytes: CodexAppServerJob.maximumEventBytes)
+    private var messages: [String: Message] = [:]
+    private var emittedCommentary: [String: String] = [:]
+    private var activityStarts: [String: Date] = [:]
+    private var commandOutputs: [String: String] = [:]
+    private var commandItems: [String: [String: Any]] = [:]
+    private var commandOutputBytes = 0
+    private var incompleteCommands = Set<String>()
+    private var lastCommandUpdate: [String: Date] = [:]
+    private var finalResponse: String?
+    private static let maximumEventBytes = 32_000_000
+    private static let maximumFinalBytes = 4_000_000
+
+    init(executable: URL, arguments: [String], directory: URL, model: String, effort: String?, schema: Data,
+         onProgress: @escaping @Sendable (String) -> Void,
+         onMessage: @escaping @Sendable (CodexProgressMessage) -> Void,
+         onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void,
+         onSteeringAvailability: @escaping @Sendable (Bool) -> Void,
+         environment overrides: [String: String]) {
+        self.directory = directory
+        activityWorkspace = try? CADAgentWorkspace(directory: directory)
+        self.model = model
+        self.effort = effort
+        self.schema = schema
+        self.onProgress = onProgress
+        self.onMessage = onMessage
+        self.onActivity = onActivity
+        self.onSteeringAvailability = onSteeringAvailability
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = directory
+        var environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        environment["PATH"] = [executable.deletingLastPathComponent().path, environment["PATH"] ?? "/usr/bin:/bin",
+                               "/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin"].joined(separator: ":")
+        environment["NO_COLOR"] = "1"
+        environment.merge(overrides) { _, new in new }
+        process.environment = environment
+        _ = pipes
+    }
+
+    var canSteer: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !cancelled && !finished && terminal == nil && threadID != nil && turnID != nil
+    }
+    var currentTurnID: String? {
+        lock.lock(); defer { lock.unlock() }
+        return !cancelled && !finished && terminal == nil ? turnID : nil
+    }
+
+    /// The app-server resolves each image file directly. Media bytes never
+    /// become text or JSON base64 in RAD's bounded design request.
+    private static func userInput(text: String, imagePaths: [String]) -> [[String: Any]] {
+        var input: [[String: Any]] = []
+        if !text.isEmpty { input.append(["type": "text", "text": text, "text_elements": []]) }
+        input.append(contentsOf: imagePaths.map { ["type": "localImage", "path": $0] })
+        return input
+    }
+
+    func run(input: Data, imagePaths: [String] = []) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [self] in
+                do {
+                    let data = try execute(input: input, imagePaths: imagePaths)
+                    continuation.resume(returning: data)
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    /// The acknowledgement is authoritative even if turn/completed arrives
+    /// while the response is in flight. No new thread or turn is created.
+    func steer(text: String, imagePaths: [String] = []) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            guard !cancelled, !finished, terminal == nil, let threadID, let turnID else {
+                lock.unlock()
+                continuation.resume(throwing: CodexSteeringError.unavailable)
+                return
+            }
+            do {
+                let id = nextRequestID; nextRequestID += 1
+                let params: [String: Any] = ["threadId": threadID, "expectedTurnId": turnID,
+                    "clientUserMessageId": UUID().uuidString,
+                    "input": Self.userInput(text: text, imagePaths: imagePaths)]
+                let data = try Self.frame(["id": id, "method": "turn/steer", "params": params])
+                pending[id] = PendingRPC(purpose: .steer, deadline: Date().addingTimeInterval(30),
+                                          expectedTurnID: turnID, continuation: continuation)
+                outbound.append(data)
+                lock.unlock()
+                pipes.wake()
+            } catch {
+                lock.unlock()
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !finished, !cancelled else { lock.unlock(); return }
+        cancelled = true
+        cancellationDate = Date()
+        let currentThread = threadID, currentTurn = turnID
+        lock.unlock()
+        pipes.wake()
+        publishAvailability(false)
+        if let currentThread, let currentTurn {
+            try? enqueue("turn/interrupt", purpose: .interrupt,
+                         params: ["threadId": currentThread, "turnId": currentTurn])
+        }
+        // First allow the protocol interrupt to stop commands/agents. Always
+        // terminate a server that does not promptly honor it.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { [self] in
+            lock.lock(); let shouldStop = running && !finished && process.isRunning; lock.unlock()
+            if shouldStop { process.terminate() }
+        }
+    }
+
+    /// An active turn's sandbox cannot change. Once the allowed decision has
+    /// reached the agent, interrupt the turn and continue the same thread in a
+    /// turn whose sandbox has network access. Later turns keep that access.
+    func grantNetworkAccess(for operation: String) {
+        lock.lock()
+        guard !networkAccess, !cancelled, !finished, terminal == nil else { lock.unlock(); return }
+        networkAccess = true
+        networkOperation = operation
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { [self] in
+            lock.lock()
+            guard !cancelled, !finished, terminal == nil, !networkRestartPending,
+                  let currentThread = threadID, let currentTurn = turnID else { lock.unlock(); return }
+            networkRestartPending = true
+            lock.unlock()
+            publishAvailability(false)
+            try? enqueue("turn/interrupt", purpose: .interrupt, params: ["threadId": currentThread, "turnId": currentTurn])
+        }
+    }
+
+    static func networkContinuation(_ operation: String) -> String {
+        "RAD interrupted this turn only to enable network access in its sandbox, because the user allowed this operation: \(operation)\nNetwork access is available for the rest of this task. Continue the current design request from where you stopped without repeating completed work, and rerun any command that was interrupted. Finish with the final response JSON as instructed."
+    }
+
+    private func execute(input: Data, imagePaths: [String]) throws -> Data {
+        lock.lock()
+        if cancelled { lock.unlock(); throw CancellationError() }
+        do { try process.run(); running = true; lock.unlock() }
+        catch { lock.unlock(); throw CodexError.failed("Could not start the design task: \(error.localizedDescription)") }
+        defer { shutdown() }
+        pipes.configure()
+        try enqueue("initialize", purpose: .initialize, params: [
+            "clientInfo": CodexAppServerClient.info(),
+            "capabilities": ["experimentalApi": false]
+        ])
+        let prompt = String(decoding: input, as: UTF8.self)
+        var exitedAt: Date?
+        while true {
+            try expireRequests()
+            lock.lock()
+            let isCancelled = cancelled
+            let cancelDate = cancellationDate
+            let ending = terminal
+            let endingDate = completedAt
+            let awaitingSteer = pending.values.contains { $0.purpose == .steer }
+            let requestDeadline = pending.values.compactMap(\.deadline).min()
+            lock.unlock()
+            if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
+            if let ending, !awaitingSteer { return try terminalData(ending) }
+            if ending != nil, awaitingSteer, Date().timeIntervalSince(endingDate ?? Date()) > 5 {
+                rejectPendingSteers("The task finished before acknowledging this information.")
+                continue
+            }
+            if pipes.hasExited, exitedAt == nil { exitedAt = Date() }
+            if pipes.outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
+                if isCancelled { throw CancellationError() }
+                if let ending { return try terminalData(ending) }
+                let status = process.isRunning ? "" : " with status \(process.terminationStatus)"
+                let detail = String(decoding: pipes.stderrTail, as: UTF8.self)
+                throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The app-server connection closed before the design was complete." : String(detail.suffix(2_400)))")
+            }
+            // Wait for output, queued input, cancellation or exit; otherwise
+            // wake only for the earliest timeout that the checks above apply.
+            let deadline = [requestDeadline,
+                            isCancelled ? cancelDate.map { $0.addingTimeInterval(0.35) } : nil,
+                            ending != nil && awaitingSteer ? endingDate.map { $0.addingTimeInterval(5) } : nil,
+                            exitedAt.map { $0.addingTimeInterval(0.15) }].compactMap { $0 }.min()
+            let inputOpen = try pipes.step(until: deadline, next: {
+                lock.lock(); defer { lock.unlock() }
+                return outbound.isEmpty ? nil : outbound.removeFirst()
+            }, onOutput: { try consume($0, prompt: prompt, imagePaths: imagePaths) })
+            if !inputOpen {
+                if isCancelled { throw CancellationError() }
+                throw CodexError.failed("The task’s input connection closed unexpectedly.")
+            }
+        }
+    }
+
+    private func terminalData(_ terminal: Terminal) throws -> Data {
+        lock.lock(); let isCancelled = cancelled; lock.unlock()
+        if isCancelled { throw CancellationError() }
+        switch terminal {
+        case .completed(let data): return data
+        case .failed(let message): throw CodexError.failed(message)
+        case .interrupted: throw CodexError.failed("The task was interrupted before the design was complete.")
+        }
+    }
+
+    private func shutdown() {
+        lock.lock()
+        finished = true
+        let remaining = pending.values.compactMap(\.continuation)
+        pending.removeAll(); turnID = nil; threadID = nil
+        let wasCancelled = cancelled
+        lock.unlock()
+        publishAvailability(false)
+        for continuation in remaining {
+            continuation.resume(throwing: CodexSteeringError.uncertain(wasCancelled ? "The task stopped before acknowledging the additional information." : "The task’s connection closed before acknowledging the additional information."))
+        }
+        pipes.shutdown { if process.isRunning { process.terminate() } }
+        lock.lock(); running = false; lock.unlock()
+    }
+
+    private static func frame(_ object: [String: Any]) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        data.append(10)
+        return data
+    }
+    private func enqueue(_ method: String, purpose: Purpose, params: [String: Any]) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        let id = nextRequestID; nextRequestID += 1
+        outbound.append(try Self.frame(["id": id, "method": method, "params": params]))
+        pending[id] = PendingRPC(purpose: purpose, deadline: purpose == .interrupt ? nil : Date().addingTimeInterval(60))
+        pipes.wake()
+    }
+    private func notification(_ method: String) throws {
+        let data = try Self.frame(["method": method])
+        lock.lock(); outbound.append(data); lock.unlock()
+    }
+    private func publishAvailability(_ value: Bool) {
+        lock.lock()
+        let changed = publishedAvailability != value
+        publishedAvailability = value
+        lock.unlock()
+        if changed { onSteeringAvailability(value) }
+    }
+    private func expireRequests() throws {
+        lock.lock()
+        let expired = pending.filter { $0.value.deadline.map { $0 < Date() } ?? false }
+        for (id, _) in expired { pending.removeValue(forKey: id) }
+        lock.unlock()
+        for (_, request) in expired {
+            if request.purpose == .steer {
+                request.continuation?.resume(throwing: CodexSteeringError.uncertain("The additional information was not acknowledged."))
+            } else if request.purpose != .interrupt {
+                throw CodexError.failed("The connection timed out while starting the task. Check the installed app or CLI and its sign-in.")
+            }
+        }
+    }
+    private func rejectPendingSteers(_ message: String) {
+        lock.lock()
+        let steers = pending.filter { $0.value.purpose == .steer }
+        for (id, _) in steers { pending.removeValue(forKey: id) }
+        lock.unlock()
+        for (_, request) in steers { request.continuation?.resume(throwing: CodexSteeringError.uncertain(message)) }
+    }
+
+    private func consume(_ chunk: Data, prompt: String, imagePaths: [String]) throws {
+        try lines.append(chunk, oversized: oversizedEvent) { try receive($0, prompt: prompt, imagePaths: imagePaths) }
+    }
+    private func oversizedEvent() {
+        onActivity(ProjectActivityEvent(id: "server:oversized:\(UUID().uuidString)", category: "diagnostic",
+            title: "Oversized task event", status: "failed", output: "An app-server event exceeded 32 MB and could not be retained. This execution record is incomplete."))
+    }
+
+    private func receive(_ line: Data, prompt: String, imagePaths: [String]) throws {
+        guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
+        if let method = object["method"] as? String {
+            let params = object["params"] as? [String: Any] ?? [:]
+            if let id = object["id"] { try answerServerRequest(id: id, method: method, params: params) }
+            else { handleNotification(method, params: params) }
+            return
+        }
+        guard let id = object["id"] as? Int else { return }
+        lock.lock(); let request = pending.removeValue(forKey: id); lock.unlock()
+        guard let request else { return }
+        if let error = object["error"] as? [String: Any] {
+            let message = CodexAppServerClient.errorMessage(error)
+            if request.purpose == .steer {
+                request.continuation?.resume(throwing: CodexSteeringError.rejected(message))
+                return
+            }
+            if request.purpose == .interrupt { return }
+            throw CodexError.failed(message)
+        }
+        let result = object["result"] as? [String: Any] ?? [:]
+        switch request.purpose {
+        case .initialize:
+            try notification("initialized")
+            var params: [String: Any] = ["cwd": directory.path, "sandbox": "workspace-write", "approvalPolicy": "never", "ephemeral": true,
+                                       "experimentalRawEvents": false]
+            if !model.isEmpty { params["model"] = model }
+            try enqueue("thread/start", purpose: .threadStart, params: params)
+        case .threadStart:
+            guard let thread = result["thread"] as? [String: Any], let id = thread["id"] as? String, !id.isEmpty else {
+                throw CodexError.failed("The task returned an unreadable session identifier.")
+            }
+            lock.lock(); threadID = id; lock.unlock()
+            onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle", title: "Session started", status: "completed", output: "Ephemeral thread \(id)"))
+            onProgress("Creating your design…")
+            try startTurn(threadID: id, input: Self.userInput(text: prompt, imagePaths: imagePaths))
+        case .turnStart:
+            guard let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String else {
+                throw CodexError.failed("The task returned an unreadable turn identifier.")
+            }
+            activateTurn(id)
+            if turn["status"] as? String != "inProgress" { completeTurn(turn) }
+        case .steer:
+            guard let accepted = result["turnId"] as? String, accepted == request.expectedTurnID else {
+                request.continuation?.resume(throwing: CodexSteeringError.uncertain("The expected active task was not acknowledged."))
+                return
+            }
+            request.continuation?.resume(returning: accepted)
+        case .interrupt: break
+        }
+    }
+
+    private func startTurn(threadID: String, input: [[String: Any]]) throws {
+        guard let outputSchema = try JSONSerialization.jsonObject(with: schema) as? [String: Any] else { throw CodexError.resourcesMissing }
+        lock.lock(); let network = networkAccess; lock.unlock()
+        var params: [String: Any] = ["threadId": threadID, "input": input,
+            "cwd": directory.path, "approvalPolicy": "never", "outputSchema": outputSchema,
+            "sandboxPolicy": ["type": "workspaceWrite", "writableRoots": [directory.path], "networkAccess": network,
+                              "excludeTmpdirEnvVar": true, "excludeSlashTmp": true]]
+        if !model.isEmpty { params["model"] = model }
+        if let effort, !effort.isEmpty { params["effort"] = effort }
+        try enqueue("turn/start", purpose: .turnStart, params: params)
+    }
+
+    private func activateTurn(_ id: String) {
+        lock.lock()
+        let active = !cancelled && !finished && terminal == nil
+        if active { turnID = id }
+        lock.unlock()
+        if active { publishAvailability(true) }
+    }
+    private func handleNotification(_ method: String, params: [String: Any]) {
+        lock.lock(); let rootThread = threadID; lock.unlock()
+        let isRoot = params["threadId"] as? String == rootThread
+        switch method {
+        case "turn/started":
+            if isRoot, let turn = params["turn"] as? [String: Any], let id = turn["id"] as? String { activateTurn(id) }
+        case "turn/completed":
+            if isRoot, let turn = params["turn"] as? [String: Any] { completeTurn(turn) }
+        case "item/started", "item/completed":
+            guard let item = params["item"] as? [String: Any] else { return }
+            handleItem(item, completed: method == "item/completed", root: isRoot, thread: params["threadId"] as? String ?? "")
+        case "item/agentMessage/delta":
+            guard isRoot, let id = params["itemId"] as? String, let delta = params["delta"] as? String else { return }
+            var message = messages[id] ?? Message(text: "", phase: nil)
+            if message.text.utf8.count + delta.utf8.count <= Self.maximumFinalBytes { message.text += delta }
+            else {
+                onActivity(ProjectActivityEvent(id: "server:message-limit:\(id)", category: "diagnostic", title: "Task message exceeded its size limit", status: "failed"))
+            }
+            messages[id] = message
+            // Unknown-phase deltas might be final JSON or tool/code text. Wait
+            // for their completed item before classifying them as commentary.
+            if message.phase == "commentary" { emitCommentary(id, message: message) }
+        case "item/commandExecution/outputDelta":
+            guard let id = params["itemId"] as? String, let delta = params["delta"] as? String else { return }
+            let key = (params["threadId"] as? String ?? "") + ":" + id
+            if commandOutputBytes + delta.utf8.count <= Self.maximumEventBytes {
+                commandOutputs[key, default: ""] += delta; commandOutputBytes += delta.utf8.count
+            } else if incompleteCommands.insert(key).inserted {
+                onActivity(ProjectActivityEvent(id: "server:command-limit:\(key)", category: "diagnostic", title: "Command output exceeded its size limit", status: "failed", output: "The public command output exceeded RAD’s 32 MB buffer; this execution record is incomplete."))
+            }
+            if let item = commandItems[key], Date().timeIntervalSince(lastCommandUpdate[key] ?? .distantPast) >= 0.25 {
+                lastCommandUpdate[key] = Date()
+                var updated = item; updated["aggregatedOutput"] = commandOutputs[key] ?? ""
+                emitActivity(updated, completed: false, thread: params["threadId"] as? String ?? "")
+            }
+        case "turn/plan/updated":
+            onActivity(ProjectActivityEvent(id: "server:plan:\(params["turnId"] as? String ?? "plan")", category: "plan", title: "Task plan", status: "running", output: CodexActivity.json(CodexActivity.sanitize(params))))
+        case "error":
+            onActivity(ProjectActivityEvent(id: "server:error:\(UUID().uuidString)", category: "diagnostic", title: "Task error", status: "failed", output: CodexActivity.json(CodexActivity.sanitize(params))))
+        default: break
+        }
+    }
+    private func handleItem(_ item: [String: Any], completed: Bool, root: Bool, thread: String) {
+        guard let id = item["id"] as? String, let kind = item["type"] as? String else { return }
+        if kind == "agentMessage", root {
+            var message = messages[id] ?? Message(text: "", phase: nil)
+            if let phase = item["phase"] as? String { message.phase = phase }
+            if let text = item["text"] as? String, !text.isEmpty { message.text = text }
+            messages[id] = message
+            if completed, message.phase == "final_answer" || (message.phase == nil && message.text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{")) {
+                finalResponse = message.text
+            }
+            emitCommentary(id, message: message)
+            return
+        }
+        if kind == "commandExecution" {
+            let key = thread + ":" + id
+            if completed {
+                var canonical = item
+                if canonical["aggregatedOutput"] == nil || canonical["aggregatedOutput"] is NSNull {
+                    canonical["aggregatedOutput"] = commandOutputs[key] ?? ""
+                }
+                emitActivity(canonical, completed: true, thread: thread)
+                commandOutputBytes -= commandOutputs.removeValue(forKey: key)?.utf8.count ?? 0
+                commandItems.removeValue(forKey: key); lastCommandUpdate.removeValue(forKey: key)
+            } else { commandItems[key] = item; emitActivity(item, completed: false, thread: thread) }
+            return
+        }
+        emitActivity(item, completed: completed, thread: thread)
+    }
+    private func emitActivity(_ source: [String: Any], completed: Bool, thread: String) {
+        guard let originalKind = source["type"] as? String, let id = source["id"] as? String else { return }
+        switch originalKind {
+        case "imageView":
+            onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: originalKind,
+                status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source)),
+                imageData: completed ? activityImageData(source["path"] as? String) : nil))
+            return
+        case "collabAgentToolCall", "dynamicToolCall", "sleep", "subAgentActivity":
+            onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: source["tool"] as? String ?? originalKind,
+                status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source))))
+            return
+        default:
+            if let event = CodexActivity.event(item: source, id: thread + ":" + id, completed: completed,
+                                               starts: &activityStarts) { onActivity(event) }
+        }
+    }
+    private func activityImageData(_ path: String?) -> Data? {
+        lock.lock(); let isCancelled = cancelled; lock.unlock()
+        guard !isCancelled, let path, let activityWorkspace else { return nil }
+        // This utility I/O thread captures the original encoded bytes before
+        // task cleanup. Descriptor-relative, bounded reads reject links and
+        // special files without decoding images or following external paths.
+        let data = try? activityWorkspace.read(path, maximumBytes: 32 * 1024 * 1024)
+        lock.lock(); let stopped = cancelled; lock.unlock()
+        return stopped ? nil : data
+    }
+    private func emitCommentary(_ id: String, message: Message) {
+        guard message.phase == nil || message.phase == "commentary",
+              let visible = AgentCommentary.visibleText(message.text) else { return }
+        guard emittedCommentary[id] != visible, emittedCommentary.count < 256 || emittedCommentary[id] != nil else { return }
+        emittedCommentary[id] = visible
+        onMessage(CodexProgressMessage(id: id, text: visible))
+    }
+    private func completeTurn(_ turn: [String: Any]) {
+        let status = turn["status"] as? String ?? "failed"
+        lock.lock()
+        let restart = status == "interrupted" && networkRestartPending && !cancelled && terminal == nil
+        let currentThread = threadID
+        if restart { networkRestartPending = false; turnID = nil }
+        let operation = networkOperation
+        lock.unlock()
+        if restart, let currentThread {
+            finalResponse = nil
+            onActivity(ProjectActivityEvent(id: "server:network:\(turn["id"] as? String ?? UUID().uuidString)", category: "lifecycle",
+                title: "Network access enabled", status: "completed",
+                output: "Continued the task in a turn with network access after this operation was allowed: \(operation)"))
+            do {
+                try startTurn(threadID: currentThread, input: Self.userInput(text: Self.networkContinuation(operation), imagePaths: []))
+            } catch {
+                lock.lock()
+                if terminal == nil { terminal = .failed("The task could not continue with network access."); completedAt = Date() }
+                lock.unlock()
+            }
+            return
+        }
+        for item in turn["items"] as? [[String: Any]] ?? [] where item["type"] as? String == "agentMessage" {
+            handleItem(item, completed: true, root: true, thread: "")
+        }
+        let ending: Terminal
+        if status == "completed" {
+            if let response = finalResponse, !response.isEmpty, response.utf8.count <= Self.maximumFinalBytes {
+                ending = .completed(Data(response.utf8))
+            } else { ending = .failed("The task completed without a bounded structured CAD response.") }
+        } else if status == "interrupted" { ending = .interrupted }
+        else {
+            let error = turn["error"] as? [String: Any]
+            let detail = error.flatMap(CodexAppServerClient.modelUnavailableMessage) ?? error?["message"] as? String
+            ending = .failed(detail ?? "The task could not complete the design.")
+        }
+        lock.lock()
+        if terminal == nil { terminal = ending; completedAt = Date(); turnID = nil }
+        lock.unlock()
+        publishAvailability(false)
+        onProgress("Checking the CAD design…")
+        onActivity(ProjectActivityEvent(id: "server:turn:\(turn["id"] as? String ?? "turn")", category: "lifecycle", title: "Task finished",
+            status: status == "completed" ? "completed" : status == "interrupted" ? "canceled" : "failed", output: "Turn \(turn["id"] as? String ?? "") · \(status)"))
+    }
+
+    private func answerServerRequest(id: Any, method: String, params: [String: Any]) throws {
+        let result: [String: Any]
+        switch method {
+        case "item/commandExecution/requestApproval", "item/fileChange/requestApproval": result = ["decision": "decline"]
+        case "execCommandApproval", "applyPatchApproval": result = ["decision": "denied"]
+        case "item/permissions/requestApproval": result = ["permissions": [:], "scope": "turn"]
+        case "item/tool/requestUserInput": result = ["answers": [:]]
+        case "mcpServer/elicitation/request": result = ["action": "decline"]
+        case "item/tool/call": result = ["success": false, "contentItems": [["type": "inputText", "text": "This dynamic tool is not available in RAD. Use the configured RAD MCP tools."]]]
+        default:
+            let data = try Self.frame(["id": id, "error": ["code": -32601, "message": "RAD does not support this interactive request."]])
+            lock.lock(); outbound.append(data); lock.unlock()
+            return
+        }
+        onActivity(ProjectActivityEvent(id: "server:request:\(String(describing: id))", category: "diagnostic", title: "Interactive request declined", status: "failed",
+            input: method, output: "The task’s configured approval policy does not allow this interactive request. \(CodexActivity.json(CodexActivity.sanitize(params)))"))
+        let data = try Self.frame(["id": id, "result": result])
+        lock.lock(); outbound.append(data); lock.unlock()
+    }
+}

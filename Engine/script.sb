@@ -1,0 +1,37 @@
+(version 1)
+(deny default)
+
+; RAD runs Python programs in a separate native process. Only the installed
+; runtime, system libraries, the bundled worker, the native SDF kernel (KERNEL,
+; the resolved libRADSDF.dylib path) and this build's scratch directory are
+; readable. Network and process-fork remain denied.
+(allow file-read-metadata)
+(allow file-map-executable
+    (literal (param "KERNEL"))
+    (subpath (param "RUNTIME"))
+    (subpath (param "PYTHON_BASE"))
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/Library/Apple/System/Library"))
+(allow file-read*
+    ; dyld/libignition opens the root directory as its openat(2) base.
+    (literal "/")
+    (literal (param "KERNEL"))
+    (subpath (param "RUNTIME"))
+    (subpath (param "PYTHON_BASE"))
+    (subpath (param "WORKER"))
+    (subpath (param "OUTPUT"))
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/usr/share")
+    (subpath "/Library/Apple/System/Library")
+    (literal "/dev/null")
+    (literal "/dev/random")
+    (literal "/dev/urandom"))
+(allow file-write* (subpath (param "OUTPUT")) (literal "/dev/null"))
+(allow process-exec (literal (param "PYTHON")) (literal (param "ENTRY_PYTHON")))
+(allow signal (target self))
+(allow sysctl-read)
+(allow mach-lookup
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.logd"))

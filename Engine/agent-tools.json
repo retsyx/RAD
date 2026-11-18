@@ -1,0 +1,836 @@
+[
+  {
+    "name": "rad_runtime",
+    "description": "Discover RAD's ready-to-use CAD runtime: the Python executable with numpy and the radsdf signed distance field modeling API, the native kernel version, threads, the task workspace and available input asset IDs. apiGuidePath names a workspace copy of the complete radsdf modeling guide: every function signature, conventions, assemblies, motion, 3D printing and limits.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_request_permission",
+    "description": "Request a current permission decision for a proposed task-workspace operation, such as an optional download or dependency installation. Call for each new operation that needs permission, including after an earlier always-allow/always-deny result. Describe the operation and why it is needed. Returns allowed, source, rememberedPolicy and task-workspace scope only; does not install or execute anything. A Mac-local global policy may answer automatically and can change in Settings. If allowed, execute the operation yourself; optional installs belong in an isolated environment inside the task workspace. Never modify RAD's shared runtime, global settings, original inputs or files outside the workspace; final CAD replay must use bundled dependencies only. A denial or canceled request grants no permission.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Specific proposed operation, including optional dependency names and versions when relevant."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Why this operation is needed for the user's request; no commands are executed by this tool."
+        }
+      },
+      "required": [
+        "operation",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "requestsPermission": true
+    }
+  },
+  {
+    "name": "rad_versions",
+    "description": "List the task's saved design versions with stable IDs, vN history positions, custom names, dates and the current-version marker. Read-only history lookup; does not build geometry, select a version or change the viewport.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_version",
+    "description": "Look up a saved design version by its stable UUID, vN history position or exact case-sensitive custom name. Stable UUIDs take precedence; duplicate names or a name matching another version's vN label return ambiguity candidates. Returns metadata and local paths to the complete saved CAD program and exact required original inputs, never inline source or binary data. Ambiguous names return candidates instead of guessing. Does not build geometry, select a version or change the viewport.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "type": "string",
+          "description": "Stable version UUID, history position such as v3, or exact custom version name. Use a returned stable UUID to disambiguate names or vN collisions."
+        }
+      },
+      "required": [
+        "reference"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_build",
+    "description": "Build a workspace radsdf Python program for review in RAD's sandboxed worker. The native kernel meshes every part at the preview resolution and returns an artifact ID with solids, volume, surface area, bounds, triangles, meshCellSize, warnings, assembly motion, printing facts and per-part statistics (partID, name, volume, area, bounds, centroid, triangles, pieces, and reference for reference parts, which are not printed). Program errors and empty, open or unbounded parts fail with a message to repair. Values are numeric at the mesh resolution. Does not commit the design.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "programPath": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "assetIDs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Input asset IDs the program reads as imported_assets[assetID] (from rad_import or rad_runtime inputAssets). Default: the current design's inputs, or the versionID's."
+        },
+        "versionID": {
+          "type": "string",
+          "description": "Optional stable UUID returned by rad_version. Binds that saved version's exact original imported_assets inputs for this build only; does not change the current design or register historical inputs for the final replacement program."
+        },
+        "print": {
+          "type": "boolean",
+          "default": false,
+          "description": "Build the program's 3D printing version, with rad.print true, as its own artifact in built design coordinates. Requires the same physical parts as the ordinary build. Inspect, measure and render it like any artifact."
+        }
+      },
+      "required": [
+        "programPath"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "programs": [
+        "programPath"
+      ]
+    }
+  },
+  {
+    "name": "rad_import",
+    "description": "Register a pre-existing external or reference triangle mesh from the task workspace as a design input: a binary or ASCII STL or an OBJ file, such as a part the user attached, or a faithful format conversion of a user-provided input. Never import geometry generated for this design, by RAD (rad_export_stl exports) or by external tools; authored geometry belongs in the replayable program. The mesh must be closed, consistently oriented and manifold, in millimetres; separate bodies may overlap or touch and are united, and a shell facing inward within one body's solid is a cavity. RAD validates the mesh with a build of it alone and returns that artifact with an assetID; when only that preview fails (a sheet thinner than the preview cells of its own size), the mesh is still registered and the result carries warnings instead of an artifact. Programs use the solid as imported_assets[assetID] like any radsdf solid (booleans, placement, offset, shell); list the assetID in rad_build assetIDs and the final response's assetIDs. The solid is the exact distance to the facets: curved originals stay faceted, and previews and exports re-mesh them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Workspace path of the .stl or .obj file; copy an attached file into the task workspace first."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the input (default: the file name)."
+        },
+        "producerPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional workspace files (conversion code, dependency descriptions) that produced a converted reference input, recorded in the task audit."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "sources": [
+        "producerPaths"
+      ],
+      "references": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "rad_inspect",
+    "description": "Inspect an artifact. kind summary (default) returns the build facts; parts pages per-part statistics with stable part IDs, names and colors; motion returns the assembly motion definition, current joint positions and independent joints; print returns printing directions, the reference parts the printing layout leaves out and, for a printable artifact, every printed part's orientation and packed build-plate placement; probe samples the parts' signed distance fields at points (negative inside) with unit normals, and with directions traces rays to the first surface hit, for example to measure wall thickness from inside. Coordinates are world millimetres at the artifact's assembly pose.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "summary",
+            "parts",
+            "motion",
+            "print",
+            "probe"
+          ],
+          "default": "summary"
+        },
+        "solidIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxItems": 4096,
+          "description": "Optional subset for parts, print and probe: zero-based physical solid indices from rad_inspect."
+        },
+        "partIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "minItems": 1,
+          "maxItems": 256,
+          "description": "Optional subset for parts, print and probe by stable part IDs; a folder ID selects its physical parts."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "minimum": -1000000,
+              "maximum": 1000000
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "minItems": 1,
+          "maxItems": 256,
+          "description": "probe only: world [x,y,z] points in mm. At most 8192 point-part samples."
+        },
+        "directions": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "minimum": -1000000,
+              "maximum": 1000000
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "minItems": 1,
+          "maxItems": 256,
+          "description": "probe only: optional nonzero ray direction per point; each ray reports hit, hitDistance and hitPoint for every probed part."
+        },
+        "maxDistance": {
+          "type": "number",
+          "minimum": 1e-06,
+          "maximum": 1000000,
+          "description": "probe only: longest traced ray in mm; defaults to beyond the probed parts."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_get_part_colors",
+    "description": "Read current opaque sRGB colors, stable part and folder IDs, and parent relationships. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_set_part_colors",
+    "description": "Stage an atomic batch of part or folder color assignments for one artifact without rebuilding geometry or changing the live design. Folder assignments expand to physical parts; conflicting overlaps are rejected. Use color:null to set the neutral default finish. Only a successful final response commits the current patch or the final replacement program's matching artifact patch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "properties": {
+              "partID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "color": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "red": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "green": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "blue": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    },
+                    "required": [
+                      "red",
+                      "green",
+                      "blue"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "partID",
+              "color"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build"
+    }
+  },
+  {
+    "name": "rad_measure",
+    "description": "Measure whole parts and surface points numerically. Parts report volume, surface area, size, bounds and volume centroid. Each point snaps to the surface of its part (partID, or the nearest part) and reports coordinates and the outward normal; two points add distance and axis deltas, three add the angle at the second point and triangle facts. Exactly two items with at least one part add the minimum distance and closest points (0 when touching or interfering). World coordinates at the artifact's assembly pose; values come from the parts' SDFs and preview meshes at their numeric resolution.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "partIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "minItems": 1,
+          "maxItems": 256,
+          "description": "Stable part IDs (rad_id values); a folder ID selects its physical parts."
+        },
+        "solidIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxItems": 4096,
+          "description": "Zero-based physical solid indices from rad_inspect."
+        },
+        "points": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "properties": {
+              "point": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": -1000000,
+                  "maximum": 1000000
+                },
+                "minItems": 3,
+                "maxItems": 3,
+                "description": "World [x,y,z] in mm on or near the part surface."
+              },
+              "partID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Physical part whose surface the point snaps to; default the nearest part."
+              }
+            },
+            "required": [
+              "point"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Up to three surface points, in measurement order."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_validate",
+    "description": "Validate an artifact's surfaces finer than its preview: re-mesh every part (half the preview cell size by default) and report per-part closed surfaces, boundary and non-manifold edges, pieces and volume change. Open or non-manifold surfaces, parts that split or vanish and volume changes above 2% reveal features thinner than the preview resolution. valid is true when no problem is found; run it before acceptance.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "cellSize": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 1000,
+          "description": "Optional validation mesh cell size in mm; default half the preview cell size."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_render",
+    "description": "Render an artifact through RAD's native camera, lights and display pipeline using a preset or arbitrary camera. Returns a PNG image attachment for visual review without changing the user's view. Camera coordinates are CAD-world millimetres; angles are degrees. Zoom 1 uses automatic fit, 2 doubles magnification, and 0.5 halves it. An explicit cameraPosition defines the base eye position. Perspective zoom dollies that position around cameraTarget by dividing its target distance; orthographic zoom keeps the eye position unchanged and divides the view scale. Do not combine cameraPosition with yawDegrees or elevationDegrees.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "isometric",
+            "front",
+            "back",
+            "top",
+            "bottom",
+            "left",
+            "right"
+          ],
+          "default": "isometric",
+          "description": "Preset starting orientation, retained when angular overrides are omitted."
+        },
+        "yawDegrees": {
+          "type": "number",
+          "description": "Optional camera azimuth overriding the preset: 0 looks from +X, 90 from +Y. Any finite angle; cannot combine with cameraPosition."
+        },
+        "elevationDegrees": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "description": "Optional elevation overriding the preset: 0 is in the XY plane, +90 is above (+Z), -90 below. Cannot combine with cameraPosition."
+        },
+        "rollDegrees": {
+          "type": "number",
+          "default": 0,
+          "description": "Rotation about the viewing axis; positive angles rotate the image counterclockwise. Works with either angular or position-based cameras."
+        },
+        "cameraPosition": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000
+          },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "Optional base camera [x,y,z] in CAD-world millimetres, looking toward cameraTarget. Must differ from the target. Overrides preset orientation; cannot combine with yawDegrees/elevationDegrees. Perspective zoom divides the eye-to-target distance by zoom; orthographic zoom retains this eye position and changes only the view scale."
+        },
+        "cameraTarget": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000
+          },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "Optional look-at [x,y,z] in CAD-world millimetres. Defaults to the automatic fit center of the visible artifact or solidIndices subset."
+        },
+        "zoom": {
+          "type": "number",
+          "minimum": 1e-06,
+          "maximum": 1000000,
+          "default": 1,
+          "description": "Positive magnification multiplier: 1 is automatic fit, 2 zooms in, 0.5 zooms out. With cameraPosition, 1 uses that exact base position. Perspective zoom divides the base eye-to-target distance; orthographic zoom keeps the eye unchanged and divides the orthographic view scale. Does not change geometry."
+        },
+        "jointPositions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": -1000000000,
+            "maximum": 1000000000
+          },
+          "maxProperties": 256,
+          "description": "Optional isolated assembly pose overrides keyed by stable joint ID: revolute positions are degrees and slider positions are mm. Solves mate constraints for this render only; preserves the artifact and live viewport pose. Other joint positions start from the artifact pose and may move to satisfy closed loops."
+        },
+        "drivingJoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Optional movable joint ID supplied in jointPositions whose requested value must remain fixed while passive joints satisfy closed-loop constraints."
+        },
+        "printLayout": {
+          "type": "boolean",
+          "default": false,
+          "description": "Render the 3D printing layout the user sees with both 3D printing views on and exports for printing: every printed part of a 3D printing version artifact oriented for printing and packed on the build plate at z=0; reference parts are left out. Requires an artifact built with print=true, or one whose program never reads rad.print. Cannot combine with jointPositions."
+        },
+        "projection": {
+          "type": "string",
+          "enum": [
+            "perspective",
+            "isometric"
+          ]
+        },
+        "display": {
+          "type": "string",
+          "enum": [
+            "shaded",
+            "edges",
+            "translucent",
+            "wireframe"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 2048
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 2048
+        },
+        "solidIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Zero-based physical solid indices from rad_inspect."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read",
+      "returnsImage": true
+    }
+  },
+  {
+    "name": "rad_check_motion",
+    "description": "Sweep one independent movable joint of an artifact's assembly through evenly spaced positions, solving each pose with the design's joints, closed loops and couplings, and report the minimum clearance between pairs of physical parts at every reachable pose from their signed distance fields. Distances within contactTolerance (1e-6 mm) are contact; a zero distance includes the overlap volume, separating surface contact from interference. requiredClearance reports positions closer than a running clearance. Returns per-pair minimum clearance with closest points, contact, interference and tight positions, unreachable positions and the coordinates of every joint that moves. Never changes the artifact, the live design or its pose.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "joint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Movable joint ID to sweep. Coupling followers move with their drivers and cannot be swept directly."
+        },
+        "from": {
+          "type": "number",
+          "minimum": -1000000000,
+          "maximum": 1000000000,
+          "description": "First swept position: degrees for revolute joints, mm for sliders."
+        },
+        "to": {
+          "type": "number",
+          "minimum": -1000000000,
+          "maximum": 1000000000,
+          "description": "Last swept position, included in the sweep."
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 361,
+          "default": 73,
+          "description": "Number of evenly spaced poses, including both ends."
+        },
+        "pairs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Pairs of physical part IDs (stable rad_id values) whose clearance is checked at each pose."
+        },
+        "jointPositions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": -1000000000,
+            "maximum": 1000000000
+          },
+          "maxProperties": 256,
+          "description": "Optional starting coordinates for other independent joints, keyed by joint ID. Other joints start from the artifact pose; passive closed-loop joints follow the sweep."
+        },
+        "requiredClearance": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1000,
+          "default": 0,
+          "description": "Optional minimum gap in mm that each pair must keep, such as 0.3 to 0.5 mm running clearance for printed parts. Positions closer than this, but not touching, are reported as tightPositions."
+        }
+      },
+      "required": [
+        "joint",
+        "from",
+        "to",
+        "pairs"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "rad_screenshot",
+    "description": "Capture the current RAD viewport as a PNG image attachment with its camera, display, hidden and selected solid indices, selectedParts (part IDs and names), solidTransforms and selectedPoints: the user's picked surface points with their part, built part coordinates and unit normal, and worldPoint/worldNormal as displayed, ready for rad_measure. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "capture",
+      "returnsImage": true
+    }
+  },
+  {
+    "name": "rad_export_stl",
+    "description": "Export an artifact as binary STL (millimetres) into the task workspace, re-meshed from its SDFs at export resolution and simplified with a 0.01 mm tolerance (flat and gently curved regions become large triangles; sharp edges and corners stay; the field is checked at sampled points, so the surface can deviate slightly more between them, near curved sharp edges and on scaled or blended shapes), with every part a separate closed shell. Export the whole artifact or selected parts; individualParts writes one STL per physical part named from the parts tree; parts stay at the artifact's assembly pose unless jointPositions poses them; printLayout exports the 3D printing layout: a printing version artifact's printed parts oriented for printing and packed on the build plate at z=0, as the user's export for 3D printing, leaving out reference parts. STL has no colors. Returns file references without sending the bytes as text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design."
+        },
+        "path": {
+          "type": "string",
+          "description": "Workspace output path; default exports/<artifactID>.stl, or the folder exports/<artifactID>-parts with individualParts."
+        },
+        "solidIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxItems": 4096,
+          "description": "Zero-based physical solid indices from rad_inspect."
+        },
+        "partIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "minItems": 1,
+          "maxItems": 256,
+          "description": "Stable part IDs (rad_id values); a folder ID selects its physical parts."
+        },
+        "individualParts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write one STL file per physical part, named from the parts tree."
+        },
+        "jointPositions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": -1000000000,
+            "maximum": 1000000000
+          },
+          "maxProperties": 256,
+          "description": "Optional assembly pose for this export keyed by stable joint ID: revolute positions are degrees and slider positions are mm. Other joints start from the artifact pose."
+        },
+        "drivingJoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Optional joint in jointPositions held fixed while passive joints satisfy closed loops."
+        },
+        "printLayout": {
+          "type": "boolean",
+          "default": false,
+          "description": "Export the 3D printing layout. Requires an artifact built with print=true, or one whose program never reads rad.print. Cannot combine with jointPositions."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "export",
+      "exportPath": "path"
+    }
+  }
+]

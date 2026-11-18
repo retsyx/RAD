@@ -1,0 +1,3 @@
+# Tested native arm64 / Python 3.14 runtime. Geometry runs in RAD's native SDF
+# kernel (libRADSDF.dylib, shipped in the app); Python needs only NumPy.
+numpy==2.4.6
