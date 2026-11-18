@@ -43,7 +43,7 @@ class MeshOptions(ctypes.Structure):
     _fields_ = [("cell_size", ctypes.c_double), ("crease_angle", ctypes.c_double), ("max_cells", ctypes.c_uint64),
                 ("threads", ctypes.c_int32), ("refine_steps", ctypes.c_int32),
                 ("bounds_lo", ctypes.c_double * 3), ("bounds_hi", ctypes.c_double * 3),
-                ("bounds_valid", ctypes.c_int32), ("reserved", ctypes.c_int32)]
+                ("bounds_valid", ctypes.c_int32), ("flags", ctypes.c_uint32)]
 
 
 class MeshStats(ctypes.Structure):
@@ -128,8 +128,9 @@ class Kernel:
         dimension = self.lib.rsdf_node_dimension(handle, node)
         return lo[:dimension], hi[:dimension], lipschitz.value
 
-    def mesh(self, handle, node, cell_size, threads=0, bounds=None, max_cells=0, crease_angle=0.0):
-        options = MeshOptions(cell_size=cell_size, crease_angle=crease_angle, max_cells=max_cells, threads=threads)
+    def mesh(self, handle, node, cell_size, threads=0, bounds=None, max_cells=0, crease_angle=0.0, preview=False):
+        options = MeshOptions(cell_size=cell_size, crease_angle=crease_angle, max_cells=max_cells, threads=threads,
+                              flags=1 if preview else 0)
         if bounds is not None:
             options.bounds_lo[:] = bounds[0]
             options.bounds_hi[:] = bounds[1]
@@ -1060,6 +1061,82 @@ class MeshTests(KernelCase):
                 nearest = np.min(length(mesh.positions.astype(float) - (center + corner)))
                 self.assertLess(nearest, 0.01 * cell, msg=f"corner {center + corner} at h={cell}")
 
+    def test_oblique_shallow_crease_follows_the_implicit_ridge(self):
+        # The roof planes meet at an 18-degree change of normal. The ridge
+        # crosses the sampling lattice obliquely and lies below the threshold
+        # for a drawn edge, but it still separates the two shading normals.
+        g = Graph()
+        angle = math.radians(18 / 2)
+        s, c = math.sin(angle), math.cos(angle)
+        body = g.add(BOX, [], [4, 4, 3, 0])
+        left = g.add(HALFSPACE, [], [-s, 0, c, 2 * c])
+        right = g.add(HALFSPACE, [], [s, 0, c, 2 * c])
+        roof = g.add(INTERSECTION, [body, left, right], [0])
+        rotation = rotation_matrix([1, 2, 3], 29)
+        offset = np.array([0.137, -0.159, 0.213])
+        node = g.move(roof, offset, rotation)
+        cell = 0.43
+        mesh = self.mesh(g, node, cell, preview=True)
+
+        points = (mesh.positions.astype(float) - offset) @ rotation
+        local = points[mesh.triangles]
+        x, y, z = local.transpose(2, 0, 1)
+        top = (np.abs(y).max(axis=1) < 2.7) & (np.abs(x).max(axis=1) < 1.4) & (z.min(axis=1) > 1.65)
+        local = local[top]
+        self.assertGreater(len(local), 100)
+        x = local[:, :, 0]
+        # A triangle that has two corners across the exact ridge uses a
+        # blended normal where the hard transition should be.
+        crossing = (x.min(axis=1) < -0.02 * cell) & (x.max(axis=1) > 0.02 * cell)
+        self.assertLess(np.mean(crossing), 0.03)
+
+        side = np.sign(x.mean(axis=1))
+        normals = mesh.normals[mesh.triangles[top]].astype(float) @ rotation
+        cosine = normals[:, :, 0] * side[:, None] * s + normals[:, :, 2] * c
+        self.assertGreater(np.percentile(cosine, 5), math.cos(math.radians(2)))
+        self.assertEqual(mesh.stats.boundary_edges, 0)
+        self.assertEqual(mesh.stats.nonmanifold_edges, 0)
+        self.assertEqual(mesh.stats.components, 1)
+
+    def test_curved_shallow_crease_preserves_the_normals_on_both_sides(self):
+        # A plane clipped near the sphere's pole leaves a circular crease
+        # with a 22-degree change of normal. Rotate it off the sampling axes.
+        g = Graph()
+        radius, angle = 5, math.radians(22)
+        cut_height = radius * math.cos(angle)
+        rim_radius = radius * math.sin(angle)
+        ball = g.add(SPHERE, [], [radius])
+        plane = g.add(HALFSPACE, [], [0, 0, 1, cut_height])
+        clipped = g.add(INTERSECTION, [ball, plane], [0])
+        rotation = rotation_matrix([1, 2, 3], 29)
+        offset = np.array([0.137, -0.159, 0.213])
+        node = g.move(clipped, offset, rotation)
+        cell = 0.3
+        mesh = self.mesh(g, node, cell, threads=1, preview=True)
+        parallel = self.mesh(g, node, cell, threads=4, preview=True)
+        for key in ("positions", "normals", "triangles", "creases"):
+            np.testing.assert_array_equal(getattr(mesh, key), getattr(parallel, key))
+
+        points = (mesh.positions.astype(float) - offset) @ rotation
+        local = points[mesh.triangles]
+        radial = np.hypot(local[:, :, 0], local[:, :, 1])
+        near_rim = (np.abs(radial - rim_radius).max(axis=1) < 0.65) & (local[:, :, 2].min(axis=1) > cut_height - 0.5)
+        self.assertGreater(np.count_nonzero(near_rim), 500)
+        radial = radial[near_rim]
+        crossing = (radial.min(axis=1) < rim_radius - 0.02 * cell) & (radial.max(axis=1) > rim_radius + 0.02 * cell)
+        self.assertLess(np.mean(crossing), 0.01)
+
+        local = local[near_rim]
+        normals = mesh.normals[mesh.triangles[near_rim]].astype(float) @ rotation
+        center = local.mean(axis=1)
+        on_cap = np.hypot(center[:, 0], center[:, 1]) < rim_radius
+        outward = local / np.linalg.norm(local, axis=2)[:, :, None]
+        cosine = np.where(on_cap[:, None], normals[:, :, 2], np.sum(normals * outward, axis=2))
+        self.assertGreater(np.percentile(cosine, 5), math.cos(math.radians(2)))
+        self.assertEqual(mesh.stats.boundary_edges, 0)
+        self.assertEqual(mesh.stats.nonmanifold_edges, 0)
+        self.assertEqual(mesh.stats.components, 1)
+
     def test_faces_beside_creases_shade_with_their_own_normals(self):
         # A crease vertex lies where faces meet, so its gradient is a blend of
         # theirs: flat faces must shade flat up to their edges. A blend
@@ -1073,7 +1150,7 @@ class MeshTests(KernelCase):
         axis, up = rotation[:, 2], np.array([0.0, 0.0, 1.0])
         cases = [(cylinder, 0.3, axis, 0.5), (cylinder, 0.37, axis, 0.5), (slotted, 0.72, up, 20)]
         for node, cell, normal, tolerance in cases:
-            mesh = self.mesh(g, node, cell)
+            mesh = self.mesh(g, node, cell, preview=True)
             corners = mesh.positions[mesh.triangles].astype(float)
             facet = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
             facet /= length(facet)[:, None]

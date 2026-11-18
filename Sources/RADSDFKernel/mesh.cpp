@@ -69,12 +69,22 @@ public:
           cos_half_crease_(std::cos(crease_degrees * M_PI / 360)), threads_(threads), spatial_(spatial), vertex_count_(surface.positions.size() / 3),
           triangle_count_(surface.triangles.size() / 3) {}
 
-    void run(rsdf_mesh &mesh) {
-        vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *position) {
-            std::copy_n(&surface_.positions[3 * v], 3, position);
-        });
+    void run(rsdf_mesh &mesh, std::vector<double> vertex_normals = {}) {
+        vertex_normals_ = std::move(vertex_normals);
+        const size_t existing = vertex_normals_.size() / 3;
+        if (existing == 0) {
+            vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *p) {
+                std::copy_n(&surface_.positions[3 * v], 3, p);
+            });
+        } else if (existing < vertex_count_) {
+            const auto extra = gradients(field_, vertex_count_ - existing, eps_, threads_, spatial_, [&](size_t v, double *p) {
+                std::copy_n(&surface_.positions[3 * (existing + v)], 3, p);
+            });
+            vertex_normals_.insert(vertex_normals_.end(), extra.begin(), extra.end());
+        }
         triangle_normals(mesh.stats.cell_size);
         build_adjacency();
+        assign_crease_sides(mesh.stats.cell_size);
         split_vertices(mesh);
         analyse_edges(mesh);
         prune_spurs(mesh);
@@ -180,6 +190,34 @@ private:
         for (size_t c = 0; c < surface_.triangles.size(); ++c) corners_[fill[surface_.triangles[c]]++] = uint32_t(c);
     }
 
+    // Probe just inside each incident triangle at the located surface crease.
+    // Its two one-sided normals are shared by every corner on each face.
+    void assign_crease_sides(double cell) {
+        if (surface_.crease_samples.empty()) return;
+        const size_t start = first_corner_[surface_.first_crease_vertex];
+        const auto side_normals = gradients(field_, corners_.size() - start, eps_ / 16, threads_, spatial_,
+            [&](size_t i, double *sample) {
+                const uint32_t corner = corners_[start + i];
+                const uint32_t *v = &surface_.triangles[3 * (corner / 3)];
+                const uint32_t at = corner % 3;
+                const double *p = &surface_.positions[3 * size_t(v[at])];
+                const double *a = &surface_.positions[3 * size_t(v[(at + 1) % 3])];
+                const double *b = &surface_.positions[3 * size_t(v[(at + 2) % 3])];
+                double direction[3];
+                for (int axis = 0; axis < 3; ++axis) direction[axis] = a[axis] + b[axis] - 2 * p[axis];
+                normalize(direction);
+                const auto &origin = surface_.crease_samples[v[at] - surface_.first_crease_vertex].point;
+                for (int axis = 0; axis < 3; ++axis) sample[axis] = origin[axis] + 0.006 * cell * direction[axis];
+            });
+        crease_sides_.resize(side_normals.size() / 3);
+        for (size_t i = 0; i < crease_sides_.size(); ++i) {
+            const uint32_t v = surface_.triangles[corners_[start + i]];
+            const auto &sides = surface_.crease_samples[v - surface_.first_crease_vertex].normals;
+            const double *normal = &side_normals[3 * i];
+            crease_sides_[i] = dot(normal, sides[1].data()) > dot(normal, sides[0].data());
+        }
+    }
+
     // Most surface vertex gradients already agree with their incident
     // triangles. Use the area vector of the fan to guide ambiguous samples.
     void vertex_normal(size_t v, double cell, double *normal) const {
@@ -211,6 +249,16 @@ private:
     uint32_t group_corners(size_t v, std::vector<uint32_t> &groups, std::vector<uint32_t> &parent) const {
         const uint32_t begin = first_corner_[v], count = first_corner_[v + 1] - begin;
         groups.assign(count, 0);
+        if (v >= surface_.first_crease_vertex) {
+            const size_t start = begin - first_corner_[surface_.first_crease_vertex];
+            const uint8_t first_side = crease_sides_[start];
+            uint32_t last_group = 0;
+            for (uint32_t i = 1; i < count; ++i) {
+                groups[i] = crease_sides_[start + i] != first_side;
+                last_group |= groups[i];
+            }
+            return last_group + 1;
+        }
         // Normals within half the crease angle of one of them pairwise differ
         // by less than the crease angle: no crease edge, one group.
         const double *first = count ? &tri_normals_[3 * size_t(corners_[begin] / 3)] : nullptr;
@@ -299,7 +347,7 @@ private:
                 for (size_t i = 0; i < groups.size(); ++i) {
                     const uint32_t corner = corners_[begin + i];
                     mesh.triangles[corner] = static_cast<uint32_t>(output(groups[i]));
-                    if (count == 1) continue;
+                    if (count == 1 || v >= surface_.first_crease_vertex) continue;
                     const double *nt = &tri_normals_[3 * size_t(corner / 3)];
                     const double angle = corner_angle(corner);
                     for (int a = 0; a < 3; ++a) {
@@ -309,7 +357,12 @@ private:
                 }
                 for (uint32_t group = 0; group < count; ++group) {
                     double normal[3];
-                    if (count == 1) {
+                    if (v >= surface_.first_crease_vertex) {
+                        const size_t start = begin - first_corner_[surface_.first_crease_vertex];
+                        const auto &sides = surface_.crease_samples[v - surface_.first_crease_vertex].normals;
+                        const auto &side = sides[crease_sides_[start] ^ group];
+                        std::copy(side.begin(), side.end(), normal);
+                    } else if (count == 1) {
                         vertex_normal(v, mesh.stats.cell_size, normal);
                     } else {
                         std::copy(&weighted[3 * group], &weighted[3 * group] + 3, normal);
@@ -653,6 +706,7 @@ private:
     const size_t vertex_count_, triangle_count_;
     std::vector<double> tri_normals_, vertex_normals_;
     std::vector<uint32_t> first_corner_, corners_;
+    std::vector<uint8_t> crease_sides_;
 };
 
 std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, const rsdf_mesh_options *options) {
@@ -722,7 +776,16 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
         settings.spatial_order = n.sorts_queries;
         Surface surface = extract_surface(field, settings);
         refine_surface(field, surface, settings);
-        Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order).run(*mesh);
+        std::vector<double> normals;
+        if (options->flags & RSDF_MESH_PREVIEW_CREASES) {
+            normals = gradients(field, surface.positions.size() / 3, settings.gradient_step, settings.threads,
+                                settings.spatial_order, [&](size_t v, double *p) {
+                                    std::copy_n(&surface.positions[3 * v], 3, p);
+                                });
+            align_surface_creases(field, surface, settings, normals);
+        }
+        Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order)
+            .run(*mesh, std::move(normals));
     }
     mesh->stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return mesh;

@@ -4,6 +4,8 @@
 
 #include "kernel.h"
 
+#include <array>
+
 namespace rsdf {
 
 // The field being meshed: the node intersected with the meshing box, so the
@@ -34,6 +36,11 @@ enum : uint8_t {
     kSpreadVertex = 2,  // not sharp, but its cell's crossing normals spread (a curved or blended region)
 };
 
+struct CreaseSample {
+    std::array<double, 3> point;
+    std::array<double, 3> normals[2];
+};
+
 // Dual contouring output before shading: one vertex per referenced active
 // cell, plus the vertices refinement adds.
 struct Surface {
@@ -41,7 +48,24 @@ struct Surface {
     std::vector<uint32_t> triangles;  // 3 per triangle, outward counter-clockwise
     std::vector<uint8_t> marks;       // 1 per vertex from extraction; empty for other surfaces
     uint64_t active_cells = 0;
+    // One exact surface sample for each appended preview crease vertex. Its
+    // mesh position may stay on the chord to keep the adjacent faces flat.
+    uint32_t first_crease_vertex = UINT32_MAX;
+    std::vector<CreaseSample> crease_samples;
 };
+
+inline uint64_t surface_edge_key(uint32_t a, uint32_t b) {
+    return a < b ? uint64_t(a) << 32 | b : uint64_t(b) << 32 | a;
+}
+
+// Splits both triangles incident to each edge, using the already appended
+// vertices in sorted edge-key order. If chord positions are supplied, use
+// them for any projected cuts that would fold an adjacent face.
+void subdivide_surface(Surface &surface, const std::vector<uint64_t> &edges, uint32_t first_vertex,
+                       const std::vector<std::array<double, 3>> &chord_points = {});
+
+void align_surface_creases(const MeshField &field, Surface &surface, const MeshSettings &settings,
+                           const std::vector<double> &normals);
 
 Surface extract_surface(const MeshField &field, const MeshSettings &settings);
 

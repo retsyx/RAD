@@ -619,7 +619,8 @@ def _mesh_part(graph, node, label, cell, threads):
     import radsdf
     diagnostic = {"stage": "preview_meshing", "cellSize": cell}
     try:
-        mesh = graph.mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE, threads=threads)
+        mesh = graph.native_mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE,
+                                 threads=threads, _preview=True).mesh()
     except radsdf.SDFError as error:
         raise ModelError(f"{label} could not be meshed at the preview cell size of {cell:.4g} mm: {error}",
                          diagnostic=diagnostic) from error

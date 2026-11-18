@@ -31,8 +31,13 @@ typedef struct {
     double bounds_lo[3];    /* explicit meshing bounds, used when bounds_valid != 0 */
     double bounds_hi[3];
     int32_t bounds_valid;
-    int32_t reserved;
+    uint32_t flags;         /* RSDF_MESH_* flags, or zero */
 } rsdf_mesh_options;
+
+enum {
+    /* Trace shallow shading creases through the extracted preview surface. */
+    RSDF_MESH_PREVIEW_CREASES = 1u
+};
 
 typedef struct {
     uint64_t vertex_count;

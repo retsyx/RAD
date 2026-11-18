@@ -26,10 +26,6 @@ std::vector<uint32_t> visiting_order(size_t count, const MeshSettings &s, const 
     return order;
 }
 
-inline uint64_t edge_key(uint32_t a, uint32_t b) {
-    return a < b ? uint64_t(a) << 32 | b : uint64_t(b) << 32 | a;
-}
-
 // Field values at points (3 per point).
 std::vector<double> values(const MeshField &field, const MeshSettings &s, const std::vector<double> &points) {
     const size_t count = points.size() / 3;
@@ -203,7 +199,7 @@ void refine_surface(const MeshField &field, Surface &surface, const MeshSettings
             if (level == 0 ? !(marks & kSpreadVertex) && !(std::fabs(bulges[t]) > kBulge * h)
                            : std::max({v[0], v[1], v[2]}) < fresh)
                 continue;
-            for (int k = 0; k < 3; ++k) keys.push_back(edge_key(v[k], v[(k + 1) % 3]));
+            for (int k = 0; k < 3; ++k) keys.push_back(surface_edge_key(v[k], v[(k + 1) % 3]));
         }
         std::sort(keys.begin(), keys.end());
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -281,48 +277,144 @@ void refine_surface(const MeshField &field, Surface &surface, const MeshSettings
         surface.positions.insert(surface.positions.end(), points.begin(), points.end());
         surface.marks.resize(vertices + split.size(), kSpreadVertex);
 
-        // Conforming subdivision: new vertex of edge (a, b), or kNone.
-        constexpr uint32_t kNone = UINT32_MAX;
-        std::vector<uint8_t> touched(vertices, 0);
-        for (uint64_t key : split) touched[key >> 32] = touched[uint32_t(key)] = 1;
-        auto middle = [&](uint32_t a, uint32_t b) -> uint32_t {
-            if (!touched[a] || !touched[b]) return kNone;
-            const auto it = std::lower_bound(split.begin(), split.end(), edge_key(a, b));
-            return it != split.end() && *it == edge_key(a, b) ? uint32_t(vertices + (it - split.begin())) : kNone;
-        };
-        auto distance2 = [&](uint32_t a, uint32_t b) {
-            const double *p = &surface.positions[3 * size_t(a)], *q = &surface.positions[3 * size_t(b)];
-            const double d[3] = {q[0] - p[0], q[1] - p[1], q[2] - p[2]};
-            return dot3(d, d);
-        };
-        std::vector<uint32_t> out;
-        out.reserve(surface.triangles.size() + 9 * split.size());
-        for (size_t t = 0; t < triangles; ++t) {
-            const uint32_t v[3] = {tri[3 * t], tri[3 * t + 1], tri[3 * t + 2]};
-            const uint32_t m[3] = {middle(v[0], v[1]), middle(v[1], v[2]), middle(v[2], v[0])};  // m[k] on edge k
-            const int count = (m[0] != kNone) + (m[1] != kNone) + (m[2] != kNone);
-            if (count == 0) {
-                out.insert(out.end(), v, v + 3);
-            } else if (count == 3) {
-                out.insert(out.end(), {v[0], m[0], m[2], m[0], v[1], m[1], m[2], m[1], v[2], m[0], m[1], m[2]});
-            } else if (count == 1) {
-                const int k = m[0] != kNone ? 0 : m[1] != kNone ? 1 : 2;
-                const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
-                out.insert(out.end(), {a, m[k], c, m[k], b, c});
-            } else {
-                const int k = m[0] == kNone ? 0 : m[1] == kNone ? 1 : 2;  // the unsplit edge
-                const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
-                const uint32_t p = m[(k + 1) % 3], q = m[(k + 2) % 3];   // on b-c and c-a
-                out.insert(out.end(), {p, c, q});
-                if (distance2(a, p) <= distance2(b, q)) {
-                    out.insert(out.end(), {a, b, p, a, p, q});
-                } else {
-                    out.insert(out.end(), {a, b, q, b, p, q});
-                }
-            }
-        }
-        surface.triangles.swap(out);
+        subdivide_surface(surface, split, static_cast<uint32_t>(vertices));
     }
+}
+
+namespace {
+
+constexpr uint32_t kNoCut = UINT32_MAX;
+
+// Emits triangles in the original winding. With two cuts, either diagonal
+// connects the two split points and leaves the crease as a shared edge.
+template <class Emit>
+void divide_triangle(const uint32_t *v, const uint32_t *m, bool first_diagonal, const Emit &emit) {
+    const int count = (m[0] != kNoCut) + (m[1] != kNoCut) + (m[2] != kNoCut);
+    switch (count) {
+    case 0:
+        emit(v[0], v[1], v[2]);
+        break;
+    case 1: {
+        const int k = m[0] != kNoCut ? 0 : m[1] != kNoCut ? 1 : 2;
+        const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
+        emit(a, m[k], c);
+        emit(m[k], b, c);
+        break;
+    }
+    case 2: {
+        const int k = m[0] == kNoCut ? 0 : m[1] == kNoCut ? 1 : 2;
+        const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
+        const uint32_t p = m[(k + 1) % 3], q = m[(k + 2) % 3];
+        emit(p, c, q);
+        if (first_diagonal) {
+            emit(a, b, p);
+            emit(a, p, q);
+        } else {
+            emit(a, b, q);
+            emit(b, p, q);
+        }
+        break;
+    }
+    case 3:
+        emit(v[0], m[0], m[2]);
+        emit(m[0], v[1], m[1]);
+        emit(m[2], m[1], v[2]);
+        emit(m[0], m[1], m[2]);
+        break;
+    }
+}
+
+std::array<double, 3> area_vector(const double *a, const double *b, const double *c) {
+    const double u[] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const double v[] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    return {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+}
+
+// A projected cut can fold a child of a very thin triangle. Keep its chord
+// position anywhere a projection would make a child turn away from its
+// parent. Test each combination of chord and projected positions because
+// an adjacent triangle can also cause a shared cut to stay on the chord.
+bool safe_projection(const double *positions, const uint32_t *v, const uint32_t *m,
+                     uint32_t first, const std::vector<std::array<double, 3>> &chord_points) {
+    constexpr uint32_t v_local[3] = {0, 1, 2};
+    uint32_t m_local[3];
+    int bits = 0;
+    for (int k = 0; k < 3; ++k) {
+        m_local[k] = m[k] == kNoCut ? kNoCut : 3u + k;
+        if (m[k] != kNoCut) bits |= 1 << k;
+    }
+    if (bits == 0) return true;
+    const double *points[6] = {&positions[3 * size_t(v[0])], &positions[3 * size_t(v[1])],
+                               &positions[3 * size_t(v[2])], nullptr, nullptr, nullptr};
+    const auto parent = area_vector(points[0], points[1], points[2]);
+    const double parent_area = std::sqrt(dot3(parent.data(), parent.data()));
+    // A collapsed parent gives no reliable guide to shifting its children.
+    if (!(parent_area > 0)) return false;
+    for (int mask = bits; mask != 0; mask = (mask - 1) & bits) {
+        for (int k = 0; k < 3; ++k) {
+            if (m[k] == kNoCut) continue;
+            points[3 + k] = mask & (1 << k) ? &positions[3 * size_t(m[k])] : chord_points[m[k] - first].data();
+        }
+        bool safe = true;
+        auto check = [&](uint32_t a, uint32_t b, uint32_t c) {
+            const auto child = area_vector(points[a], points[b], points[c]);
+            const double child_area = std::sqrt(dot3(child.data(), child.data()));
+            safe &= dot3(parent.data(), child.data()) > 0.5 * parent_area * child_area;
+        };
+        divide_triangle(v_local, m_local, true, check);
+        if (bits == 3 || bits == 5 || bits == 6) divide_triangle(v_local, m_local, false, check);
+        if (!safe) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+void subdivide_surface(Surface &surface, const std::vector<uint64_t> &edges, uint32_t first_vertex,
+                       const std::vector<std::array<double, 3>> &chord_points) {
+    std::vector<uint8_t> touched(first_vertex, 0);
+    for (uint64_t key : edges) touched[key >> 32] = touched[uint32_t(key)] = 1;
+    auto middle = [&](uint32_t a, uint32_t b) -> uint32_t {
+        if (!touched[a] || !touched[b]) return kNoCut;
+        const uint64_t key = surface_edge_key(a, b);
+        const auto it = std::lower_bound(edges.begin(), edges.end(), key);
+        return it != edges.end() && *it == key ? first_vertex + static_cast<uint32_t>(it - edges.begin()) : kNoCut;
+    };
+    auto distance2 = [&](uint32_t a, uint32_t b) {
+        const double *p = &surface.positions[3 * size_t(a)], *q = &surface.positions[3 * size_t(b)];
+        const double d[3] = {q[0] - p[0], q[1] - p[1], q[2] - p[2]};
+        return dot3(d, d);
+    };
+    if (!chord_points.empty()) {
+        std::vector<uint8_t> keep_projection(edges.size(), 1);
+        for (size_t i = 0; i < surface.triangles.size(); i += 3) {
+            const uint32_t *v = &surface.triangles[i];
+            const uint32_t m[] = {middle(v[0], v[1]), middle(v[1], v[2]), middle(v[2], v[0])};
+            if (safe_projection(surface.positions.data(), v, m, first_vertex, chord_points)) continue;
+            for (uint32_t index : m)
+                if (index != kNoCut) keep_projection[index - first_vertex] = 0;
+        }
+        for (size_t i = 0; i < edges.size(); ++i)
+            if (!keep_projection[i])
+                std::copy(chord_points[i].begin(), chord_points[i].end(), &surface.positions[3 * (first_vertex + i)]);
+    }
+
+    std::vector<uint32_t> out;
+    out.reserve(surface.triangles.size() + 6 * edges.size());
+    for (size_t i = 0; i < surface.triangles.size(); i += 3) {
+        const uint32_t *v = &surface.triangles[i];
+        const uint32_t m[] = {middle(v[0], v[1]), middle(v[1], v[2]), middle(v[2], v[0])};
+        bool first_diagonal = true;
+        const int count = (m[0] != kNoCut) + (m[1] != kNoCut) + (m[2] != kNoCut);
+        if (count == 2) {
+            const int k = m[0] == kNoCut ? 0 : m[1] == kNoCut ? 1 : 2;
+            first_diagonal = distance2(v[k], m[(k + 1) % 3]) <= distance2(v[(k + 1) % 3], m[(k + 2) % 3]);
+        }
+        divide_triangle(v, m, first_diagonal, [&](uint32_t a, uint32_t b, uint32_t c) {
+            out.insert(out.end(), {a, b, c});
+        });
+    }
+    surface.triangles.swap(out);
 }
 
 }  // namespace rsdf
