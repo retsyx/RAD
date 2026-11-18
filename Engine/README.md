@@ -59,7 +59,7 @@ export RAD_SDF_LIBRARY="$PWD/.build/release/libRADSDF.dylib"
 
 ## Builds
 
-`worker.py --request R --output O [--threads N] [--validated-hash=H]` runs one
+`worker.py --request R --output O [--threads N]` runs one
 build. A request contains `title`, `summary`, `units` (`"mm"`), a nonempty
 `script` of at most 200,000 UTF-8 bytes, and optionally `print: true`.
 `inputAssets` records (`{id, name, format: stl|obj, path: "input-%03d.<format>"}`)
@@ -371,7 +371,7 @@ Measured values are numeric, not exact geometric facts.
 Preview builds usually run in a sandboxed worker started before they are
 requested. `worker.py --await-build <fifo> --output <folder>` loads Python,
 NumPy, the modeling modules and the kernel, then reads one build's options
-(`threads`, `validatedHash`) from the private FIFO the app created in that build
+(`threads`) from the private FIFO the app created in that build
 folder, after the app has staged `request.json` there. Each process still runs
 exactly one program under the same sandbox profile, launched and reaped by its
 own thread. The app prepares the next worker when a build finishes or the agent
@@ -491,10 +491,9 @@ validation rules tag (the rules version, the kernel version and every preview
 meshing parameter), the runtime versions, the construction (units, program,
 ordered input identities and formats, and the printing flag) and each input's
 exact bytes. Titles, summaries and input display names are excluded, matching
-validated candidate reuse at final commit. Saved revisions carry the receipt.
-`--validated-hash` and the FIFO `validatedHash` are accepted, but an SDF build
-has no separate verification to skip, so a matching receipt does not change the
-build. This is an accidental-change detector, not an authenticity mechanism or
+validated candidate reuse at final commit. Saved revisions carry the receipt;
+an SDF build has no separate verification to skip, so builds do not take one.
+This is an accidental-change detector, not an authenticity mechanism or
 proof that Python is deterministic. Meshes, statistics and native graphs remain
 session-only.
 

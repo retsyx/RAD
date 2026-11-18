@@ -35,7 +35,7 @@ class AwaitBuildTests(unittest.TestCase):
         time.sleep(0.5)
         self.assertIsNone(process.poll(), "The worker waits for its build.")
         (self.folder / "request.json").write_text(json.dumps(BOX))
-        self.send({"threads": 2, "validatedHash": "0" * 64})
+        self.send({"threads": 2})
         _, errors = process.communicate(timeout=120)
         self.assertEqual(process.returncode, 0, errors)
         result = json.loads((self.folder / "result.json").read_text())
@@ -43,7 +43,6 @@ class AwaitBuildTests(unittest.TestCase):
         self.assertEqual(result["threads"], 2)
         self.assertAlmostEqual(result["volume"], 24, places=3)
         self.assertEqual(len(result["validatedHash"]), 64)
-        self.assertNotEqual(result["validatedHash"], "0" * 64, "A supplied receipt does not replace the build's own.")
         self.assertTrue((self.folder / "model.rsdf").read_bytes().startswith(b"RSDF"))
 
     def test_invalid_options_run_no_program(self):

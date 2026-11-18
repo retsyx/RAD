@@ -2242,12 +2242,11 @@ final class AppState {
     private func buildExisting(_ spec: ModelSpec) {
         let token = UUID(); operationID = token
         let revisionID = selectedRevisionID, runtime = python, cores = threads
-        let validatedHash = revisions.first(where: { $0.id == revisionID })?.validatedHash
         let previousLayout = selectedPartLayout, previouslyHidden = hiddenSolids
         isWorking = true; activity = "Building solid geometry…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores, validatedHash: validatedHash)
+                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores)
                 guard operationID == token, !Task.isCancelled else { return }
                 if let index = revisions.firstIndex(where: { $0.id == revisionID }) {
                     let defaults = Self.defaultParts(for: preview)
@@ -2452,7 +2451,7 @@ final class AppState {
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
                     // captured subset to fresh stable ownership.
-                    var rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                    var rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
                     if let motion = rebuilt.assemblyMotion {
                         rebuilt.assemblyPose = try motion.solve(parts: rebuilt.parts ?? [], positions: preview.assemblyPose?.positions ?? [:])
                     }
@@ -2767,7 +2766,7 @@ final class AppState {
         isWorking = true; activity = "Preparing preview…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
                 guard operationID == token, selectedRevisionID == revision.id, !Task.isCancelled,
                       let index = revisions.firstIndex(where: { $0.id == revision.id }) else { return }
                 // Only transient geometry changes here. User edits made while

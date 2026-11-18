@@ -20,8 +20,8 @@ final class ProjectOpeningProfileTests: XCTestCase {
         let python = try await CADRuntimeManager.resolvePython(EngineService.defaultPython)
         timings["runtimeReady"] = clock.systemUptime - start
         start = clock.systemUptime
-        let receipt = ProcessInfo.processInfo.environment["RAD_PROFILE_VALIDATED_HASH"] ?? revision.validatedHash
-        let preview = try await EngineService().buildPreview(revision.model, python: python, threads: 8, validatedHash: receipt)
+        let receipt = revision.validatedHash
+        let preview = try await EngineService().buildPreview(revision.model, python: python, threads: 8)
         timings["engineTotal"] = clock.systemUptime - start
         timings["workerReportedBuild"] = preview.buildSeconds
         if let copyPath = ProcessInfo.processInfo.environment["RAD_PROFILE_SAVE_COPY"],
@@ -79,7 +79,7 @@ final class ProjectOpeningProfileTests: XCTestCase {
                                    "solids": preview.solids,
                                    "vertices": preview.vertices.count, "triangles": preview.triangles.count,
                                    "artifactDirectory": retained.path, "python": python,
-                                   "validatedHash": preview.validatedHash ?? "", "reusedValidation": receipt == preview.validatedHash]
+                                   "validatedHash": preview.validatedHash ?? "", "savedReceiptMatches": receipt == preview.validatedHash]
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: URL(fileURLWithPath: "/tmp/rad-project-opening-profile.json"), options: .atomic)
         print("RAD_PROFILE \(String(decoding: data, as: UTF8.self))")

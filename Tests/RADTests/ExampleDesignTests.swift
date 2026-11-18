@@ -79,8 +79,7 @@ final class ExampleDesignTests: XCTestCase {
             ProjectPackage.clearSessionCache()
             let saved = try ProjectStore.read(from: Self.package(example))
             let revision = try XCTUnwrap(saved.revisions.first)
-            let preview = try await EngineService().buildPreview(revision.model, python: EngineService.defaultPython, threads: 4,
-                                                                 validatedHash: revision.validatedHash)
+            let preview = try await EngineService().buildPreview(revision.model, python: EngineService.defaultPython, threads: 4)
             XCTAssertEqual(preview.parts, revision.parts, example.design)
             XCTAssertEqual(preview.warnings, [], example.design)
             if preview.runtime == revision.runtime {

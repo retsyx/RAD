@@ -888,7 +888,7 @@ class WorkerTests(unittest.TestCase):
             directory = Path(directory)
             (directory / "request.json").write_text(json.dumps(spec("result = box((30, 20, 4)) - cylinder(3, 10)")))
             completed = self.worker("--request", directory / "request.json", "--output", directory / "out",
-                                    "--threads", 2, "--validated-hash=" + "0" * 64)
+                                    "--threads", 2)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout), {"status": "complete", "solids": 1})
             result = json.loads((directory / "out" / "result.json").read_text())
@@ -900,13 +900,14 @@ class WorkerTests(unittest.TestCase):
             report = json.loads((directory / "bad" / "error.json").read_text())
             self.assertEqual((report["formatVersion"], report["stage"], report["failureKind"]), (1, "worker", "design"))
             self.assertFalse((directory / "bad" / "result.json").exists())
-            for removed in ("--defer-step", "--verify-later"):
+            for removed in ("--defer-step", "--verify-later", "--validated-hash=" + "0" * 64):
                 self.assertEqual(self.worker("--request", directory / "request.json", "--output", directory / "x",
                                              removed).returncode, 2)
 
     def test_prepared_build_reads_its_options_from_a_fifo(self):
         import subprocess
-        for options, code in (({"threads": 3, "validatedHash": "abc"}, 0), ({"threads": 3, "deferStep": True}, 1)):
+        for options, code in (({"threads": 3}, 0), ({"threads": 3, "validatedHash": "0" * 64}, 1),
+                              ({"threads": 3, "deferStep": True}, 1)):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
                 (output / "request.json").write_text(json.dumps(spec("result = sphere(5)")))

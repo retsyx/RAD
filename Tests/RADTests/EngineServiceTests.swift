@@ -19,8 +19,7 @@ final class EngineServiceTests: XCTestCase {
         let revision = ProjectRevision(model: final, validatedHash: hash)
         let project = RADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
         let saved = try ProjectStore.decode(ProjectStore.encode(project)).revisions[0]
-        let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 2,
-                                                  validatedHash: saved.validatedHash)
+        let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 2)
         XCTAssertEqual(replay.validatedHash, hash,
                        "Changing only final presentation metadata must not invalidate the reviewed candidate.")
         XCTAssertEqual(replay.volume, built.volume)
@@ -182,8 +181,7 @@ final class EngineServiceTests: XCTestCase {
             let project = RADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
             let saved = try XCTUnwrap(ProjectStore.decode(ProjectStore.encode(project)).revisions.first)
             XCTAssertNil(saved.preview)
-            let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 4,
-                                                      validatedHash: saved.validatedHash)
+            let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 4)
             XCTAssertEqual(replay.validatedHash, receipt)
             XCTAssertEqual(replay.volume, preview.volume, "Meshing is deterministic for any thread count.")
             XCTAssertEqual(replay.bounds, preview.bounds)

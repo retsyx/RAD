@@ -171,8 +171,7 @@ final class ProjectDevelopmentMigrationTests: XCTestCase {
                         do {
                             progress("Rendering thumbnail: \(input.lastPathComponent)")
                             let python = try await CADRuntimeManager.resolvePython(EngineService.defaultPython)
-                            let preview = try await engine.buildPreview(selected.model, python: python, threads: 8,
-                                                                        validatedHash: selected.validatedHash)
+                            let preview = try await engine.buildPreview(selected.model, python: python, threads: 8)
                             project.thumbnailData = try await ProjectThumbnail.render(project: project, preview: preview)
                             item.thumbnailBytes = project.thumbnailData?.count
                         } catch {

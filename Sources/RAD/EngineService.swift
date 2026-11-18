@@ -171,12 +171,11 @@ final class EngineService {
         CADRuntimeManager.defaultPythonPath
     }
 
-    /// Build the program's SDF graph and preview meshes. A saved validation
-    /// hash is passed on; the worker reports the receipt of every build.
+    /// Build the program's SDF graph and preview meshes. The worker reports
+    /// the receipt of every build.
     /// `print` builds the program's 3D printing version (`rad.print`).
-    func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int,
-                      validatedHash: String? = nil) async throws -> PreviewMesh {
-        let output = try await run(python: python, threads: threads, scriptMode: true, validatedHash: validatedHash) { folder in
+    func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int) async throws -> PreviewMesh {
+        let output = try await run(python: python, threads: threads, scriptMode: true) { folder in
             try Self.stageBuild(spec, print: print, verifyFields: false, in: folder)
         }
         return try await readPreview(output)
@@ -685,7 +684,7 @@ final class EngineService {
         var folder: URL { artifacts.folder }
     }
 
-    func run(python: String, threads: Int, scriptMode: Bool, validatedHash: String? = nil,
+    func run(python: String, threads: Int, scriptMode: Bool,
              action: String = "build this design",
              prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
@@ -707,15 +706,10 @@ final class EngineService {
             prepared?.job.discard()
             throw error
         }
-        let hash = validatedHash.flatMap { hash in
-            hash.utf8.count == 64 && hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) ? hash : nil
-        }
         let workerThreads = max(1, min(256, threads))
         var task: EngineProcessJob?
         if let prepared {
-            var options: [String: Any] = ["threads": workerThreads]
-            options["validatedHash"] = hash
-            let data = try JSONSerialization.data(withJSONObject: options)
+            let data = try JSONSerialization.data(withJSONObject: ["threads": workerThreads])
             do {
                 try await Task.detached(priority: .userInitiated) { try prepared.job.begin(options: data, at: prepared.start) }.value
                 task = prepared.job
@@ -728,8 +722,7 @@ final class EngineService {
         if task == nil {
             let python = try await CADRuntimeManager.resolvePython(python)
             guard token == generation, !Task.isCancelled else { throw CancellationError() }
-            var arguments = ["--request", request.path, "--output", folder.path, "--threads", String(workerThreads)]
-            if let hash { arguments.append("--validated-hash=\(hash)") }
+            let arguments = ["--request", request.path, "--output", folder.path, "--threads", String(workerThreads)]
             task = try Self.workerJob(python: python, sandboxed: scriptMode, arguments: arguments, artifacts: artifacts)
         }
         let running = task!

@@ -146,7 +146,7 @@ def serve():
     return 0
 
 
-BUILD_OPTIONS = {"threads", "validatedHash"}
+BUILD_OPTIONS = {"threads"}
 
 
 def await_build(start, output):
@@ -178,8 +178,7 @@ def await_build(start, output):
     with open(start, "rb") as stream:
         options = json.loads(stream.read(4_096))
     if (not isinstance(options, dict) or set(options) - BUILD_OPTIONS
-            or isinstance(options.get("threads"), bool) or not isinstance(options.get("threads"), int)
-            or not isinstance(options.get("validatedHash", ""), str)):
+            or isinstance(options.get("threads"), bool) or not isinstance(options.get("threads"), int)):
         raise HostError("The CAD build options are invalid.")
     return options
 
@@ -190,9 +189,6 @@ def main():
     parser.add_argument("--request", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--threads", type=int, default=max(1, min(32, os.cpu_count() or 1)))
-    # Receipts identify a build's inputs; an SDF build has no separate
-    # verification to skip, so a matching receipt does not change the build.
-    parser.add_argument("--validated-hash", help="The receipt of an earlier identical build (accepted, unused).")
     parser.add_argument("--await-build", type=Path,
                         help="Load the CAD runtime, then read one build's options from this FIFO; the request is "
                              "in --output.")
