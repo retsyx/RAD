@@ -32,6 +32,7 @@ namespace rsdf {
 namespace {
 
 constexpr size_t kChunk = 4096;
+const double kNormalAgreement = std::cos(20 * M_PI / 180);
 // Meshing needs about 330 bytes per narrow-band cell, so the default limit
 // keeps peak memory near 5 GB.
 constexpr uint64_t kDefaultMaxCells = 16000000;
@@ -69,9 +70,11 @@ public:
           triangle_count_(surface.triangles.size() / 3) {}
 
     void run(rsdf_mesh &mesh) {
-        triangle_normals();
+        vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *position) {
+            std::copy_n(&surface_.positions[3 * v], 3, position);
+        });
+        triangle_normals(mesh.stats.cell_size);
         build_adjacency();
-        vertex_normals();
         split_vertices(mesh);
         analyse_edges(mesh);
         prune_spurs(mesh);
@@ -81,21 +84,90 @@ public:
     }
 
 private:
-    // Interior normal of each triangle: the gradient at its centroid.
-    void triangle_normals() {
-        tri_normals_ = gradients(field_, triangle_count_, eps_, threads_, spatial_, [&](size_t t, double *centroid) {
+    // Find the nearest sampled sign change along the outward guide and
+    // return the exterior end of its bracket, within one gradient step.
+    bool surface_offset(const double *point, const double *guide, double cell, double &outside) const {
+        double value;
+        field_.evaluate(1, point, point + 1, point + 2, &value);
+        outside = 0;
+        if (value == 0) return true;
+        // Probe from the sample towards the expected side, nearest first.
+        // A local sign bracket also works for fields scaled away from a
+        // true distance. Search from 1/1024 to 1/4 of a cell.
+        constexpr int probes = 9;
+        double offsets[probes], xyz[3][probes], values[probes];
+        double step = std::copysign(cell / 1024, -value);
+        for (int i = 0; i < probes; ++i, step *= 2) {
+            offsets[i] = step;
+            for (int a = 0; a < 3; ++a) xyz[a][i] = point[a] + step * guide[a];
+        }
+        field_.evaluate(probes, xyz[0], xyz[1], xyz[2], values);
+        for (int i = 0; i < probes; ++i) {
+            if ((value < 0 && values[i] < 0) || (value > 0 && values[i] > 0)) continue;
+            double near = i ? offsets[i - 1] : 0, far = offsets[i], sample[3];
+            // A buried cap can make the field nearly constant across part of
+            // the bracket. Resolve the crossing to the gradient stencil size.
+            while (std::fabs(far - near) > eps_) {
+                const double mid = 0.5 * (near + far);
+                for (int a = 0; a < 3; ++a) sample[a] = point[a] + mid * guide[a];
+                double f;
+                field_.evaluate(1, sample, sample + 1, sample + 2, &f);
+                if ((f < 0) == (value < 0)) near = mid;
+                else far = mid;
+            }
+            outside = value < 0 ? far : near;
+            return true;
+        }
+        return false;
+    }
+
+    // A triangle centroid or refined vertex can sit inside a union where the
+    // field gradient points to a buried cap. If the gradient disagrees with
+    // the local mesh, resample at the surface. The mesh guides the search
+    // while field normals continue to define lighting and creases.
+    void surface_normal(const double *point, double *guide, double cell, double *normal) const {
+        normalize(guide);
+        if (is_zero(guide)) return;
+        const double agreement = dot(guide, normal);
+        if (agreement >= kNormalAgreement) return;
+        if (is_zero(normal)) std::copy_n(guide, 3, normal);
+
+        double outside;
+        if (!surface_offset(point, guide, cell, outside)) return;
+        // Keep the tetrahedral gradient stencil on the exterior side of a seam.
+        double sample[3], corrected[3];
+        for (int a = 0; a < 3; ++a) sample[a] = point[a] + (outside + 2 * eps_) * guide[a];
+        batch_gradients(field_.batch(), 1, sample, sample + 1, sample + 2, eps_,
+                        corrected, corrected + 1, corrected + 2);
+        if (!is_zero(corrected) && dot(corrected, guide) > agreement)
+            std::copy_n(corrected, 3, normal);
+    }
+
+    void triangle_normals(double cell) {
+        auto centroid = [&](size_t t, double *point) {
             for (int a = 0; a < 3; ++a) {
                 double sum = 0;
                 for (int k = 0; k < 3; ++k) sum += surface_.positions[3 * size_t(surface_.triangles[3 * t + k]) + a];
-                centroid[a] = sum / 3;
+                point[a] = sum / 3;
+            }
+        };
+        tri_normals_ = gradients(field_, triangle_count_, eps_, threads_, spatial_, centroid);
+        parallel_chunks(chunks_of(triangle_count_, kChunk), threads_, [&](size_t chunk) {
+            const size_t end = std::min(triangle_count_, (chunk + 1) * kChunk);
+            for (size_t t = chunk * kChunk; t < end; ++t) {
+                // The surface samples at the corners take precedence over a
+                // poorly conditioned facet of a sliver or thin wall.
+                double *normal = &tri_normals_[3 * t];
+                const uint32_t *corners = &surface_.triangles[3 * t];
+                if (std::all_of(corners, corners + 3, [&](uint32_t v) {
+                        return dot(normal, &vertex_normals_[3 * size_t(v)]) >= kNormalAgreement;
+                    })) continue;
+                double facet[3], point[3];
+                face_vector(surface_, t, facet);
+                centroid(t, point);
+                surface_normal(point, facet, cell, normal);
             }
         });
-        for (size_t t = 0; t < triangle_count_; ++t) {
-            double *n = &tri_normals_[3 * t];
-            if (!is_zero(n)) continue;
-            face_vector(surface_, t, n);  // a vanishing gradient falls back to the facet normal
-            normalize(n);
-        }
     }
 
     // Triangle corners (3 t + k) around each vertex, in triangle order.
@@ -108,23 +180,20 @@ private:
         for (size_t c = 0; c < surface_.triangles.size(); ++c) corners_[fill[surface_.triangles[c]]++] = uint32_t(c);
     }
 
-    // The gradient at each vertex; a vanishing gradient falls back to the
-    // area-weighted facet normals around the vertex.
-    void vertex_normals() {
-        vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *position) {
-            std::copy(&surface_.positions[3 * v], &surface_.positions[3 * v] + 3, position);
-        });
-        for (size_t v = 0; v < vertex_count_; ++v) {
-            double *n = &vertex_normals_[3 * v];
-            if (!is_zero(n)) continue;
-            for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i) {
-                double facet[3];
-                face_vector(surface_, corners_[i] / 3, facet);
-                for (int a = 0; a < 3; ++a) n[a] += facet[a];
-            }
-            normalize(n);
-            if (is_zero(n)) n[2] = 1;
+    // Most surface vertex gradients already agree with their incident
+    // triangles. Use the area vector of the fan to guide ambiguous samples.
+    void vertex_normal(size_t v, double cell, double *normal) const {
+        std::copy_n(&vertex_normals_[3 * v], 3, normal);
+        for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i)
+            if (dot(normal, &tri_normals_[3 * size_t(corners_[i] / 3)]) >= kNormalAgreement) return;
+        double guide[3] = {};
+        for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i) {
+            double facet[3];
+            face_vector(surface_, corners_[i] / 3, facet);
+            for (int a = 0; a < 3; ++a) guide[a] += facet[a];
         }
+        surface_normal(&surface_.positions[3 * v], guide, cell, normal);
+        if (is_zero(normal)) normal[2] = 1;
     }
 
     // Whether the edge two triangles share is a crease (step 9): both have
@@ -194,10 +263,9 @@ private:
     }
 
     // Splits vertices at creases so each side shades with its own normal. A
-    // vertex whose fan is one smoothing group keeps the SDF gradient at the
-    // vertex. A vertex on a crease is where the field's faces meet, so its
-    // gradient is an arbitrary blend of them; every group there takes the
-    // angle-weighted mean of its triangles' interior normals instead.
+    // vertex whose fan is one smoothing group uses its surface gradient.
+    // A crease vertex lies where faces meet and its gradient blends them,
+    // so each group takes the angle-weighted mean of its interior normals.
     void split_vertices(rsdf_mesh &mesh) {
         std::vector<uint32_t> extra(vertex_count_ + 1, 0);
         parallel_chunks(chunks_of(vertex_count_, kChunk), threads_, [&](size_t chunk) {
@@ -241,9 +309,8 @@ private:
                 }
                 for (uint32_t group = 0; group < count; ++group) {
                     double normal[3];
-                    const double *gradient = &vertex_normals_[3 * v];
                     if (count == 1) {
-                        std::copy(gradient, gradient + 3, normal);
+                        vertex_normal(v, mesh.stats.cell_size, normal);
                     } else {
                         std::copy(&weighted[3 * group], &weighted[3 * group] + 3, normal);
                         normalize(normal);
@@ -251,7 +318,7 @@ private:
                             std::copy(&plain[3 * group], &plain[3 * group] + 3, normal);
                             normalize(normal);
                         }
-                        if (is_zero(normal)) std::copy(gradient, gradient + 3, normal);
+                        if (is_zero(normal)) vertex_normal(v, mesh.stats.cell_size, normal);
                     }
                     const size_t out = output(group);
                     if (out >= vertex_count_) mesh.split_origin[out - vertex_count_] = static_cast<uint32_t>(v);

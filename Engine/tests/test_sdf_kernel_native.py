@@ -1084,6 +1084,28 @@ class MeshTests(KernelCase):
                     shading = mesh.normals[mesh.triangles[flat]].reshape(-1, 3).astype(float) @ face
                     self.assertGreater(shading.min(), math.cos(math.radians(tolerance)))
 
+    def test_buried_cylinder_caps_do_not_crease_the_outer_wall(self):
+        # Overlapping coaxial cylinders have one continuous cylindrical wall.
+        # Inside it, a triangle centroid can sample either buried cap.
+        g = Graph()
+        rotation = rotation_matrix([1, 2, 0], 41)
+        axis = rotation[:, 2]
+        cylinder = g.add(CYLINDER, [], [4, 3])
+        for overlap in (0.01, 0.001):
+            with self.subTest(overlap=overlap):
+                offset = (3 - overlap / 2) * axis
+                node = g.add(UNION, [g.move(cylinder, -offset, rotation), g.move(cylinder, offset, rotation)], [0])
+                mesh = self.mesh(g, node, 0.72)
+
+                axial = mesh.positions @ axis
+                join = np.abs(axial) < 2
+                radial = mesh.positions[join] - axial[join, None] * axis
+                radial /= length(radial)[:, None]
+                self.assertGreater(np.min(np.sum(radial * mesh.normals[join], axis=1)), math.cos(math.radians(2)))
+                ends = mesh.creases.reshape(-1, 2, 3)
+                self.assertFalse(np.any(np.abs(ends @ axis) < 2))
+                self.assertGreater(len(ends), 0)  # the exposed end rims still crease
+
     def test_a_blend_narrower_than_a_cell_is_refined_on_the_surface(self):
         # A smooth union of two flush cylinders bulges into a bead k/4 high
         # and about two cells wide. Unrefined, its QEF vertices lie above the

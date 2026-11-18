@@ -114,8 +114,8 @@ std::vector<double> side_cosines(const MeshField &field, const MeshSettings &set
 void refine_surface(const MeshField &field, Surface &surface, const MeshSettings &settings);
 
 // What a finished mesh keeps for simplification (simplify.cpp): its surface
-// before vertex splitting, its crease edges and the interior normal (field
-// gradient at the centroid) of every triangle.
+// before vertex splitting, its crease edges and the interior shading normal
+// of every triangle.
 struct SimplifyInput {
     Surface surface;
     std::vector<uint32_t> creases;        // pairs of surface vertex indices
