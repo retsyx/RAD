@@ -1,4 +1,4 @@
-// Mesh finishing (SDF-DESIGN.md, "Meshing" steps 7-9): split shading normals,
+// Mesh finishing (SDF-DESIGN.md, "Meshing" steps 8-10): split shading normals,
 // crease segments and statistics, plus the mesh C API.
 #include "mesh.h"
 
@@ -60,64 +60,20 @@ void face_vector(const Surface &surface, size_t t, double *out) {
     out[2] = u[0] * v[1] - u[1] * v[0];
 }
 
-// Normalised field gradients at `count` points, the i-th written by
-// point(i, xyz); zero where the gradient vanishes. Costly fields visit the
-// points in Morton order (vertices and triangles come in grid-key order, whose
-// batches are long strips that defeat culling).
-template <class PointAt>
-std::vector<double> gradients(const MeshField &field, size_t count, double eps, int threads, bool spatial,
-                              const PointAt &point) {
-    std::vector<double> normals(3 * count);
-    const BatchField batch = field.batch();
-    std::vector<uint32_t> order;
-    if (spatial) {
-        order = morton_order(count, threads, point);
-    } else {
-        order.resize(count);
-        for (size_t i = 0; i < count; ++i) order[i] = static_cast<uint32_t>(i);
-    }
-    constexpr int kPoints = kBatch / 4;
-    parallel_chunks(chunks_of(count, kChunk), threads, [&](size_t chunk) {
-        double x[kPoints], y[kPoints], z[kPoints], nx[kPoints], ny[kPoints], nz[kPoints];
-        const size_t end = std::min(count, (chunk + 1) * kChunk);
-        for (size_t first = chunk * kChunk; first < end; first += kPoints) {
-            const int n = static_cast<int>(std::min<size_t>(kPoints, end - first));
-            for (int i = 0; i < n; ++i) {
-                double xyz[3];
-                point(order[first + i], xyz);
-                x[i] = xyz[0];
-                y[i] = xyz[1];
-                z[i] = xyz[2];
-            }
-            batch_gradients(batch, n, x, y, z, eps, nx, ny, nz);
-            for (int i = 0; i < n; ++i) {
-                double *normal = &normals[3 * size_t(order[first + i])];
-                normal[0] = nx[i];
-                normal[1] = ny[i];
-                normal[2] = nz[i];
-            }
-        }
-    });
-    return normals;
-}
-
 class Finisher {
 public:
-    Finisher(const Surface &surface, const MeshField &field, double cell, double eps, double crease_degrees,
-             int threads, bool spatial)
-        : surface_(surface), field_(field), reach_(cell / 3), eps_(eps),
-          cos_crease_(std::cos(crease_degrees * M_PI / 180)),
+    Finisher(const Surface &surface, const MeshField &field, double eps, double crease_degrees, int threads,
+             bool spatial)
+        : surface_(surface), field_(field), eps_(eps), cos_crease_(std::cos(crease_degrees * M_PI / 180)),
           cos_half_crease_(std::cos(crease_degrees * M_PI / 360)), threads_(threads), spatial_(spatial), vertex_count_(surface.positions.size() / 3),
           triangle_count_(surface.triangles.size() / 3) {}
 
     void run(rsdf_mesh &mesh) {
         triangle_normals();
-        edge_normals();
         build_adjacency();
         vertex_normals();
         split_vertices(mesh);
         analyse_edges(mesh);
-        std::vector<double>().swap(edge_normals_);
         statistics(mesh);
         mesh.base_vertices = vertex_count_;
         mesh.interior_normals.assign(tri_normals_.begin(), tri_normals_.end());
@@ -138,37 +94,6 @@ private:
             if (!is_zero(n)) continue;
             face_vector(surface_, t, n);  // a vanishing gradient falls back to the facet normal
             normalize(n);
-        }
-    }
-
-    // The normal beside each triangle edge (3 t + k, from vertex k to k + 1)
-    // for the crease test: the gradient on the median from the edge's
-    // midpoint, a third of a cell into the triangle (at most two thirds of
-    // the way to the opposite vertex). A crease is then a turn of the surface
-    // within a fixed distance of the edge. Centroids lie a third of their
-    // triangle's height from its edges, and dual contouring puts vertices
-    // anywhere in their cells: along one blend narrower than a cell, centroid
-    // normals turn by more or less than the crease angle from one grid column
-    // to the next, and the blend alternates between a crease and a bump.
-    void edge_normals() {
-        edge_normals_ = gradients(field_, 3 * triangle_count_, eps_, threads_, spatial_, [&](size_t i, double *point) {
-            const size_t t = i / 3;
-            const int k = static_cast<int>(i % 3);
-            const double *a = &surface_.positions[3 * size_t(surface_.triangles[3 * t + k])];
-            const double *b = &surface_.positions[3 * size_t(surface_.triangles[3 * t + (k + 1) % 3])];
-            const double *c = &surface_.positions[3 * size_t(surface_.triangles[3 * t + (k + 2) % 3])];
-            const double e[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, f[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-            const double cross[3] = {e[1] * f[2] - e[2] * f[1], e[2] * f[0] - e[0] * f[2], e[0] * f[1] - e[1] * f[0]};
-            const double height = std::sqrt(dot(cross, cross) / dot(e, e));
-            const double s = height > 0 && std::isfinite(height) ? std::fmin(reach_ / height, 2.0 / 3) : 2.0 / 3;
-            for (int axis = 0; axis < 3; ++axis) {
-                const double mid = 0.5 * (a[axis] + b[axis]);
-                point[axis] = mid + s * (c[axis] - mid);
-            }
-        });
-        for (size_t i = 0; i < 3 * triangle_count_; ++i) {
-            double *n = &edge_normals_[3 * i];
-            if (is_zero(n)) std::copy(&tri_normals_[3 * (i / 3)], &tri_normals_[3 * (i / 3)] + 3, n);
         }
     }
 
@@ -201,21 +126,10 @@ private:
         }
     }
 
-    // The normal beside edge (u, w) of triangle t (edge_normals).
-    const double *edge_normal(size_t t, uint32_t u, uint32_t w) const {
-        const uint32_t *v = &surface_.triangles[3 * t];
-        for (int k = 0; k < 3; ++k) {
-            const uint32_t p = v[k], q = v[(k + 1) % 3];
-            if ((p == u && q == w) || (p == w && q == u)) return &edge_normals_[3 * (3 * t + k)];
-        }
-        return &tri_normals_[3 * t];
-    }
-
-    // Whether edge (u, w), shared by triangles t0 and t1, is a crease (step 8):
-    // the normals beside it in the two triangles differ by more than the
-    // crease angle.
-    bool crease_between(size_t t0, size_t t1, uint32_t u, uint32_t w) const {
-        const double *a = edge_normal(t0, u, w), *b = edge_normal(t1, u, w);
+    // Whether the edge two triangles share is a crease (step 9): both have
+    // interior normals and they differ by more than the crease angle.
+    bool crease_between(size_t t0, size_t t1) const {
+        const double *a = &tri_normals_[3 * t0], *b = &tri_normals_[3 * t1];
         return !is_zero(a) && !is_zero(b) && dot(a, b) < cos_crease_;
     }
 
@@ -227,18 +141,13 @@ private:
     uint32_t group_corners(size_t v, std::vector<uint32_t> &groups, std::vector<uint32_t> &parent) const {
         const uint32_t begin = first_corner_[v], count = first_corner_[v + 1] - begin;
         groups.assign(count, 0);
-        // Normals beside the edges at v within half the crease angle of one of
-        // them pairwise differ by less than the crease angle: no crease edge,
-        // one group.
-        if (count == 0) return 0;
-        const double *first = &edge_normals_[3 * size_t(corners_[begin])];
+        // Normals within half the crease angle of one of them pairwise differ
+        // by less than the crease angle: no crease edge, one group.
+        const double *first = count ? &tri_normals_[3 * size_t(corners_[begin] / 3)] : nullptr;
         bool smooth = true;
-        for (uint32_t i = 0; i < count && smooth; ++i) {
-            const uint32_t c = corners_[begin + i], before = c - c % 3 + (c % 3 + 2) % 3;
-            smooth = dot(first, &edge_normals_[3 * size_t(c)]) >= cos_half_crease_ &&
-                     dot(first, &edge_normals_[3 * size_t(before)]) >= cos_half_crease_;
-        }
-        if (smooth) return 1;
+        for (uint32_t i = 1; i < count && smooth; ++i)
+            smooth = dot(first, &tri_normals_[3 * size_t(corners_[begin + i] / 3)]) >= cos_half_crease_;
+        if (smooth) return count ? 1 : 0;
         parent.resize(count);
         for (uint32_t i = 0; i < count; ++i) parent[i] = i;
         auto root = [&](uint32_t i) {
@@ -257,10 +166,8 @@ private:
             for (uint32_t j = i + 1; j < count; ++j) {
                 uint32_t b[2];
                 ends(corners_[begin + j], b);
-                const uint32_t shared = a[0] == b[0] || a[0] == b[1] ? a[0] : a[1] == b[0] || a[1] == b[1] ? a[1] : kNoVertex;
-                if (shared == kNoVertex ||
-                    crease_between(corners_[begin + i] / 3, corners_[begin + j] / 3, static_cast<uint32_t>(v), shared))
-                    continue;
+                const bool adjacent = a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1];
+                if (!adjacent || crease_between(corners_[begin + i] / 3, corners_[begin + j] / 3)) continue;
                 const uint32_t ri = root(i), rj = root(j);
                 if (ri != rj) parent[std::max(ri, rj)] = std::min(ri, rj);
             }
@@ -384,8 +291,7 @@ private:
                     } else if (j - i > 2) {
                         ++nonmanifold[chunk];
                     } else {
-                        if (crease_between(edges[i].second, edges[i + 1].second, static_cast<uint32_t>(v),
-                                           edges[i].first)) {
+                        if (crease_between(edges[i].second, edges[i + 1].second)) {
                             const double *p = &surface_.positions[3 * v];
                             const double *q = &surface_.positions[3 * size_t(edges[i].first)];
                             segments[chunk].insert(segments[chunk].end(),
@@ -473,16 +379,14 @@ private:
         for (size_t v = 0; v < vertex_count_; ++v) stats.components += root(static_cast<uint32_t>(v)) == v;
     }
 
-    static constexpr uint32_t kNoVertex = UINT32_MAX;
-
     const Surface &surface_;
     const MeshField &field_;
-    const double reach_, eps_;
+    const double eps_;
     const double cos_crease_, cos_half_crease_;
     const int threads_;
     const bool spatial_;
     const size_t vertex_count_, triangle_count_;
-    std::vector<double> tri_normals_, edge_normals_, vertex_normals_;
+    std::vector<double> tri_normals_, vertex_normals_;
     std::vector<uint32_t> first_corner_, corners_;
 };
 
@@ -548,8 +452,9 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
         settings.threads = evaluation_threads(n, options->threads);
         settings.refine_steps = options->refine_steps > 0 ? std::min(options->refine_steps, 64) : 6;
         settings.spatial_order = n.sorts_queries;
-        const Surface surface = extract_surface(field, settings);
-        Finisher(surface, field, h, settings.gradient_step, crease, settings.threads, settings.spatial_order).run(*mesh);
+        Surface surface = extract_surface(field, settings);
+        refine_surface(field, surface, settings);
+        Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order).run(*mesh);
     }
     mesh->stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return mesh;
@@ -598,8 +503,7 @@ std::unique_ptr<rsdf_mesh> simplify_mesh(const rsdf_graph &graph, uint32_t node,
                                         source->spatial_order};
         Surface surface = simplify_surface(field, std::move(input), settings);
         surface.active_cells = source->stats.active_cells;
-        Finisher(surface, field, source->stats.cell_size, source->gradient_step, source->crease_angle, threads,
-                 source->spatial_order)
+        Finisher(surface, field, source->gradient_step, source->crease_angle, threads, source->spatial_order)
             .run(*mesh);
     }
     mesh->stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

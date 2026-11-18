@@ -628,9 +628,10 @@ private:
         const size_t parts = chunks_of(cells_.size(), kChunk);
         std::vector<std::vector<uint32_t>> owners(parts), tables(parts);
         std::vector<std::vector<uint8_t>> counts(parts);
-        // Per vertex: its QEF position, its cell's minimum corner and the sum
-        // of its component's crossing normals.
-        std::vector<std::vector<double>> points(parts), corners(parts), guides(parts);
+        // Per vertex: its QEF position, its cell's minimum corner, the sum of
+        // its component's crossing normals and the widest pair of them (see
+        // project_vertices).
+        std::vector<std::vector<double>> points(parts), corners(parts), guides(parts), spreads(parts);
         parallel_chunks(parts, s_.threads, [&](size_t part) {
             const size_t begin = part * kChunk, end = std::min(cells_.size(), begin + kChunk);
             Cursor rows[4] = {Cursor(keys, cells_[begin]), Cursor(keys, cells_[begin] + s1),
@@ -668,11 +669,21 @@ private:
                     }
                     double vertex[3], guide[3] = {0, 0, 0};
                     solve_qef(m, p, nrm, lo, grid_.h, vertex);
-                    for (int k = 0; k < m; ++k)
+                    // spread: the widest pair's cosine and its difference.
+                    double spread[4] = {1, 0, 0, 0};
+                    for (int k = 0; k < m; ++k) {
                         for (int a = 0; a < 3; ++a) guide[a] += nrm[k][a];
+                        for (int l = k + 1; l < m; ++l) {
+                            const double cosine = nrm[k][0] * nrm[l][0] + nrm[k][1] * nrm[l][1] + nrm[k][2] * nrm[l][2];
+                            if (!(cosine < spread[0])) continue;
+                            spread[0] = cosine;
+                            for (int a = 0; a < 3; ++a) spread[1 + a] = nrm[k][a] - nrm[l][a];
+                        }
+                    }
                     points[part].insert(points[part].end(), vertex, vertex + 3);
                     corners[part].insert(corners[part].end(), lo, lo + 3);
                     guides[part].insert(guides[part].end(), guide, guide + 3);
+                    spreads[part].insert(spreads[part].end(), spread, spread + 4);
                 }
                 owners[part].push_back(local[0]);
                 counts[part].push_back(static_cast<uint8_t>(components));
@@ -680,7 +691,7 @@ private:
             }
         });
         vertex_positions_ = concatenate(points);
-        project_vertices(concatenate(corners), concatenate(guides));
+        project_vertices(concatenate(corners), concatenate(guides), concatenate(spreads));
         const std::vector<uint32_t> owner = concatenate(owners), table = concatenate(tables);
         const std::vector<uint8_t> count = concatenate(counts);
         active_cells_ = owner.size();
@@ -694,84 +705,52 @@ private:
         }
     }
 
-    // Moves the QEF vertices onto the surface (step 5): Newton steps along the
-    // field gradient. Tangent planes meet on a sharp edge, so its QEF vertex
-    // already lies on the surface and stays, but across a blend narrower than
-    // a cell they meet off it: above a rounded ridge or inside it, depending
-    // on which grid edges the blend crosses, so its vertices alternate into
-    // dents along the ridge. Such a ridge can also bulge slightly past the
-    // cell whose crossings found it, so a vertex may move up to half a cell
-    // beyond its cell. A step is taken only while the gradient faces the
-    // component's crossing normals, so a vertex never moves to the opposite
-    // side of a thin wall, and kept only if it reduces |f|.
-    void project_vertices(const std::vector<double> &cell_lo, const std::vector<double> &guide) {
-        constexpr int kSamples = 3;  // field samples per vertex: at most two steps
-        constexpr int kPoints = kBatch / 4;
-        static const double kTetra[4][3] = {{1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {1, 1, 1}};
+    // Moves QEF vertices onto the surface (step 5) and marks them for
+    // refinement. Across a blend narrower than a cell the crossings' tangent
+    // planes meet off the surface, above a rounded ridge or inside it
+    // depending on which grid edges the blend crosses, so its vertices
+    // alternate into dents along the ridge. Such a ridge can also bulge
+    // slightly past the cell whose crossings found it, so a vertex may move
+    // up to half a cell beyond its cell. On a sharp edge or corner the QEF
+    // vertex is the feature point and the gradient there blends the faces,
+    // so a step would slide it off the feature: a vertex whose crossing
+    // normals differ by more than kSpread stays (kSharpVertex) where the
+    // gradients a twentieth of a cell either side of it, along the difference
+    // of its widest pair of normals, differ by more than half that pair's
+    // angle and by more than kTurn. Across a sub-cell blend they differ by a
+    // few degrees; such a vertex is a kSpreadVertex. Vertices whose crossing
+    // normals agree move too: a blend can pass through a cell without
+    // crossing its grid edges.
+    void project_vertices(const std::vector<double> &cell_lo, const std::vector<double> &guide,
+                          const std::vector<double> &spread) {
+        const double kSpread = std::cos(10 * M_PI / 180), kTurn = std::cos(20 * M_PI / 180);
         const size_t count = vertex_positions_.size() / 3;
-        const double h = grid_.h, eps = s_.gradient_step, settled = 1e-9 * h;
-        std::vector<uint32_t> order;
-        if (s_.spatial_order) {
-            order = morton_order(count, s_.threads, [&](size_t v, double *xyz) {
-                std::copy(&vertex_positions_[3 * v], &vertex_positions_[3 * v] + 3, xyz);
-            });
-        } else {
-            order.resize(count);
-            for (size_t v = 0; v < count; ++v) order[v] = static_cast<uint32_t>(v);
+        const double h = grid_.h;
+        std::vector<size_t> features;  // vertices whose crossing normals spread
+        std::vector<double> points, across;
+        for (size_t v = 0; v < count; ++v) {
+            if (!(spread[4 * v] < kSpread)) continue;
+            features.push_back(v);
+            points.insert(points.end(), &vertex_positions_[3 * v], &vertex_positions_[3 * v] + 3);
+            across.insert(across.end(), &spread[4 * v + 1], &spread[4 * v + 1] + 3);
         }
-        parallel_chunks(chunks_of(count, kChunk), s_.threads, [&](size_t chunk) {
-            double x[kPoints][3], best[kPoints][3], best_f[kPoints];
-            double sx[kBatch], sy[kBatch], sz[kBatch], values[kBatch];
-            int active[kPoints];
-            const size_t end = std::min(count, (chunk + 1) * kChunk);
-            for (size_t first = chunk * kChunk; first < end; first += kPoints) {
-                const int n = static_cast<int>(std::min<size_t>(kPoints, end - first));
-                int live = n;
-                for (int i = 0; i < n; ++i) {
-                    std::copy(&vertex_positions_[3 * size_t(order[first + i])],
-                              &vertex_positions_[3 * size_t(order[first + i])] + 3, x[i]);
-                    std::copy(x[i], x[i] + 3, best[i]);
-                    best_f[i] = INFINITY;
-                    active[i] = i;
-                }
-                for (int sample = 0; sample < kSamples && live > 0; ++sample) {
-                    // The value (mean of the stencil) and gradient (tetrahedral differences).
-                    for (int j = 0; j < live; ++j)
-                        for (int k = 0; k < 4; ++k) {
-                            sx[4 * j + k] = x[active[j]][0] + eps * kTetra[k][0];
-                            sy[4 * j + k] = x[active[j]][1] + eps * kTetra[k][1];
-                            sz[4 * j + k] = x[active[j]][2] + eps * kTetra[k][2];
-                        }
-                    field_.evaluate(4 * live, sx, sy, sz, values);
-                    int next = 0;
-                    for (int j = 0; j < live; ++j) {
-                        const int i = active[j];
-                        double f = 0, g[3] = {0, 0, 0};
-                        for (int k = 0; k < 4; ++k) {
-                            f += values[4 * j + k];
-                            for (int a = 0; a < 3; ++a) g[a] += values[4 * j + k] * kTetra[k][a];
-                        }
-                        f *= 0.25;
-                        if (!(std::fabs(f) < best_f[i])) continue;  // the last step did not help
-                        std::copy(x[i], x[i] + 3, best[i]);
-                        best_f[i] = std::fabs(f);
-                        const double *towards = &guide[3 * size_t(order[first + i])];
-                        const double gg = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
-                        if (sample + 1 == kSamples || best_f[i] <= settled || !(gg > 0) || !std::isfinite(gg) ||
-                            g[0] * towards[0] + g[1] * towards[1] + g[2] * towards[2] <= 0)
-                            continue;
-                        const double step = f * 4 * eps / gg;  // the gradient is g / (4 eps)
-                        const double *lo = &cell_lo[3 * size_t(order[first + i])];
-                        for (int a = 0; a < 3; ++a)
-                            x[i][a] = std::fmin(std::fmax(x[i][a] - step * g[a], lo[a] - 0.5 * h), lo[a] + 1.5 * h);
-                        active[next++] = i;
-                    }
-                    live = next;
-                }
-                for (int i = 0; i < n; ++i)
-                    std::copy(best[i], best[i] + 3, &vertex_positions_[3 * size_t(order[first + i])]);
+        const std::vector<double> gaps = side_cosines(field_, s_, points, across, 0.05 * h);
+        vertex_marks_.assign(count, 0);
+        for (size_t i = 0; i < features.size(); ++i) {
+            const size_t v = features[i];
+            // Half the widest pair's angle, at least kTurn.
+            const bool sharp = gaps[i] < std::fmin(std::sqrt(0.5 * (1 + spread[4 * v])), kTurn);
+            vertex_marks_[v] = sharp ? kSharpVertex : kSpreadVertex;
+        }
+        std::vector<double> boxes(6 * count);
+        for (size_t v = 0; v < count; ++v)
+            for (int a = 0; a < 3; ++a) {
+                boxes[6 * v + a] = cell_lo[3 * v + a] - 0.5 * h;
+                boxes[6 * v + 3 + a] = cell_lo[3 * v + a] + 1.5 * h;
             }
-        });
+        std::vector<uint8_t> fixed(count);
+        for (size_t v = 0; v < count; ++v) fixed[v] = vertex_marks_[v] & kSharpVertex;
+        project_points(field_, s_, 1e-6 * h, vertex_positions_, guide, boxes, fixed);
     }
 
     // Minimises sum (n_i . (x - p_i))^2 about the mass point with a truncated
@@ -952,6 +931,7 @@ private:
             if (remap[v] == kNone) continue;
             remap[v] = next++;
             surface.positions.insert(surface.positions.end(), &vertex_positions_[3 * v], &vertex_positions_[3 * v] + 3);
+            surface.marks.push_back(vertex_marks_[v]);
         }
         surface.triangles.resize(triangles_.size());
         for (size_t i = 0; i < triangles_.size(); ++i) surface.triangles[i] = remap[triangles_[i]];
@@ -975,6 +955,7 @@ private:
     std::vector<uint32_t> cell_vertex_;    // per corner: first vertex of the cell it is the minimum corner of
     std::vector<uint32_t> cell_table_;     // per corner: 2-bit component (vertex offset) per local edge
     std::vector<double> vertex_positions_;
+    std::vector<uint8_t> vertex_marks_;    // per vertex: kSharpVertex, kSpreadVertex (project_vertices)
     uint64_t active_cells_ = 0;
     std::vector<uint32_t> triangles_;
 };

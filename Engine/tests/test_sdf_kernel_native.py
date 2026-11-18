@@ -1081,6 +1081,38 @@ class MeshTests(KernelCase):
                     shading = mesh.normals[mesh.triangles[flat]].reshape(-1, 3).astype(float) @ face
                     self.assertGreater(shading.min(), math.cos(math.radians(tolerance)))
 
+    def test_a_blend_narrower_than_a_cell_is_refined_on_the_surface(self):
+        # A smooth union of two flush cylinders bulges into a bead k/4 high
+        # and about two cells wide. Unrefined, its QEF vertices lie above the
+        # crest or dent into it, triangles span it, and its crest creases in
+        # some grid columns but not others: it shades as splotches.
+        g = Graph()
+        center = np.array([0.13, -0.27, 0.31])
+        low = g.move(g.add(CYLINDER, [], [8, 2]), center + [0, 0, -2])
+        high = g.move(g.add(CYLINDER, [], [8, 3]), center + [0, 0, 3])
+        node = g.add(UNION, [low, high], [0.6])
+        handle = self.build(g)
+
+        def on_bead(points):
+            offset = points - center
+            return (np.abs(offset[..., 2]) < 0.6) & (np.hypot(offset[..., 0], offset[..., 1]) > 7.5)
+
+        for cell in (0.43, 0.47, 0.5, 0.53, 0.5325, 0.56):
+            with self.subTest(cell=cell):
+                mesh = self.mesh(g, node, cell)
+                points = mesh.positions.astype(float)
+                self.assertLess(np.max(np.abs(self.k.evaluate(handle, node, points[on_bead(points)]))), 1e-5)
+                corners = points[mesh.triangles]
+                corners = corners[on_bead(corners.mean(axis=1))]
+                facet = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+                facet /= length(facet)[:, None]
+                field = self.k.gradient(handle, node, corners.mean(axis=1))
+                field /= length(field)[:, None]
+                deviation = np.degrees(np.arccos(np.clip(np.sum(facet * field, axis=1), -1, 1)))
+                self.assertLess(np.percentile(deviation, 95), 9.5)
+                ends = mesh.creases.reshape(-1, 2, 3).astype(float)
+                self.assertFalse(np.any(np.all(on_bead(ends), axis=1)))
+
     def test_crease_segments(self):
         g = Graph()
         box = g.move(g.add(BOX, [], [5, 4, 3, 0]), [0.2, 0.1, -0.3])
