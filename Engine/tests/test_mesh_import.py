@@ -203,6 +203,59 @@ class KernelMeshTests(unittest.TestCase):
             self.load(vertices, triangles)
         return str(caught.exception)
 
+    def test_preview_resolves_close_facets_on_blended_meshes(self):
+        def shell(stations, segments, clustering=0):
+            uniform = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+            angle = uniform + clustering * np.cos(uniform)
+            rings = [
+                np.column_stack((center + rx * np.cos(angle) + 0.33 * flare * np.cos(3 * angle),
+                                 (ry - 0.72 * flare * np.sin(3 * angle)) * np.sin(angle),
+                                 np.full(segments, z)))
+                for z, center, rx, ry, flare in stations
+            ]
+            last = (len(rings) - 1) * segments
+            triangles = []
+            for start in range(0, last, segments):
+                for i in range(segments):
+                    a, b = start + i, start + (i + 1) % segments
+                    triangles.extend(((a, b, b + segments), (a, b + segments, a + segments)))
+            for i in range(1, segments - 1):
+                triangles.extend(((0, i + 1, i), (last, last + i, last + i + 1)))
+            return radsdf.mesh_solid(np.vstack(rings), triangles)
+
+        flange = shell(((0, 0, 5, 7, 1), (0.75, 0, 5.25, 7.8, 1), (2.3, 0.2, 5, 6.5, 0.96),
+                        (4.3, 0.45, 4.6, 5.13, 0.48), (6.6, 0.6, 3.55, 3.6, 0.09),
+                        (8.1, 0.65, 3.32, 3.27, 0)), 48, clustering=-0.7)
+        tube = shell(((3, 0.8, 2.9, 2.6, 0), (5.6, 0.68, 3.26, 3.13, 0),
+                      (8, 0.55, 3.4, 3.5, 0), (13, 0.4, 3.54, 3.62, 0)), 25)
+        data, (root,) = radsdf.serialize(radsdf.union(flange, tube, smooth=1.35))
+        graph = radsdf.Graph.from_bytes(data, [root])
+        cell = 0.47
+        mesh = graph.native_mesh(root, cell_size=cell, threads=4, _preview=True, _facet_detail=True).mesh()
+
+        self.assertEqual(mesh.stats["boundary_edges"], 0)
+        self.assertEqual(mesh.stats["nonmanifold_edges"], 0)
+        self.assertEqual(mesh.stats["components"], 1)
+        points = mesh.positions[mesh.triangles].astype(float)
+        normals = mesh.normals[mesh.triangles].astype(float)
+        areas = np.linalg.norm(np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]), axis=1)
+        barycentric = [[1 / 3] * 3, [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6]]
+        samples = np.einsum("ij,tjk->tik", barycentric, points).reshape(-1, 3)
+        lighting = np.einsum("ij,tjk->tik", barycentric, normals).reshape(-1, 3)
+        lighting /= np.linalg.norm(lighting, axis=1)[:, None]
+        # Compare what the preview interpolates with the exact visible surface.
+        ray = np.array([0, 1.0, 0])
+        origins = samples - 0.25 * ray
+        hits, distance = graph.raycast(root, origins, ray, max_distance=0.65, tolerance=cell * 1e-6, threads=4)
+        exact = graph.gradient(root, origins + distance[:, None] * ray, eps=cell * 1e-4, threads=4)
+        front = (hits & (samples[:, 1] < 0) & (samples[:, 2] > 3) & (samples[:, 2] < 8)
+                 & (exact[:, 1] < -0.4) & (abs(distance - 0.25) < 0.1))
+        error = np.einsum("ij,ij->i", lighting, exact) < math.cos(math.radians(4))
+        weights = np.repeat(areas, len(barycentric))
+        self.assertGreater(weights[front].sum(), 200)
+        self.assertLess(weights[front & error].sum() / weights[front].sum(), 0.045)
+
+
     def test_distances_match_brute_force_and_inward_meshes_turn_outward(self):
         rng = np.random.default_rng(1)
         for name, (vertices, triangles) in {"cube": cube_mesh(), "sphere": sphere_mesh(),

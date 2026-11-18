@@ -349,8 +349,21 @@ double union_of_bodies(const TriangleMesh &m, const double *p, uint32_t nearest_
 
 }  // namespace
 
+static double facet_altitude(const TriangleMesh &m, uint32_t triangle) {
+    const uint32_t *indices = &m.triangles[3 * size_t(triangle)];
+    const double *a = &m.positions[3 * size_t(indices[0])], *b = &m.positions[3 * size_t(indices[1])],
+                 *c = &m.positions[3 * size_t(indices[2])];
+    const double u[] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const double v[] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    const double w[] = {c[0] - b[0], c[1] - b[1], c[2] - b[2]};
+    double area[3];
+    cross(u, v, area);
+    return std::sqrt(dot(area, area) / std::max({dot(u, u), dot(v, v), dot(w, w)}));
+}
+
 void eval_triangle_mesh(const TriangleMesh &m, int n, const double *x, const double *y, const double *z,
-                        double *out) {
+                        double *out, double *facet_sizes, double facet_radius, double scale) {
+    const double radius = scale > 0 && std::isfinite(scale) ? facet_radius / scale : 0;
     for (int i = 0; i < n; ++i) {
         const double p[3] = {x[i], y[i], z[i]};
         Nearest best;
@@ -358,6 +371,8 @@ void eval_triangle_mesh(const TriangleMesh &m, int n, const double *x, const dou
             nearest(m, 0, p, best);
         else
             nearest_in(m, m.mixed, m.mixed_order.data(), 0, p, best);
+        if (facet_sizes && best.d2 < radius * radius)
+            facet_sizes[i] = std::min(facet_sizes[i], facet_altitude(m, best.triangle) * scale);
         if (!box_contains(m.lo, m.hi, p)) {  // the solid lies within the vertices' box
             out[i] = std::sqrt(best.d2);
             continue;

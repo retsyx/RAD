@@ -77,12 +77,6 @@ struct Cut {
     bool valid = false;
 };
 
-bool same_float_position(const Vector &a, const Vector &b) {
-    for (int axis = 0; axis < 3; ++axis)
-        if (static_cast<float>(a[axis]) != static_cast<float>(b[axis])) return false;
-    return true;
-}
-
 Cut trace(const MeshField &field, const MeshSettings &settings, const Vector &a, const Vector &b,
           const Vector &na, const Vector &nb) {
     Vector along, guide;
@@ -122,7 +116,7 @@ Cut trace(const MeshField &field, const MeshSettings &settings, const Vector &a,
     if (!(agreement < kCosCrease && agreement > kCosSteepCrease)) return {};
     Vector chord;
     for (int axis = 0; axis < 3; ++axis) chord[axis] = a[axis] + t * along[axis];
-    if (same_float_position(chord, a) || same_float_position(chord, b)) return {};
+    if (same_preview_position(chord.data(), a.data()) || same_preview_position(chord.data(), b.data())) return {};
     const Sample hit = sample_surface(field, span, a, b, t, eps);
     if (dot(hit.normal, hit.normal) == 0) return {};
     return {chord, {hit.point, {left.normal, right.normal}}, true};
@@ -162,8 +156,8 @@ void align_surface_creases(const MeshField &field, Surface &surface, const MeshS
         if (!cut.valid) continue;
         cut_edges.push_back(candidates[i]);
         const uint32_t a = candidates[i] >> 32, b = static_cast<uint32_t>(candidates[i]);
-        const bool rounded_to_endpoint = same_float_position(cut.sample.point, point_at(surface.positions, a)) ||
-                                         same_float_position(cut.sample.point, point_at(surface.positions, b));
+        const bool rounded_to_endpoint = same_preview_position(cut.sample.point.data(), &surface.positions[3 * size_t(a)]) ||
+                                         same_preview_position(cut.sample.point.data(), &surface.positions[3 * size_t(b)]);
         const auto &position = rounded_to_endpoint ? cut.chord_point : cut.sample.point;
         surface.positions.insert(surface.positions.end(), position.begin(), position.end());
         surface.crease_samples.push_back(cut.sample);

@@ -36,7 +36,9 @@ typedef struct {
 
 enum {
     /* Trace shallow shading creases through the extracted preview surface. */
-    RSDF_MESH_PREVIEW_CREASES = 1u
+    RSDF_MESH_PREVIEW_CREASES = 1u,
+    /* Refine under-resolved facets of triangle-mesh inputs in previews. */
+    RSDF_MESH_PREVIEW_FACETS = 2u
 };
 
 typedef struct {

@@ -836,6 +836,26 @@ m.couple("geneva", drive, index, **geneva(N))
             preview = graph.mesh(graph.roots[0], cell_size=cell, crease_angle=sdf_build.PREVIEW_CREASE_ANGLE)
             self.assertLess(len(preview.triangles), sdf_build.MAX_TRIANGLES)
 
+    def test_optional_facet_detail_yields_to_the_preview_budget(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        graph = SimpleNamespace(roots=[0])
+        assembly = SimpleNamespace(labels=["part"])
+        calls = []
+
+        def part(graph, node, label, cell, threads, *, facets=False):
+            calls.append((cell, facets))
+            return SimpleNamespace(positions=[], creases=[], triangles=range(12 if facets else 8))
+
+        with mock.patch.object(sdf_build, "MAX_TRIANGLES", 10), \
+                mock.patch.object(sdf_build, "preview_cell_size", return_value=(0.5, 0.5)), \
+                mock.patch.object(sdf_build, "_mesh_part", part):
+            meshes, cell, default = sdf_build.mesh_parts(graph, assembly, [], 1, facets=True)
+
+        self.assertEqual(calls, [(0.5, True), (0.5, False)])
+        self.assertEqual((cell, default, len(meshes[0].triangles)), (0.5, 0.5, 8))
+
     def test_too_detailed_designs_fail_after_two_remeshes(self):
         calls = []
         real = sdf_build._mesh_part

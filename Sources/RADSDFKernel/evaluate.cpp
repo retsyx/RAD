@@ -26,6 +26,7 @@ struct Frame {
     double *tmp;               // a child's values awaiting combination
     size_t mark;               // pool position to release when the frame ends
     double box_lo[3], box_hi[3];
+    double feature_scale;     // model units per local unit (preview detail probes only)
     double current;            // largest value (union) or interior depth (difference)
     size_t candidate_mark;     // Scratch::candidates size to restore when the frame ends
     size_t next_candidate, candidates_end;  // this frame's candidate children (ChildTree nodes)
@@ -74,6 +75,10 @@ public:
         }
     }
 
+    // Optional preview probe. Track the narrowest nearby input facet at
+    // each query while leaving CSG distances and branch choices unchanged.
+    double *facet_sizes = nullptr;
+    double facet_radius = 0;
     std::vector<Frame> frames;
     std::vector<uint32_t> candidates;  // child positions per boolean frame, stacked like the frames
 
@@ -97,7 +102,7 @@ private:
 
 thread_local Scratch scratch;
 
-void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, const double *z, double *out) {
+void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, const double *z, double *out, double scale = 1) {
     Frame frame;
     frame.node = node;
     frame.stage = 0;
@@ -109,6 +114,7 @@ void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, co
     frame.tmp = nullptr;
     frame.mark = s.top();
     frame.current = 0;
+    frame.feature_scale = s.facet_sizes && !s.frames.empty() ? s.frames.back().feature_scale * scale : 1;
     frame.candidate_mark = s.candidates.size();
     frame.next_candidate = frame.candidates_end = 0;
     frame.has_box = frame.has_current = frame.pending = frame.has_candidates = false;
@@ -702,13 +708,22 @@ bool step(const rsdf_graph &graph, Scratch &s, Frame &f) {
             f.stage = 1;
             const double *cx, *cy, *cz;
             map_points(s, node, p, n, x, y, z, cx, cy, cz);
-            push(s, graph.child_ids(node)[0], n, cx, cy, cz, out);
+            double scale = 1;
+            if (s.facet_sizes) {
+                if (node.op == OP_TRANSFORM) scale = p[12];
+                if (node.op == OP_STRETCH) scale = std::min({p[0], p[1], p[2]});
+                if (node.op == OP_TWIST) scale = node.c0;
+            }
+            push(s, graph.child_ids(node)[0], n, cx, cy, cz, out, scale);
             return false;
         }
         finish_unary(node, p, n, z, out);
         return true;
     default:
-        eval_leaf(graph, node, p, n, x, y, z, out);
+        if (node.op == OP_MESH && s.facet_sizes)
+            eval_triangle_mesh(graph.meshes[node.mesh], n, x, y, z, out, s.facet_sizes, s.facet_radius, f.feature_scale);
+        else
+            eval_leaf(graph, node, p, n, x, y, z, out);
         return true;
     }
 }
@@ -716,10 +731,13 @@ bool step(const rsdf_graph &graph, Scratch &s, Frame &f) {
 }  // namespace
 
 void eval_batch(const rsdf_graph &graph, uint32_t node, int n, const double *x, const double *y, const double *z,
-                double *out) {
+                double *out, double *facet_sizes, double facet_radius) {
     if (n <= 0) return;
     Scratch &s = scratch;
     s.reset();
+    s.facet_sizes = facet_sizes;
+    s.facet_radius = facet_radius;
+    if (facet_sizes) std::fill_n(facet_sizes, n, INFINITY);
     push(s, node, n, x, y, z, out);
     while (!s.frames.empty()) {
         Frame &frame = s.frames.back();

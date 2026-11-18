@@ -615,12 +615,17 @@ def preview_cell_size(graph, boxes, threads):
     return (default * scale * PREVIEW_MARGIN if scale > 1 else default), default
 
 
-def _mesh_part(graph, node, label, cell, threads):
+def _mesh_part(graph, node, label, cell, threads, *, facets=False):
     import radsdf
     diagnostic = {"stage": "preview_meshing", "cellSize": cell}
+    def make_mesh(facet_detail):
+        return graph.native_mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE,
+                                 threads=threads, _preview=True, _facet_detail=facet_detail).mesh()
+
     try:
-        mesh = graph.native_mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE,
-                                 threads=threads, _preview=True).mesh()
+        mesh = make_mesh(facets)
+        if facets and (mesh.stats["boundary_edges"] or mesh.stats["nonmanifold_edges"]):
+            mesh = make_mesh(False)
     except radsdf.SDFError as error:
         raise ModelError(f"{label} could not be meshed at the preview cell size of {cell:.4g} mm: {error}",
                          diagnostic=diagnostic) from error
@@ -636,19 +641,22 @@ def _mesh_part(graph, node, label, cell, threads):
     return mesh
 
 
-def mesh_parts(graph, normalized, boxes, threads):
+def mesh_parts(graph, normalized, boxes, threads, *, facets=False):
     """Mesh every part at one preview cell size within the preview limits.
 
     The first pass uses preview_cell_size; a pass that exceeds the limits
     stops early and is redone at a coarser cell size predicted from the
     triangles so far plus the remaining parts' estimates, at most
-    MAX_PREVIEW_REMESHES times. Returns (meshes, cell size, default cell size).
+    MAX_PREVIEW_REMESHES times. Drop optional facet detail before coarsening.
+    Returns (meshes, cell size, default cell size).
     """
     cell, default = preview_cell_size(graph, boxes, threads)
-    for attempt in range(MAX_PREVIEW_REMESHES + 1):
+    remeshes = MAX_PREVIEW_REMESHES + int(facets)
+    for attempt in range(remeshes + 1):
         meshes, triangles, vertices, segments, remaining = [], 0, 0, 0, None
         for index, (node, label) in enumerate(zip(graph.roots, normalized.labels)):
-            mesh = _mesh_part(graph, node, label, cell, threads)
+            mesh = (_mesh_part(graph, node, label, cell, threads, facets=True) if facets else
+                    _mesh_part(graph, node, label, cell, threads))
             meshes.append(mesh)
             triangles += len(mesh.triangles)
             vertices += len(mesh.positions)
@@ -658,7 +666,10 @@ def mesh_parts(graph, normalized, boxes, threads):
                 break
         if remaining is None:
             return meshes, cell, default
-        if attempt == MAX_PREVIEW_REMESHES:
+        if facets:
+            facets = False
+            continue
+        if attempt == remeshes:
             break
         growth = (triangles + remaining) / triangles
         scale = max(math.sqrt(triangles * growth / MAX_TRIANGLES), math.sqrt(vertices * growth / MAX_VERTICES),
@@ -1034,7 +1045,8 @@ def build(spec, directory, output, threads, started=None):
         raise ModelError(f"The kernel rejected the design's shape graph: {message}") from error
     with graph:
         boxes = part_bounds(graph, normalized)
-        meshes, cell, default = mesh_parts(graph, normalized, boxes, threads)
+        facets = any(node.opcode == radsdf.Opcode.MESH for node in order)
+        meshes, cell, default = mesh_parts(graph, normalized, boxes, threads, facets=facets)
         fields, field_warnings = custom_fields(graph, order, normalized)
     artifact = (output / "model.rsdf").resolve()
     preview = assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerprint,

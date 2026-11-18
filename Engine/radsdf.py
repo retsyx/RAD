@@ -1732,6 +1732,7 @@ _MIN_CREASE_ANGLE = 1e-9  # degrees; a crease angle of 0 creases every edge
 
 
 _MESH_PREVIEW_CREASES = 1  # RSDF_MESH_PREVIEW_CREASES
+_MESH_PREVIEW_FACETS = 2   # RSDF_MESH_PREVIEW_FACETS
 
 
 class _MeshOptions(ctypes.Structure):
@@ -2144,7 +2145,7 @@ class Graph:
         return self.native_mesh(target, cell_size, crease_angle, max_cells, threads, bounds).mesh(tolerance)
 
     def native_mesh(self, target, cell_size=None, crease_angle=35.0, max_cells=None, threads=0, bounds=None,
-                    *, _preview=False):
+                    *, _preview=False, _facet_detail=False):
         """The kernel's mesh of a solid (options as in SDF3.mesh), kept native
         as a NativeMesh: its stats are known before NativeMesh.mesh()
         simplifies and copies it, so callers can check sizes first."""
@@ -2168,7 +2169,7 @@ class Graph:
             crease_angle=max(crease_angle, _MIN_CREASE_ANGLE),
             max_cells=0 if max_cells is None else _whole(max_cells, "max_cells", 1, 2**63),
             threads=_threads(threads), refine_steps=_REFINE_STEPS,
-            flags=_MESH_PREVIEW_CREASES if _preview else 0)
+            flags=((_MESH_PREVIEW_CREASES | (_MESH_PREVIEW_FACETS if _facet_detail else 0)) if _preview else 0))
         if region is not None:
             options.bounds_lo[:] = region.lo.tolist()
             options.bounds_hi[:] = region.hi.tolist()

@@ -944,6 +944,9 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
         }
         const double *params = graph->param_values(node);
         validate_params(node, params, Checker(where, params));
+        node.has_mesh = node.op == OP_MESH;
+        for (uint32_t i = 0; i < node.child_count; ++i)
+            node.has_mesh |= graph->nodes[graph->children[node.first_child + i]].has_mesh;
         if (node.field) {
             derive_field(node);
             visits[index] = 1;  // fields are costed through their tapes

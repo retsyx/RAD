@@ -782,6 +782,8 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
                                 settings.spatial_order, [&](size_t v, double *p) {
                                     std::copy_n(&surface.positions[3 * v], 3, p);
                                 });
+            if (n.has_mesh && (options->flags & RSDF_MESH_PREVIEW_FACETS))
+                refine_mesh_facets(field, surface, settings, normals);
             align_surface_creases(field, surface, settings, normals);
         }
         Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order)

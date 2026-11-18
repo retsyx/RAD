@@ -58,11 +58,23 @@ inline uint64_t surface_edge_key(uint32_t a, uint32_t b) {
     return a < b ? uint64_t(a) << 32 | b : uint64_t(b) << 32 | a;
 }
 
+// Final display vertices use Float32 coordinates.
+inline bool same_preview_position(const double *a, const double *b) {
+    for (int axis = 0; axis < 3; ++axis)
+        if (static_cast<float>(a[axis]) != static_cast<float>(b[axis])) return false;
+    return true;
+}
+
 // Splits both triangles incident to each edge, using the already appended
 // vertices in sorted edge-key order. If chord positions are supplied, use
 // them for any projected cuts that would fold an adjacent face.
 void subdivide_surface(Surface &surface, const std::vector<uint64_t> &edges, uint32_t first_vertex,
                        const std::vector<std::array<double, 3>> &chord_points = {});
+
+// Resolves panels whose field normals vary too quickly to interpolate across
+// the preview triangles. Updates the exact normals for newly split vertices.
+void refine_mesh_facets(const MeshField &field, Surface &surface, const MeshSettings &settings,
+                        std::vector<double> &normals);
 
 void align_surface_creases(const MeshField &field, Surface &surface, const MeshSettings &settings,
                            const std::vector<double> &normals);
