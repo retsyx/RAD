@@ -117,7 +117,7 @@ final class AppState {
     /// Session-only printing versions of recently displayed builds, keyed by
     /// the ordinary build's identity, and the print orientations found so
     /// far, keyed by the identity of the build they orient. The views and
-    /// STL export share them; neither is ever saved.
+    /// 3MF export share them; neither is ever saved.
     @ObservationIgnored private var printVersions: [String: PreviewMesh] = [:]
     @ObservationIgnored private var printOrientationCache: [String: [Int: PrintOrientation]] = [:]
     @ObservationIgnored private var printPreviewTasks: [String: Task<PreviewMesh, Error>] = [:]
@@ -2396,42 +2396,42 @@ final class AppState {
         autosave()
     }
 
-    func exportSTL() {
+    func export3MF() {
         guard canExport else { return }
         let panel = NSSavePanel()
-        panel.identifier = NSUserInterfaceItemIdentifier("RAD.ExportSTL")
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.Export3MF")
         panel.title = "Export design"
-        panel.allowedContentTypes = [UTType(filenameExtension: "stl") ?? .data]
-        panel.nameFieldStringValue = "\(safeName(title)).stl"
-        let options = STLExportOptionsView(panel: panel, projectName: STLIndividualExport.folderName(for: title))
+        panel.allowedContentTypes = [UTType(filenameExtension: "3mf") ?? .data]
+        panel.nameFieldStringValue = "\(safeName(title)).3mf"
+        let options = ThreeMFExportOptionsView(panel: panel, projectName: ThreeMFExport.folderName(for: title))
         panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url else { return }
-        exportSTL(to: url, for3DPrinting: options.for3DPrinting,
+        export3MF(to: url, for3DPrinting: options.for3DPrinting,
                   exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
     }
 
-    func exportSelectedPartsSTL(_ solidIndices: Set<Int>? = nil) {
+    func exportSelectedParts3MF(_ solidIndices: Set<Int>? = nil) {
         let solids = (solidIndices ?? selectedSolids).intersection(Set(0..<currentSolidCount))
         guard canExport, !solids.isEmpty else { return }
         let revisionID = selectedRevisionID, sessionID = projectSessionID
         let panel = NSSavePanel()
-        panel.identifier = NSUserInterfaceItemIdentifier("RAD.ExportSelectedPartsSTL")
+        panel.identifier = NSUserInterfaceItemIdentifier("RAD.ExportSelectedParts3MF")
         panel.title = "Export selected parts"
-        panel.allowedContentTypes = [UTType(filenameExtension: "stl") ?? .data]
-        panel.nameFieldStringValue = "\(safeName(title)) selected parts.stl"
-        let options = STLExportOptionsView(panel: panel, projectName: STLIndividualExport.folderName(for: title))
+        panel.allowedContentTypes = [UTType(filenameExtension: "3mf") ?? .data]
+        panel.nameFieldStringValue = "\(safeName(title)) selected parts.3mf"
+        let options = ThreeMFExportOptionsView(panel: panel, projectName: ThreeMFExport.folderName(for: title))
         panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url,
               revisionID == selectedRevisionID, sessionID == projectSessionID else { return }
-        exportSTL(to: url, solidIndices: solids, for3DPrinting: options.for3DPrinting,
+        export3MF(to: url, solidIndices: solids, for3DPrinting: options.for3DPrinting,
                   exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
     }
 
     /// Export the captured geometry at its current placement. The engine
-    /// caches session bytes by geometry, selected solids and placement.
+    /// caches session bytes by geometry, selected solids, placement and part presentation.
     /// For 3D printing, export the printing version with the 3D printing
     /// view's orientations, packing only the exported parts.
-    func exportSTL(to url: URL, solidIndices: Set<Int>? = nil, for3DPrinting: Bool = false,
+    func export3MF(to url: URL, solidIndices: Set<Int>? = nil, for3DPrinting: Bool = false,
                    exportIndividualParts: Bool = false, replaceExisting: Bool = false) {
         guard canExport, let preview = posedPreview, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
@@ -2440,14 +2440,15 @@ final class AppState {
         let token = UUID(), sessionID = projectSessionID
         operationID = token
         let runtime = python, cores = threads
-        isWorking = true; activity = "Exporting STL…"; error = nil
+        isWorking = true; activity = "Exporting 3MF…"; error = nil
         operation = Task {
             do {
-                let output: (files: [Data], parts: [STLIndividualExport.Part])
+                let output: (files: [Data], parts: [ThreeMFExport.Part])
                 do {
-                    output = try await stlExportOutput(preview, model: revision.model, solidIndices: solidIndices, nodes: nodes,
-                                                       for3DPrinting: for3DPrinting, individualParts: exportIndividualParts,
-                                                       python: runtime, threads: cores)
+                    output = try await threeMFExportOutput(preview, model: revision.model, solidIndices: solidIndices,
+                                                           nodes: nodes, colors: revision.partColors ?? [:],
+                                                           for3DPrinting: for3DPrinting, individualParts: exportIndividualParts,
+                                                           python: runtime, threads: cores)
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
                     // captured subset to fresh stable ownership.
@@ -2459,18 +2460,18 @@ final class AppState {
                           !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
                     let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
                     try cacheReplayedPreview(rebuilt, at: index)
-                    output = try await stlExportOutput(rebuilt, model: revision.model,
-                                                       solidIndices: solidIndices == nil ? nil : restored.selected,
-                                                       nodes: restored.layout?.nodes ?? restored.parts,
-                                                       for3DPrinting: for3DPrinting, individualParts: exportIndividualParts,
-                                                       python: runtime, threads: cores)
+                    output = try await threeMFExportOutput(rebuilt, model: revision.model,
+                                                           solidIndices: solidIndices == nil ? nil : restored.selected,
+                                                           nodes: restored.layout?.nodes ?? restored.parts,
+                                                           colors: revision.partColors ?? [:], for3DPrinting: for3DPrinting,
+                                                           individualParts: exportIndividualParts, python: runtime, threads: cores)
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled, revisions.contains(where: { $0.id == revisionID }) else { return }
                 let writing = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     if exportIndividualParts {
-                        try STLIndividualExport.write(output.files, parts: output.parts, to: url,
+                        try ThreeMFExport.write(output.files, parts: output.parts, to: url,
                                                       replaceExisting: replaceExisting)
                     } else {
                         try output.files[0].write(to: url, options: .atomic)
@@ -2481,7 +2482,7 @@ final class AppState {
                 } onCancel: { writing.cancel() }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled else { return }
-                notice = "STL exported · \(url.lastPathComponent)"
+                notice = "3MF exported · \(url.lastPathComponent)"
                 activity = "Ready"; isWorking = false; operation = nil
             } catch is CancellationError {
                 if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
@@ -2493,9 +2494,10 @@ final class AppState {
         }
     }
 
-    private func stlExportOutput(_ preview: PreviewMesh, model: ModelSpec, solidIndices: Set<Int>?, nodes: [PartNode],
-                                 for3DPrinting: Bool, individualParts: Bool,
-                                 python: String, threads: Int) async throws -> (files: [Data], parts: [STLIndividualExport.Part]) {
+    private func threeMFExportOutput(_ preview: PreviewMesh, model: ModelSpec, solidIndices: Set<Int>?,
+                                     nodes: [PartNode], colors: [String: PartColor], for3DPrinting: Bool, individualParts: Bool,
+                                     python: String, threads: Int) async throws -> (files: [Data], parts: [ThreeMFExport.Part]) {
+        let presentation = ThreeMFExport.presentation(in: nodes, overrides: colors)
         var source = preview
         var selection = solidIndices
         var transforms: [Int: [Double]]?
@@ -2515,12 +2517,13 @@ final class AppState {
                 orientations: printOrientations(of: source, solids: exported))
         }
         if individualParts {
-            let parts = STLIndividualExport.parts(in: nodes, selected: selection, solidCount: source.solids)
-            let files = try await engine.exportSTLParts(source, parts: parts.map(\.solidIndices),
-                                                        solidTransforms: transforms, python: python, threads: threads)
+            let parts = ThreeMFExport.parts(in: nodes, selected: selection, solidCount: source.solids)
+            let files = try await engine.export3MFParts(source, parts: parts.map(\.solidIndices),
+                                                        partPresentation: presentation, solidTransforms: transforms,
+                                                        python: python, threads: threads)
             return (files, parts)
         }
-        let data = try await engine.exportSTL(source, solidIndices: selection,
+        let data = try await engine.export3MF(source, solidIndices: selection, partPresentation: presentation,
                                               solidTransforms: transforms, python: python, threads: threads)
         return ([data], [])
     }

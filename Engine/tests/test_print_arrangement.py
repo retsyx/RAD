@@ -258,7 +258,7 @@ result = [box((4, 8, 2), center=(82, 16, 11)),
 """)
         report, folder = native(output, result, "print_orient", solidIndices=[1, 2],
                                 printDown=[{"solid": 2, "direction": [0, 0, 2]}])
-        self.assertFalse((folder / "model.stl").exists())
+        self.assertFalse((folder / "model.3mf").exists())
         records = report["orientations"]
         self.assertEqual([record["solid"] for record in records], [1, 2])
         data = (output / "model.rsdf").read_bytes()
@@ -280,7 +280,7 @@ result = [box((4, 8, 2), center=(82, 16, 11)),
                 native(output, result, "print_orient", printDown=pins)
         with self.assertRaises(ModelError):
             native(output, result, "export", arrangeFor3DPrinting=True)
-        self.assertEqual(list(output.parent.glob("*/model.stl")), [])
+        self.assertEqual(list(output.parent.glob("*/model.3mf")), [])
 
 
 if __name__ == "__main__":

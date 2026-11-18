@@ -226,18 +226,18 @@ final class EngineProtocolTests: XCTestCase {
         }
 
         // export: whole, posed subset, printing layout and one file per part.
-        let whole = try EngineSTLExportTests.summary(await engine.exportSTL(preview, python: python, threads: 2))
+        let whole = try EngineThreeMFExportTests.summary(await engine.export3MF(preview, python: python, threads: 2))
         XCTAssertEqual(whole.volume, preview.volume, accuracy: preview.volume * 0.01)
-        let swung = try EngineSTLExportTests.summary(await engine.exportSTL(preview, solidIndices: [1], solidTransforms: turned,
+        let swung = try EngineThreeMFExportTests.summary(await engine.export3MF(preview, solidIndices: [1], solidTransforms: turned,
                                                                             python: python, threads: 2))
         XCTAssertEqual(swung.volume, Self.armVolume, accuracy: Self.armVolume * 0.01)
         assertVector([swung.bounds[0], swung.bounds[3]], [-6, 6], accuracy: 0.05, "The arm exports at its pose.")
-        let plate = try EngineSTLExportTests.summary(await engine.exportSTL(preview, solidTransforms: layout, python: python, threads: 2))
+        let plate = try EngineThreeMFExportTests.summary(await engine.export3MF(preview, solidTransforms: layout, python: python, threads: 2))
         XCTAssertEqual(plate.bounds[2], 0, accuracy: 0.05)
-        let files = try await engine.exportSTLParts(preview, parts: [[0], [1, 2]], python: python, threads: 2)
+        let files = try await engine.export3MFParts(preview, parts: [[0], [1, 2]], python: python, threads: 2)
         XCTAssertEqual(files.count, 2)
-        XCTAssertEqual(try EngineSTLExportTests.summary(files[0]).volume, Self.baseVolume, accuracy: Self.baseVolume * 0.01)
-        XCTAssertEqual(try EngineSTLExportTests.summary(files[1]).volume, Self.armVolume + Self.knobVolume,
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(files[0]).volume, Self.baseVolume, accuracy: Self.baseVolume * 0.01)
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(files[1]).volume, Self.armVolume + Self.knobVolume,
                        accuracy: (Self.armVolume + Self.knobVolume) * 0.01)
 
         // validate: half the preview cell by default, or the requested cell.

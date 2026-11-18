@@ -32,8 +32,8 @@ final class EngineNativeWorkerTests: XCTestCase {
             let points = try XCTUnwrap(report.closestPoints)
             XCTAssertEqual(points[1][0] - points[0][0], 2, accuracy: 0.01)
         }
-        let stl = try await engine.exportSTL(preview, solidIndices: [1], python: python, threads: 2)
-        XCTAssertEqual(try EngineSTLExportTests.summary(stl).volume, 1, accuracy: 0.02)
+        let model = try await engine.export3MF(preview, solidIndices: [1], python: python, threads: 2)
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(model).volume, 1, accuracy: 0.02)
         var launches = await engine.native.launches
         XCTAssertEqual(launches, 1, "Measurements and exports reuse the same worker process.")
 

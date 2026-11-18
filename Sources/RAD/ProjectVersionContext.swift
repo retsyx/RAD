@@ -1,7 +1,7 @@
 import Foundation
 
 /// Immutable recipes and document metadata visible to one agent task. Display
-/// meshes, native caches and generated STL exports never enter this snapshot.
+/// meshes, native caches and generated 3MF exports never enter this snapshot.
 struct ProjectVersionContext: Sendable {
     struct Version: Sendable {
         let id: UUID

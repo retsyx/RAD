@@ -131,9 +131,9 @@ final class EngineService {
     private var job: EngineProcessJob?
     private var generation = UUID()
     private let temporaryDirectory: URL
-    /// A cached STL export: the staged graph and the whole export request,
+    /// A cached 3MF export: the staged graph and the whole export request,
     /// so every request field selects its own bytes.
-    private struct STLExportKey: Hashable {
+    private struct ThreeMFExportKey: Hashable {
         var artifactPath: String
         var request: EngineWorkerRequest.Export
     }
@@ -275,11 +275,11 @@ final class EngineService {
         return try JSONDecoder().decode(RuntimeResult.self, from: data).runtime
     }
 
-    /// Export a build's parts as one binary STL with separate closed shells,
-    /// re-meshed from its SDF graph without replaying the program. Repeated
-    /// exports reuse bytes only for the same geometry, subset and placement.
-    func exportSTL(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidTransforms: [Int: [Double]]? = nil,
-                   python: String, threads: Int) async throws -> Data {
+    /// Export separately colored meshes from the build's SDF graph without
+    /// replaying the program. Cache by geometry, subset, placement and presentation.
+    func export3MF(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil,
+                   partPresentation: [Int: ThreeMFExport.Presentation]? = nil,
+                   solidTransforms: [Int: [Double]]? = nil, python: String, threads: Int) async throws -> Data {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
         let transforms = try AssemblySolidTransform.validatedRecords(solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:], solidCount: preview.solids)
@@ -290,28 +290,31 @@ final class EngineService {
         }
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
         let source = try nativeSource(preview)
-        let request = EngineWorkerRequest.Export(solidIndices: selection, solidTransforms: transforms)
-        let cacheKey = STLExportKey(artifactPath: source.url.path, request: request)
-        if let cached = STLExportCache.shared.data(for: cacheKey) { return cached[0] }
+        let presentation = partPresentation ?? ThreeMFExport.presentation(in: preview.parts ?? [])
+        let request = EngineWorkerRequest.Export(solidIndices: selection,
+            partPresentation: presentation.filter { solidIndices?.contains($0.key) ?? true }, solidTransforms: transforms)
+        let cacheKey = ThreeMFExportKey(artifactPath: source.url.path, request: request)
+        if let cached = ThreeMFExportCache.shared.data(for: cacheKey) { return cached[0] }
         let output = try await runNative(python: python, threads: threads, action: "export this design") { folder in
             try EngineWorkerRequest.export(Self.stageNative(source, into: folder), request).write(to: folder)
         }
         let data = try await Task.detached(priority: .userInitiated) {
-            let data = try EngineArtifact.read(output.folder.appendingPathComponent("model.stl"), in: output.folder,
+            let data = try EngineArtifact.read(output.folder.appendingPathComponent("model.3mf"), in: output.folder,
                                                maximumBytes: ProjectStore.maximumAssetBytes)
-            try Self.validateSTL(data)
+            try Self.validate3MF(data)
             return data
         }.value
         try Task.checkCancellation()
-        STLExportCache.shared.store([data], for: cacheKey, owner: source.artifacts.folder)
+        ThreeMFExportCache.shared.store([data], for: cacheKey, owner: source.artifacts.folder)
         return data
     }
 
     /// Export all requested named parts in one worker, preserving their order.
     /// Placement is shared across files, so importing them together
     /// reconstructs the same layout as a combined export.
-    func exportSTLParts(_ preview: PreviewMesh, parts: [[Int]], solidTransforms: [Int: [Double]]? = nil,
-                        python: String, threads: Int) async throws -> [Data] {
+    func export3MFParts(_ preview: PreviewMesh, parts: [[Int]],
+                        partPresentation: [Int: ThreeMFExport.Presentation]? = nil,
+                        solidTransforms: [Int: [Double]]? = nil, python: String, threads: Int) async throws -> [Data] {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
         let transforms = try AssemblySolidTransform.validatedRecords(solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:], solidCount: preview.solids)
@@ -324,9 +327,13 @@ final class EngineService {
         let parts = parts.map { $0.sorted() }
         let selection = indices.count == preview.solids ? nil : indices.sorted()
         let source = try nativeSource(preview)
-        let request = EngineWorkerRequest.Export(solidIndices: selection, solidTransforms: transforms, individualParts: parts)
-        let cacheKey = STLExportKey(artifactPath: source.url.path, request: request)
-        if let cached = STLExportCache.shared.data(for: cacheKey) { return cached }
+        let presentation = partPresentation ?? ThreeMFExport.presentation(in: preview.parts ?? [])
+        let included = Set(indices)
+        let request = EngineWorkerRequest.Export(solidIndices: selection,
+            partPresentation: presentation.filter { included.contains($0.key) },
+            solidTransforms: transforms, individualParts: parts)
+        let cacheKey = ThreeMFExportKey(artifactPath: source.url.path, request: request)
+        if let cached = ThreeMFExportCache.shared.data(for: cacheKey) { return cached }
         let output = try await runNative(python: python, threads: threads, action: "export these design parts") { folder in
             try EngineWorkerRequest.export(Self.stageNative(source, into: folder), request).write(to: folder)
         }
@@ -340,19 +347,19 @@ final class EngineService {
             var result: [Data] = [], total = 0
             for (index, file) in files.enumerated() {
                 try Task.checkCancellation()
-                guard file.path == String(format: "part-%04d.stl", index), file.solidIndices == parts[index] else {
+                guard file.path == String(format: "part-%04d.3mf", index), file.solidIndices == parts[index] else {
                     throw RADError.message("The CAD engine returned an invalid parts export.")
                 }
                 let bytes = try EngineArtifact.read(output.folder.appendingPathComponent(file.path), in: output.folder,
                                                     maximumBytes: ProjectStore.maximumAssetBytes - total)
-                try Self.validateSTL(bytes)
+                try Self.validate3MF(bytes)
                 total += bytes.count
                 result.append(bytes)
             }
             return result
         }.value
         try Task.checkCancellation()
-        STLExportCache.shared.store(data, for: cacheKey, owner: source.artifacts.folder)
+        ThreeMFExportCache.shared.store(data, for: cacheKey, owner: source.artifacts.folder)
         return data
     }
 
@@ -660,21 +667,51 @@ final class EngineService {
         return RunResult(artifacts: artifacts, token: UUID())
     }
 
-    /// A binary STL: an 80-byte header, the triangle count, then 50 bytes
-    /// per triangle with a finite normal and vertices.
-    nonisolated static func validateSTL(_ data: Data) throws {
-        func invalid() -> RADError { RADError.message("The exported STL is invalid or exceeds 512 MB.") }
-        guard data.count >= 84 + 50, data.count <= ProjectStore.maximumAssetBytes else { throw invalid() }
+    /// Check the worker's ZIP structure without inflating its mesh XML.
+    /// The worker validates the mesh and writes three entries to a seekable file.
+    nonisolated static func validate3MF(_ data: Data) throws {
+        let invalid = RADError.message("The exported 3MF is invalid or exceeds 512 MB.")
+        let entryNames = Set(["[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"])
+        guard data.count >= 22, data.count <= ProjectStore.maximumAssetBytes else { throw invalid }
         try data.withUnsafeBytes { raw in
-            let count = Int(UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 80, as: UInt32.self)))
-            guard count > 0, data.count == 84 + 50 * count else { throw invalid() }
-            for triangle in 0..<count {
-                let base = 84 + 50 * triangle
-                for value in 0..<12 {
-                    let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: base + 4 * value, as: UInt32.self))
-                    guard Float(bitPattern: bits).isFinite else { throw invalid() }
-                }
+            func u16(_ offset: Int) -> Int {
+                Int(UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt16.self)))
             }
+            func u32(_ offset: Int) -> Int {
+                Int(UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            }
+
+            let end = raw.count - 22
+            guard u32(end) == 0x06054B50, u32(end + 4) == 0, u16(end + 20) == 0,
+                  u16(end + 8) == entryNames.count, u16(end + 10) == entryNames.count else { throw invalid }
+            let central = u32(end + 16)
+            guard central + u32(end + 12) == end else { throw invalid }
+
+            var cursor = central
+            var remaining = entryNames
+            var previousEnd = 0
+            for _ in entryNames {
+                guard cursor + 46 <= end, u32(cursor) == 0x02014B50 else { throw invalid }
+                let nameLength = u16(cursor + 28), compressedSize = u32(cursor + 20)
+                let nameStart = cursor + 46, nameEnd = nameStart + nameLength
+                let next = nameEnd + u16(cursor + 30) + u16(cursor + 32)
+                guard next <= end,
+                      remaining.remove(String(decoding: raw[nameStart..<nameEnd], as: UTF8.self)) != nil else { throw invalid }
+
+                let local = u32(cursor + 42)
+                guard local == previousEnd, local + 30 <= central, u32(local) == 0x04034B50,
+                      u16(local + 6) == 0, u16(cursor + 8) == 0,
+                      u16(local + 8) == u16(cursor + 10), [0, 8].contains(u16(local + 8)),
+                      u32(local + 14) == u32(cursor + 16), u32(local + 18) == compressedSize, compressedSize > 0,
+                      u32(local + 22) == u32(cursor + 24), u32(local + 22) > 0,
+                      u16(local + 26) == nameLength else { throw invalid }
+                let contents = local + 30 + nameLength + u16(local + 28)
+                previousEnd = contents + compressedSize
+                guard previousEnd <= central,
+                      raw[(local + 30)..<(local + 30 + nameLength)].elementsEqual(raw[nameStart..<nameEnd]) else { throw invalid }
+                cursor = next
+            }
+            guard cursor == end, previousEnd == central else { throw invalid }
         }
     }
 

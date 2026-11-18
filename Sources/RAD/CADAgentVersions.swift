@@ -99,7 +99,7 @@ enum CADAgentVersionFiles {
             files.append(File(path: "\(base)/part-display.json", data: try object(display)))
         }
         info["replay"] = "To inspect this exact saved construction, call rad_build with the returned programPath and versionID. That build uses this version's original imported_assets bindings without changing the current design or its inputs."
-        info["finalProgramGuidance"] = "For a final authored program, adapt the complete historical program and retain only the current design's input bindings. Build the final candidate without versionID. Never turn prior generated geometry, RAD STL exports or preview meshes into inputs."
+        info["finalProgramGuidance"] = "For a final authored program, adapt the complete historical program and retain only the current design's input bindings. Build the final candidate without versionID. Never turn prior generated geometry, RAD 3MF exports or preview meshes into inputs."
         manifest["usage"] = info["replay"]
         files.append(File(path: "\(base)/inputs.json", data: try object(manifest)))
         files.append(File(path: "\(base)/metadata.json", data: try object(info)))

@@ -15,7 +15,7 @@ struct PrintOrientation: Codable, Sendable, Equatable {
     var bounds: [Double]
 }
 
-/// The 3D printing geometry pipeline shared by the viewport and STL export.
+/// The 3D printing geometry pipeline shared by the viewport and 3MF export.
 /// The worker orients each solid once; packing on the bed is a translation
 /// of those orientations, so any subset can be packed again cheaply.
 enum PrintLayout {

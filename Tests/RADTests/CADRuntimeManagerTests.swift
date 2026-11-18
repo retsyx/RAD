@@ -189,8 +189,8 @@ final class CADRuntimeManagerTests: XCTestCase {
         let pair = try await engine.measure(preview, solids: [0, 1], python: python, threads: 2)
         // The hole lies under the ball, so the nearest plate point is on its rim at (3, 0, 3).
         XCTAssertEqual(try XCTUnwrap(pair.metrics.first { $0.id == "pair:distance" }?.values.first), 58.squareRoot() - 2, accuracy: 0.05)
-        let stl = try EngineSTLExportTests.summary(await engine.exportSTL(preview, python: python, threads: 2))
-        XCTAssertEqual(stl.volume, preview.volume, accuracy: preview.volume * 0.02)
+        let model = try EngineThreeMFExportTests.summary(await engine.export3MF(preview, python: python, threads: 2))
+        XCTAssertEqual(model.volume, preview.volume, accuracy: preview.volume * 0.02)
         let validation = try await engine.validate(preview, python: python, threads: 2)
         XCTAssertTrue(validation.ok, "\(validation)")
         XCTAssertEqual(validation.parts.map(\.solid), [0, 1])

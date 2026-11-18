@@ -22,7 +22,7 @@ final class CodexAgentIntegrationTests: XCTestCase {
         Call rad_runtime; write a complete .py recipe; call rad_build; call rad_inspect with
         kind probe to check the wall between the hole and the outside, and rad_measure for
         the part; call rad_validate; call rad_render and review the returned image; call
-        rad_export_stl to a path in the task workspace. Finish with the schema JSON, the exact program you built,
+        rad_export_3mf to a path in the task workspace. Finish with the schema JSON, the exact program you built,
         assetIDs=[] and a short summary mentioning what the rendered shape shows.
         Do not install packages or inspect unrelated files. Do not rebuild the CAD runtime.
         """, current: nil, history: [], executable: executable, model: model,
@@ -33,7 +33,7 @@ final class CodexAgentIntegrationTests: XCTestCase {
         XCTAssertEqual(preview.solids, 1)
         XCTAssertEqual(preview.volume, 184 * .pi, accuracy: 184 * .pi * 0.01)
         let completed = Set(capture.events.filter { $0.category == "tool" && $0.status == "completed" }.map(\.title))
-        for tool in ["rad_runtime", "rad_build", "rad_inspect", "rad_measure", "rad_validate", "rad_render", "rad_export_stl"] {
+        for tool in ["rad_runtime", "rad_build", "rad_inspect", "rad_measure", "rad_validate", "rad_render", "rad_export_3mf"] {
             XCTAssertTrue(completed.contains(tool), "The live Codex turn did not successfully use \(tool).")
         }
         XCTAssertTrue(capture.events.contains { $0.title == "rad_render" && $0.output?.contains("image_path") == true })

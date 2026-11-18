@@ -11,7 +11,7 @@ from unittest import mock
 
 import numpy as np
 
-from sdf_test_support import (ROOT, assert_closed_and_outward, build, native, read_stl, script_spec,
+from sdf_test_support import (ROOT, assert_closed_and_outward, build, native, read_3mf, script_spec,
                               signed_volume)
 import sdf_build
 from sdf_build import ModelError, validate_spec, validation_hash
@@ -432,7 +432,7 @@ right.add(body.translate((30, 0, 0)), name='Spacer')
 
 
 class ExampleTests(unittest.TestCase):
-    def test_examples_build_closed_parts_and_export_stl(self):
+    def test_examples_build_closed_parts_and_export_3mf(self):
         examples = sorted((ROOT / "Examples").glob("*.json"))
         self.assertTrue(examples)
         for example in examples:
@@ -452,7 +452,7 @@ class ExampleTests(unittest.TestCase):
                 corners = np.asarray(result["vertices"], dtype=np.float64)[triangles]
                 self.assertAlmostEqual(signed_volume(corners) / result["volume"], 1, delta=1e-6)
                 report, folder = native(output, result, "export")
-                exported, _ = read_stl(folder / "model.stl")
+                exported, _ = read_3mf(folder / "model.3mf")
                 self.assertEqual(len(exported), report["triangles"])
                 self.assertAlmostEqual(signed_volume(exported) / result["volume"], 1, delta=0.01)
 
@@ -476,7 +476,7 @@ class MeasurementTests(unittest.TestCase):
             self.assertAlmostEqual(actual, expected, places=5)
         self.assertEqual(report["closestPoints"][1], self.metric(report, "pair:second"))
         self.assertFalse((folder / "mesh.bin").exists())
-        self.assertFalse((folder / "model.stl").exists())
+        self.assertFalse((folder / "model.3mf").exists())
         # Sphere to cylinder: 7 - 1.5 - 2 between curved surfaces.
         report, _ = native(output, result, "measure",
                            entities=[{"kind": "part", "solid": 2}, {"kind": "part", "solid": 0}])
@@ -507,7 +507,7 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(self.metric(report, "pair:distance"), [0.0])
         self.assertEqual(report["closestPoints"][0], report["closestPoints"][1])
 
-    def test_selected_stl_exports_only_requested_parts_in_original_coordinates(self):
+    def test_selected_3mf_exports_only_requested_parts_in_original_coordinates(self):
         script = ("result = [box((1, 2, 3), center=(-9.5, 4, 5.5)), box((2, 3, 4), center=(21, -3.5, 8)), "
                   "cylinder(2, 5, center=(40, 8, -0.5))]")
         result, output = build(self, script)
@@ -515,7 +515,7 @@ class MeasurementTests(unittest.TestCase):
             with self.subTest(selected=selected):
                 report, folder = native(output, result, "export", solidIndices=selected)
                 self.assertEqual(report["solids"], len(selected))
-                corners, normals = read_stl(folder / "model.stl")
+                corners, parts = read_3mf(folder / "model.3mf")
                 self.assertEqual(len(corners), report["triangles"])
                 volume = sum(result["partStats"][index]["volume"] for index in selected)
                 # Simplification keeps flat faces and inscribes chords in the
@@ -528,7 +528,9 @@ class MeasurementTests(unittest.TestCase):
                 hi = np.max([result["partStats"][index]["bounds"][3:] for index in selected], axis=0)
                 self.assertTrue(np.allclose(corners.reshape(-1, 3).min(axis=0), lo, atol=0.05))
                 self.assertTrue(np.allclose(corners.reshape(-1, 3).max(axis=0), hi, atol=0.05))
-                self.assertTrue(np.allclose(np.linalg.norm(normals, axis=1), 1, atol=1e-5))
+                self.assertEqual(len(parts), len(selected))
+                for _, _, vertices, triangles in parts:
+                    assert_closed_and_outward(self, vertices, triangles)
                 # Half the default preview cell: the design spans 52 mm.
                 self.assertEqual(report["cellSize"], 52 / 256 / 2)
         report, folder = native(output, result, "export", solidIndices=[0], cellSize=0.25)
@@ -540,7 +542,7 @@ class MeasurementTests(unittest.TestCase):
             report, folder = native(output, result, "export", cellSize=0.05)
         self.assertLessEqual(report["triangles"], 20_000)
         self.assertGreater(report["cellSize"], 0.05)
-        corners, _ = read_stl(folder / "model.stl")
+        corners, _ = read_3mf(folder / "model.3mf")
         self.assertAlmostEqual(signed_volume(corners) / (4 / 3 * math.pi * 1000), 1, delta=0.01)
 
     def test_selection_operations_reject_invalid_indices_and_items(self):

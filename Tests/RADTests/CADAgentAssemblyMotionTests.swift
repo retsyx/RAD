@@ -105,9 +105,9 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
         let metrics = try XCTUnwrap(measured["metrics"] as? [[String: Any]])
         let centroid = try XCTUnwrap(metrics.first { $0["id"] as? String == "parts:centroid" }?["values"] as? [Double])
         assertVector(centroid, [12.5*k, 0, -7.5*k])
-        let exported = try content(try await tools.handle(name: "rad_export_stl", arguments: ["solidIndices": [1]]))
+        let exported = try content(try await tools.handle(name: "rad_export_3mf", arguments: ["solidIndices": [1]]))
         let data = try Data(contentsOf: URL(fileURLWithPath: XCTUnwrap(exported["path"] as? String)))
-        assertVector(try EngineSTLExportTests.summary(data).bounds, bounds)
+        assertVector(try EngineThreeMFExportTests.summary(data).bounds, bounds)
         XCTAssertEqual(preview.assemblyPose?.positions["hinge"], 45)
 
         var revision = ProjectRevision(model: model, parts: preview.parts)

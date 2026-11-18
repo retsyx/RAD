@@ -158,7 +158,7 @@
   },
   {
     "name": "rad_import",
-    "description": "Register a pre-existing external or reference triangle mesh from the task workspace as a design input: a binary or ASCII STL or an OBJ file, such as a part the user attached, or a faithful format conversion of a user-provided input. Never import geometry generated for this design, by RAD (rad_export_stl exports) or by external tools; authored geometry belongs in the replayable program. The mesh must be closed, consistently oriented and manifold, in millimetres; separate bodies may overlap or touch and are united, and a shell facing inward within one body's solid is a cavity. RAD validates the mesh with a build of it alone and returns that artifact with an assetID; when only that preview fails (a sheet thinner than the preview cells of its own size), the mesh is still registered and the result carries warnings instead of an artifact. Programs use the solid as imported_assets[assetID] like any radsdf solid (booleans, placement, offset, shell); list the assetID in rad_build assetIDs and the final response's assetIDs. The solid is the exact distance to the facets: curved originals stay faceted, and previews and exports re-mesh them.",
+    "description": "Register a pre-existing external or reference triangle mesh from the task workspace as a design input: a binary or ASCII STL or an OBJ file, such as a part the user attached, or a faithful format conversion of a user-provided input. Never import geometry generated for this design, by RAD (rad_export_3mf exports) or by external tools; authored geometry belongs in the replayable program. The mesh must be closed, consistently oriented and manifold, in millimetres; separate bodies may overlap or touch and are united, and a shell facing inward within one body's solid is a cavity. RAD validates the mesh with a build of it alone and returns that artifact with an assetID; when only that preview fails (a sheet thinner than the preview cells of its own size), the mesh is still registered and the result carries warnings instead of an artifact. Programs use the solid as imported_assets[assetID] like any radsdf solid (booleans, placement, offset, shell); list the assetID in rad_build assetIDs and the final response's assetIDs. The solid is the exact distance to the facets: curved originals stay faceted, and previews and exports re-mesh them.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -802,8 +802,8 @@
     }
   },
   {
-    "name": "rad_export_stl",
-    "description": "Export an artifact as binary STL (millimetres) into the task workspace, re-meshed from its SDFs at export resolution and simplified with a 0.01 mm tolerance (flat and gently curved regions become large triangles; sharp edges and corners stay; the field is checked at sampled points, so the surface can deviate slightly more between them, near curved sharp edges and on scaled or blended shapes), with every part a separate closed shell. Export the whole artifact or selected parts; individualParts writes one STL per physical part named from the parts tree; parts stay at the artifact's assembly pose unless jointPositions poses them; printLayout exports the 3D printing layout: a printing version artifact's printed parts oriented for printing and packed on the build plate at z=0, as the user's export for 3D printing, leaving out reference parts. STL has no colors. Returns file references without sending the bytes as text.",
+    "name": "rad_export_3mf",
+    "description": "Export an artifact as 3MF (millimetres) into the task workspace, re-meshed from its SDFs at export resolution and simplified with a 0.01 mm tolerance (flat and gently curved regions become large triangles; sharp edges and corners stay; the field is checked at sampled points, so the surface can deviate slightly more between them, near curved sharp edges and on scaled or blended shapes), with every solid a separate closed mesh carrying its part's current color and name. Export the whole artifact or selected parts; individualParts writes one 3MF file per physical part named from the parts tree; parts stay at the artifact's assembly pose unless jointPositions poses them; printLayout exports the 3D printing layout: a printing version artifact's printed parts oriented for printing and packed on the build plate at z=0, as the user's export for 3D printing, leaving out reference parts. Returns file references without sending the bytes as text.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -813,7 +813,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Workspace output path; default exports/<artifactID>.stl, or the folder exports/<artifactID>-parts with individualParts."
+          "description": "Workspace output path; default exports/<artifactID>.3mf, or the folder exports/<artifactID>-parts with individualParts."
         },
         "solidIndices": {
           "type": "array",
@@ -838,7 +838,7 @@
         "individualParts": {
           "type": "boolean",
           "default": false,
-          "description": "Write one STL file per physical part, named from the parts tree."
+          "description": "Write one 3MF file per physical part, named from the parts tree."
         },
         "jointPositions": {
           "type": "object",

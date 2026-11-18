@@ -1,11 +1,11 @@
 import Foundation
 
-/// Recently exported STL bytes, shared by every engine in the process so the
+/// Recently exported 3MF bytes, shared by every engine in the process so the
 /// byte bound holds across design windows and agent sessions. Keys identify the
-/// native geometry, subset and arrangement. Entries go with the build
-/// artifacts that produced them, so released geometry never keeps its bytes.
-final class STLExportCache: @unchecked Sendable {
-    static let shared = STLExportCache(maximumBytes: ProjectStore.maximumAssetBytes, maximumEntries: 8)
+/// native geometry, subset, placement and part presentation. Entries expire
+/// when the build artifacts that produced them are released.
+final class ThreeMFExportCache: @unchecked Sendable {
+    static let shared = ThreeMFExportCache(maximumBytes: ProjectStore.maximumAssetBytes, maximumEntries: 8)
 
     private struct Entry {
         var data: [Data]

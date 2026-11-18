@@ -8,7 +8,7 @@ final class AgentToolCatalogTests: XCTestCase {
         var capabilities: [ExternalAgentCapability: Set<String>] = [:]
         for tool in catalog.tools { capabilities[tool.host.capability, default: []].insert(tool.name) }
         XCTAssertEqual(capabilities[.capture], ["rad_screenshot"])
-        XCTAssertEqual(capabilities[.export], ["rad_export_stl"])
+        XCTAssertEqual(capabilities[.export], ["rad_export_3mf"])
         XCTAssertEqual(capabilities[.build], ["rad_build", "rad_import", "rad_request_permission", "rad_set_part_colors",
                                               "rad_verify"], "rad_verify runs programs, as builds do.")
         XCTAssertNil(capabilities[.commit], "Only the external transport commits candidates.")
@@ -19,7 +19,7 @@ final class AgentToolCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.tools.filter { !$0.host.programs.isEmpty }.map(\.name), ["rad_build", "rad_verify"])
         XCTAssertEqual(catalog.tools.filter { !$0.host.references.isEmpty }.map(\.name), ["rad_import"])
         XCTAssertEqual(catalog.tools.filter { !$0.host.sources.isEmpty }.map(\.name), ["rad_import"])
-        XCTAssertNil(catalog["rad_export_step"], "Exports are STL.")
+        XCTAssertNil(catalog["rad_export_step"], "Exports are 3MF.")
         for tool in catalog.tools {
             XCTAssertEqual(tool.annotations["readOnlyHint"] as? Bool, [.read, .capture].contains(tool.host.capability), tool.name)
         }

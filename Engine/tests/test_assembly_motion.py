@@ -6,7 +6,7 @@ from unittest import mock
 
 import numpy as np
 
-from sdf_test_support import build, native, read_stl, signed_volume
+from sdf_test_support import build, native, read_3mf, signed_volume
 from assembly_motion import AssemblyMotionError, coupled_position, validate_motion
 from sdf_build import ModelError
 import sdf_ops
@@ -245,12 +245,12 @@ class NativePoseTests(unittest.TestCase):
     def metric(self, report, identity):
         return next(item["values"] for item in report["metrics"] if item["id"] == identity)
 
-    def test_posed_stl_export_preserves_geometry_source_and_subset(self):
+    def test_posed_3mf_export_preserves_geometry_source_and_subset(self):
         result, output = build(self, "result = [box((1, 2, 3)), cylinder(2, 5, center=(10, 0, 2.5))]")
         source = (output / "model.rsdf").read_bytes()
         pose = [{"solid": 1, "matrix": rotation_y(90, (20, 5, 7))}]
         report, folder = native(output, result, "export", solidIndices=[1], solidTransforms=pose)
-        corners, _ = read_stl(folder / "model.stl")
+        corners, _ = read_3mf(folder / "model.3mf")
         self.assertEqual(report["solids"], 1)
         # Simplification keeps the flat ends and inscribes chords in the
         # side, removing on average two thirds of their depth (at most the

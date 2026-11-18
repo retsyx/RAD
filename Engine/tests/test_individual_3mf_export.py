@@ -1,10 +1,10 @@
-"""Batch STL export preserves parts, their coordinates and shared print placement."""
+"""Batch 3MF export preserves parts, their coordinates and shared print placement."""
 import unittest
 from unittest import mock
 
 import numpy as np
 
-from sdf_test_support import build, native, read_stl, signed_volume
+from sdf_test_support import assert_closed_and_outward, build, native, read_3mf, signed_volume
 import sdf_build
 import sdf_ops
 
@@ -14,8 +14,18 @@ result = [box((8, 14, 2)).rotate(61, (1, 2, 3)).translate((30, -5, 17)),
           cylinder(3, 17).rotate_y(90).translate((-9, 21, -4))]
 """
 
+PRESENTATION = {
+    "0": {"name": 'Base & bracket <Ø2> "left"', "color": [1, 0, 0.5]},
+    "2": {"name": "Peg", "color": [0, 0.25, 1]},
+}
+EXPECTED_PRESENTATION = {
+    0: (PRESENTATION["0"]["name"], "#FF0080"),
+    1: ("Part 2", "#B3BFCC"),
+    2: ("Peg", "#0040FF"),
+}
 
-class IndividualSTLExportTests(unittest.TestCase):
+
+class IndividualThreeMFExportTests(unittest.TestCase):
     def setUp(self):
         self.result, self.output = build(self, FIXTURE)
         self.stats = self.result["partStats"]
@@ -56,28 +66,44 @@ class IndividualSTLExportTests(unittest.TestCase):
     def test_individual_subset_and_grouping_preserve_output_order_and_coordinates(self):
         for selected, parts in [([0, 2], [[2], [0]]), ([0, 1, 2], [[2, 0], [1]])]:
             with self.subTest(parts=parts):
-                report, folder = self.export(solidIndices=selected, individualParts=parts)
-                self.assertFalse((folder / "model.stl").exists())
+                report, folder = self.export(solidIndices=selected, individualParts=parts,
+                                             partPresentation=PRESENTATION)
+                self.assertFalse((folder / "model.3mf").exists())
                 self.assertEqual(report["solids"], len(selected))
                 self.assertEqual(len(report["partFiles"]), len(parts))
                 total = 0
                 for index, (record, expected) in enumerate(zip(report["partFiles"], parts)):
-                    self.assertEqual(record, {"path": f"part-{index:04d}.stl", "solidIndices": expected})
-                    corners, _ = read_stl(folder / record["path"])
+                    self.assertEqual(record, {"path": f"part-{index:04d}.3mf", "solidIndices": expected})
+                    corners, meshes = read_3mf(folder / record["path"])
+                    self.assert_presentation(meshes, expected)
                     total += len(corners)
                     self.assert_same_geometry(corners, expected)
                 self.assertEqual(total, report["triangles"])
-                self.assertEqual(sorted(path.name for path in folder.glob("*.stl")),
-                                 [f"part-{index:04d}.stl" for index in range(len(parts))])
+                self.assertEqual(sorted(path.name for path in folder.glob("*.3mf")),
+                                 [f"part-{index:04d}.3mf" for index in range(len(parts))])
+
+    def assert_presentation(self, meshes, indices):
+        self.assertEqual([(name, color) for name, color, _, _ in meshes],
+                         [EXPECTED_PRESENTATION[index] for index in indices])
+        for _, _, vertices, triangles in meshes:
+            self.assertEqual(len(np.unique(vertices, axis=0)), len(vertices), "3MF mesh topology shares vertex indices.")
+            assert_closed_and_outward(self, vertices, triangles)
 
     def test_individual_printing_files_share_one_selected_placement(self):
         selected = [0, 2]
         plate = self.plate(selected)
         with mock.patch.object(sdf_ops, "print_orientations", side_effect=AssertionError("Placement is supplied")):
-            report, folder = self.export(solidIndices=selected, individualParts=[[2], [0]], solidTransforms=plate)
-            combined, combined_folder = self.export(solidIndices=selected, solidTransforms=plate)
-        exported = {record["solidIndices"][0]: read_stl(folder / record["path"])[0] for record in report["partFiles"]}
-        merged, _ = read_stl(combined_folder / "model.stl")
+            report, folder = self.export(solidIndices=selected, individualParts=[[2], [0]], solidTransforms=plate,
+                                         partPresentation=PRESENTATION)
+            combined, combined_folder = self.export(solidIndices=selected, solidTransforms=plate,
+                                                    partPresentation=PRESENTATION)
+        exported = {}
+        for record in report["partFiles"]:
+            corners, meshes = read_3mf(folder / record["path"])
+            self.assert_presentation(meshes, record["solidIndices"])
+            exported[record["solidIndices"][0]] = corners
+        merged, meshes = read_3mf(combined_folder / "model.3mf")
+        self.assert_presentation(meshes, selected)
         self.assertEqual(combined["triangles"], report["triangles"])
         self.assertEqual(combined["cellSize"], report["cellSize"])
         self.assertAlmostEqual(signed_volume(merged), sum(signed_volume(item) for item in exported.values()),
@@ -92,20 +118,26 @@ class IndividualSTLExportTests(unittest.TestCase):
         clearance = max(b[0] - a[3], a[0] - b[3], b[1] - a[4], a[1] - b[4])
         self.assertGreaterEqual(clearance, 50 - 0.1)
 
-    def test_invalid_individual_partitions_fail_before_writing_any_stl(self):
+    def test_invalid_individual_partitions_fail_before_writing_any_3mf(self):
         invalid = [None, [], {}, "parts", [None], [[]], [[0], [0]], [[0, 0], [2]], [[0]],
                    [[0], [1]], [[0], [True]], [[0], [-1]], [[0], [3]], [[0], ["2"]]]
         for parts in invalid:
             with self.subTest(parts=parts):
-                with (mock.patch.object(sdf_ops, "write_stl", side_effect=AssertionError("No partial output")),
+                with (mock.patch.object(sdf_ops, "write_3mf", side_effect=AssertionError("No partial output")),
                       self.assertRaises(sdf_build.ModelError)):
                     native(self.output, self.result, "export", solidIndices=[0, 2], individualParts=parts)
-        self.assertEqual(list(self.output.parent.glob("*/*.stl")), [])
+        self.assertEqual(list(self.output.parent.glob("*/*.3mf")), [])
 
-    def test_stl_carries_no_colors(self):
-        colors = [{"solidIndex": 0, "color": {"red": 0.8, "green": 0.1, "blue": 0.2}}]
-        with self.assertRaisesRegex(sdf_build.ModelError, "solidColors"):
-            native(self.output, self.result, "export", solidColors=colors)
+    def test_invalid_presentation_fails_before_writing_any_3mf(self):
+        invalid = [{"-1": PRESENTATION["0"]}, {"3": PRESENTATION["0"]},
+                   {"0": {"name": "Part", "color": [1, 0]}}, {"0": {"name": "Part", "color": [1, 0, 2]}},
+                   {"0": {"name": "Part", "color": [1, 0, float("nan")]}}]
+        for presentation in invalid:
+            with self.subTest(presentation=presentation):
+                with mock.patch.object(sdf_ops, "write_3mf", side_effect=AssertionError("No partial output")):
+                    with self.assertRaises(sdf_build.ModelError):
+                        native(self.output, self.result, "export", partPresentation=presentation)
+        self.assertEqual(list(self.output.parent.glob("*/*.3mf")), [])
 
 
 if __name__ == "__main__":

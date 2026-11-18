@@ -1,7 +1,30 @@
 import Darwin
 import Foundation
 
-enum STLIndividualExport {
+enum ThreeMFExport {
+    struct Presentation: Encodable, Sendable, Hashable {
+        let name: String
+        let color: PartColor
+
+        private enum CodingKeys: String, CodingKey { case name, color }
+
+        func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(name, forKey: .name)
+            try values.encode([color.red, color.green, color.blue], forKey: .color)
+        }
+    }
+
+    static func presentation(in nodes: [PartNode], overrides: [String: PartColor] = [:]) -> [Int: Presentation] {
+        let colors = PartColorState.resolved(in: nodes, overrides: overrides)
+        var result: [Int: Presentation] = [:]
+        for node in nodes.flatMap(\.flattened) where !node.solidIndices.isEmpty {
+            let part = Presentation(name: node.name, color: colors[node.id] ?? PartColorState.defaultFinish)
+            for solid in node.solidIndices { result[solid] = part }
+        }
+        return result
+    }
+
     struct Part: Equatable, Sendable {
         let name: String
         let solidIndices: [Int]
@@ -9,7 +32,7 @@ enum STLIndividualExport {
 
         init(name: String, solidIndices: [Int]) {
             self.init(name: name, solidIndices: solidIndices,
-                      fileName: "\(STLIndividualExport.filenameStem(name, fallback: "Part")).stl")
+                      fileName: "\(ThreeMFExport.filenameStem(name, fallback: "Part")).3mf")
         }
 
         fileprivate init(name: String, solidIndices: [Int], fileName: String) {
@@ -49,7 +72,7 @@ enum STLIndividualExport {
                 } while used.contains(collisionKey(candidate)) || reserved.contains(collisionKey(candidate))
             }
             used.insert(collisionKey(candidate))
-            return Part(name: entry.name, solidIndices: entry.indices, fileName: "\(candidate).stl")
+            return Part(name: entry.name, solidIndices: entry.indices, fileName: "\(candidate).3mf")
         }
     }
 
@@ -127,7 +150,7 @@ enum STLIndividualExport {
     }
 
     private static func validFileName(_ name: String) -> Bool {
-        !name.isEmpty && name.utf8.count <= 255 && name.hasSuffix(".stl") &&
+        !name.isEmpty && name.utf8.count <= 255 && name.hasSuffix(".3mf") &&
         !name.unicodeScalars.contains(where: {
             CharacterSet.controlCharacters.contains($0) || $0 == "/" || $0 == ":"
         }) && !name.hasPrefix(".")

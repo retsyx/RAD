@@ -1,6 +1,6 @@
 """Feature-preserving mesh simplification (SDF-DESIGN.md, "Mesh
 simplification"): rsdf_mesh_simplify through radsdf's Graph.mesh(simplify=),
-and the worker's STL export with its tolerance.
+and the worker's 3MF export with its tolerance.
 
 Simplified meshes must stay closed and manifold, keep every changed triangle
 within the tolerance of the field (sampled densely here, independently of the
@@ -22,7 +22,7 @@ from unittest import mock
 
 import numpy as np
 
-from sdf_test_support import assert_closed_and_outward, build, native, read_stl, signed_volume
+from sdf_test_support import assert_closed_and_outward, build, native, read_3mf, signed_volume
 import radsdf
 from radsdf import SDFError, box, cone, cylinder, involute_gear, rect, regular_polygon, sphere, torus, union
 import sdf_build
@@ -484,7 +484,7 @@ result = [box((40, 30, 4)) - union(*[cylinder(2, 10, center=(x, y, 0)) for x in 
 
     def export(self, **fields):
         report, folder = native(self.output, self.result, "export", **fields)
-        corners, _ = read_stl(folder / "model.stl")
+        corners, _ = read_3mf(folder / "model.3mf")
         return report, corners
 
     def test_exports_are_simplified_by_default_and_report_both_counts(self):
@@ -520,7 +520,7 @@ result = [box((40, 30, 4)) - union(*[cylinder(2, 10, center=(x, y, 0)) for x in 
         self.assertLess(coarse["triangles"], default["triangles"])
         report, folder = native(self.output, self.result, "export", individualParts=[[1], [0]], tolerance=0.02)
         self.assertEqual(report["tolerance"], 0.02)
-        total = sum(len(read_stl(folder / record["path"])[0]) for record in report["partFiles"])
+        total = sum(len(read_3mf(folder / record["path"])[0]) for record in report["partFiles"])
         self.assertEqual(total, report["triangles"])
 
     def test_tolerances_are_capped_at_a_quarter_of_the_cell(self):
@@ -568,7 +568,7 @@ class ThinWallExportTests(unittest.TestCase):
         self.assertEqual(report["tolerance"], sdf_ops.EXPORT_TOLERANCE_CELLS * report["cellSize"])
         self.assertLess(report["tolerance"], 0.025)
         self.assertLess(report["triangles"], 0.1 * report["meshedTriangles"])
-        corners, _ = read_stl(folder / "model.stl")
+        corners, _ = read_3mf(folder / "model.3mf")
         a, b, c = corners[:, 0], corners[:, 1], corners[:, 2]
         points = np.concatenate([(i * a + j * b + (6 - i - j) * c) / 6 for i in range(7) for j in range(7 - i)])
         # Every sample stays on its own side of the wall's middle (radius 5.95).

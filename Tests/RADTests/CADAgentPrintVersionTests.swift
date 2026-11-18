@@ -64,15 +64,15 @@ final class CADAgentPrintVersionTests: XCTestCase {
         XCTAssertEqual((print["referenceParts"] as? [[String: Any]])?.compactMap { $0["partID"] as? String }, ["board"])
         XCTAssertEqual(print["total"] as? Int, 2)
 
-        let exported = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "printLayout": true]).metadata
+        let exported = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "printLayout": true]).metadata
         XCTAssertEqual(exported["solidIndices"] as? [Int], [0, 2])
         XCTAssertEqual(exported["referenceSolidsLeftOut"] as? [Int], [1])
         do {
-            _ = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "printLayout": true,
+            _ = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "printLayout": true,
                                                                            "partIDs": ["board"]])
             XCTFail("Reference parts are never printed")
         } catch { XCTAssertTrue(error.localizedDescription.contains("every requested part is a reference part")) }
-        let ordinary = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "partIDs": ["board"]]).metadata
+        let ordinary = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "partIDs": ["board"]]).metadata
         XCTAssertEqual(ordinary["solidIndices"] as? [Int], [1], "Ordinary exports include reference parts")
         XCTAssertNil(ordinary["referenceSolidsLeftOut"])
 

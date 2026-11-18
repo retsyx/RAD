@@ -2,9 +2,9 @@ import AppKit
 import UniformTypeIdentifiers
 
 @MainActor
-final class STLExportOptionsView: NSView {
-    private static let printingPreferenceKey = "stlExportFor3DPrinting"
-    private static let individualPreferenceKey = "stlExportIndividualParts"
+final class ThreeMFExportOptionsView: NSView {
+    private static let printingPreferenceKey = "threeMFExportFor3DPrinting"
+    private static let individualPreferenceKey = "threeMFExportIndividualParts"
     private let printing = NSButton(checkboxWithTitle: "For 3D printing", target: nil, action: nil)
     private let individual = NSButton(checkboxWithTitle: "Export individual parts", target: nil, action: nil)
     private let defaults: UserDefaults
@@ -64,7 +64,7 @@ final class STLExportOptionsView: NSView {
         if exportIndividualParts {
             fileName = panel.nameFieldStringValue
             // The app publishes a complete directory after all exports finish.
-            // Clearing the file type prevents AppKit from appending .stl.
+            // Clearing the file type prevents AppKit from appending .3mf.
             panel.allowedContentTypes = []
             panel.allowsOtherFileTypes = true
             panel.isExtensionHidden = false

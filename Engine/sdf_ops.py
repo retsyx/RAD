@@ -8,7 +8,7 @@ model.rsdf as source.rsdf together with the RSDF node of each part
 coordinates. The loader checks the file strictly before the kernel decodes
 it, and a serving worker keeps the two most recently used graphs by their
 artifactIdentity. Handlers return plain dictionaries, which the worker
-publishes as result.json; STL exports are written beside it.
+publishes as result.json; 3MF exports are written beside it.
 
 Measurements are numeric: distances come from the parts' signed distance
 fields, seeded by surface samples (vertices of a sampling mesh) and refined
@@ -22,6 +22,8 @@ import os
 from pathlib import Path
 import stat
 import struct
+from xml.sax.saxutils import quoteattr
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import numpy as np
 
@@ -36,7 +38,7 @@ OPERATION_FIELDS = {
     "measure": {"entities", "solidTransforms"},
     "clearance": {"pairs", "poses"},
     "print_orient": {"solidIndices", "printDown"},
-    "export": {"solidIndices", "individualParts", "solidTransforms", "cellSize", "tolerance"},
+    "export": {"solidIndices", "individualParts", "solidTransforms", "partPresentation", "cellSize", "tolerance"},
     "validate": {"cellSize"},
     "probe": {"solids", "points", "directions", "maxDistance"},
 }
@@ -77,8 +79,17 @@ MAX_EXPORT_REMESHES = 2
 # that mesh (at least two cells thick) keep their two sides apart.
 EXPORT_TOLERANCE = 0.01
 EXPORT_TOLERANCE_CELLS = 0.25
-STL_HEADER = b"RAD binary STL, millimetres".ljust(80, b" ")
-STL_RECORD = np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
+EXPORT_DEFAULT_COLOR = "#B3BFCC"  # PartColorState.defaultFinish in 8-bit sRGB
+EXPORT_XML_BATCH = 8_192
+THREE_MF_MODEL_PATH = "3D/3dmodel.model"
+THREE_MF_HEADER = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+THREE_MF_CONTENT_TYPES = THREE_MF_HEADER + b'''<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>\n'''
+THREE_MF_RELATIONSHIPS = THREE_MF_HEADER + f'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Target="/{THREE_MF_MODEL_PATH}" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>\n'''.encode("ascii")
 
 VALIDATE_TRIANGLE_BUDGET = 4_000_000
 VALIDATE_VOLUME_CHANGE = 0.02
@@ -1225,8 +1236,8 @@ def closed_meshes(source, solids, cell, budget, threads, purpose, tolerance=None
             for solid in solids:
                 natives.append(source.native_mesh(solid, cell, threads))
                 stats = natives[-1].stats
-                if not stats["triangle_count"] or stats["boundary_edges"]:
-                    raise ModelError(f"{source.label(solid)} has no closed surface at the {purpose} cell size of "
+                if not stats["triangle_count"] or stats["boundary_edges"] or stats["nonmanifold_edges"]:
+                    raise ModelError(f"{source.label(solid)} has no closed manifold surface at the {purpose} cell size of "
                                      f"{cell:.4g} mm; choose a finer cell size or thicken its features.")
                 triangles += stats["triangle_count"]
                 if triangles > budget:
@@ -1244,49 +1255,116 @@ def closed_meshes(source, solids, cell, budget, threads, purpose, tolerance=None
     raise ModelError(f"The {purpose} exceeds {budget:,} triangles even at a cell size of {cell:.4g} mm.")
 
 
-def write_stl(path, meshes, solids, pose):
-    """Binary STL (millimetres) of posed meshes as separate shells, written
-    to a temporary name and renamed. Returns its triangle count."""
-    count = sum(len(mesh.triangles) for mesh in meshes)
+def export_part_attributes(records, source):
+    """Part names and 8-bit sRGB colors from the requesting design or artifact."""
+    available = {str(solid): solid for solid in range(source.solids)}
+    if not isinstance(records, dict) or not records.keys() <= available.keys():
+        raise ModelError("Export part information must refer to available solid indices.")
+    attributes = {}
+    for key, record in records.items():
+        if not isinstance(record, dict) or set(record) != {"name", "color"}:
+            raise ModelError("Export part information requires a name and RGB color for each supplied solid.")
+        name, color = record["name"], record["color"]
+        if not isinstance(name, str) or not name.strip():
+            raise ModelError("Every exported part needs a nonempty name.")
+        if (not isinstance(color, list) or len(color) != 3
+                or any(isinstance(channel, bool) or not isinstance(channel, (int, float))
+                       or not 0 <= channel <= 1 for channel in color)):
+            raise ModelError("Export RGB colors must contain three numbers from 0 to 1.")
+        # XML 1.0 cannot represent some characters allowed in a renamed part.
+        name = "".join(char if (char in "\t\r\n" or 0x20 <= ord(char) <= 0xD7FF
+                                or 0xE000 <= ord(char) <= 0xFFFD or ord(char) >= 0x10000)
+                       else "\ufffd" for char in name)
+        attributes[available[key]] = (name, "#" + "".join(f"{int(channel * 255 + 0.5):02X}" for channel in color))
+    return attributes
+
+
+def write_3mf_mesh(stream, mesh, solid, pose):
+    # The kernel duplicates vertices at creases for normals. 3MF uses indexed
+    # topology and does not store shading normals, so share coincident vertices.
+    points, index = np.unique(mesh.positions, axis=0, return_inverse=True)
+    index = index.reshape(-1)
+    stream.write(b"<mesh><vertices>\n")
+    for start in range(0, len(points), EXPORT_XML_BATCH):
+        batch = points[start:start + EXPORT_XML_BATCH].astype(np.float64)
+        rows = pose.apply(solid, batch).tolist()
+        stream.write("".join('<vertex x="%.17g" y="%.17g" z="%.17g"/>\n' % (x, y, z)
+                             for x, y, z in rows).encode("ascii"))
+    stream.write(b"</vertices><triangles>\n")
+    for start in range(0, len(mesh.triangles), EXPORT_XML_BATCH):
+        batch = index[mesh.triangles[start:start + EXPORT_XML_BATCH]]
+        a, b, c = batch.T
+        if np.any((a == b) | (b == c) | (c == a)):
+            raise ModelError(f"{Source.label(solid)} has degenerate triangles at the export resolution.")
+        rows = batch.tolist()
+        stream.write("".join('<triangle v1="%d" v2="%d" v3="%d"/>\n' % (a, b, c)
+                             for a, b, c in rows).encode("ascii"))
+    stream.write(b"</triangles></mesh>\n")
+
+
+def three_mf_entry(name):
+    # ZipInfo's fixed timestamp makes the archive independent of export time.
+    entry = ZipInfo(name)
+    entry.compress_type = ZIP_DEFLATED
+    entry.compress_level = 3
+    return entry
+
+
+def write_3mf(path, meshes, solids, pose, attributes):
+    """Write a standard 3MF package with a named, colored mesh per solid."""
+    presentation = [attributes.get(solid, (Source.label(solid), EXPORT_DEFAULT_COLOR)) for solid in solids]
+    colors = dict.fromkeys(color for _, color in presentation)
+    # A single color per property group works with readers that use object pid
+    # to assign whole-part colors without looking up its pindex.
+    color_ids = {color: identifier for identifier, color in enumerate(colors, 1)}
+    first_object_id = len(color_ids) + 1
     staged = path.with_name(path.name + ".tmp")
     try:
-        with staged.open("wb") as stream:
-            stream.write(STL_HEADER)
-            stream.write(struct.pack("<I", count))
-            for mesh, solid in zip(meshes, solids):
-                positions = pose.apply(solid, mesh.positions.astype(np.float64))
-                for start in range(0, len(mesh.triangles), 262_144):
-                    corners = positions[mesh.triangles[start:start + 262_144].astype(np.int64)]
-                    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-                    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-                    records = np.zeros(len(corners), dtype=STL_RECORD)
-                    records["normal"] = np.divide(normals, lengths, out=np.zeros_like(normals), where=lengths > 0)
-                    records["vertices"] = corners
-                    stream.write(records.tobytes())
+        with ZipFile(staged, "w", allowZip64=False) as package:
+            package.writestr(three_mf_entry("[Content_Types].xml"), THREE_MF_CONTENT_TYPES)
+            package.writestr(three_mf_entry("_rels/.rels"), THREE_MF_RELATIONSHIPS)
+            with package.open(three_mf_entry(THREE_MF_MODEL_PATH), "w") as stream:
+                stream.write(THREE_MF_HEADER)
+                stream.write(b'<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+                             b'xmlns:m="http://schemas.microsoft.com/3dmanufacturing/material/2015/02">\n'
+                             b'<metadata name="Application">RAD</metadata>\n<resources>\n')
+                for color, identifier in color_ids.items():
+                    stream.write(f'<m:colorgroup id="{identifier}"><m:color color="{color}"/></m:colorgroup>\n'.encode("ascii"))
+                for identifier, ((name, color), mesh, solid) in enumerate(zip(presentation, meshes, solids), first_object_id):
+                    stream.write(f'<object id="{identifier}" type="model" name={quoteattr(name)} '
+                                 f'pid="{color_ids[color]}" pindex="0">\n'.encode("utf-8"))
+                    write_3mf_mesh(stream, mesh, solid, pose)
+                    stream.write(b"</object>\n")
+                stream.write(b"</resources><build>\n")
+                for identifier in range(first_object_id, first_object_id + len(solids)):
+                    stream.write(f'<item objectid="{identifier}"/>\n'.encode("ascii"))
+                stream.write(b"</build></model>\n")
+        if staged.stat().st_size > MAX_GEOMETRY_BYTES:
+            raise ModelError("The 3MF export exceeds the 512 MB file size limit.")
         staged.replace(path)
     finally:
         staged.unlink(missing_ok=True)
-    return count
 
 
 def export(spec, source, output, threads):
-    """Binary STL of the selected parts at their poses, re-meshed at export
-    resolution and simplified within the export tolerance: one model.stl, or
-    part-%04d.stl per individualParts group."""
+    """Colored 3MF of the selected parts at their poses, re-meshed at export
+    resolution and simplified within the export tolerance: one model.3mf, or
+    part-%04d.3mf per individualParts group."""
     indices = selected_solids(spec.get("solidIndices"), source.solids)
     parts = spec.get("individualParts")
     if "individualParts" in spec:
         if not isinstance(parts, list) or not 1 <= len(parts) <= len(indices):
-            raise ModelError("Individual STL files require a nonempty list of available parts.")
+            raise ModelError("Individual 3MF files require a nonempty list of available parts.")
         used, selected = set(), set(indices)
         for part in parts:
             if (not isinstance(part, list) or not part or any(not _integer(index) or index not in selected
                                                               for index in part)
                     or len(set(part)) != len(part) or used.intersection(part)):
-                raise ModelError("Individual STL files must contain distinct selected parts.")
+                raise ModelError("Individual 3MF files must contain distinct selected parts.")
             used.update(part)
         if used != selected:
-            raise ModelError("Individual STL files must include every selected part exactly once.")
+            raise ModelError("Individual 3MF files must include every selected part exactly once.")
+    attributes = export_part_attributes(spec.get("partPresentation", {}), source)
     pose = Pose(spec.get("solidTransforms", []), source.solids)
     cell = positive_cell(spec, "export")
     if cell is None:
@@ -1301,12 +1379,12 @@ def export(spec, source, output, threads):
               "meshedTriangles": sum(int(mesh.stats.get("unsimplified_triangles", len(mesh.triangles)))
                                      for mesh in meshes)}
     if parts is None:
-        write_stl(output / "model.stl", meshes, indices, pose)
+        write_3mf(output / "model.3mf", meshes, indices, pose, attributes)
         return report
     files = []
     for position, part in enumerate(parts):
-        name = f"part-{position:04d}.stl"
-        write_stl(output / name, [by_solid[index] for index in part], part, pose)
+        name = f"part-{position:04d}.3mf"
+        write_3mf(output / name, [by_solid[index] for index in part], part, pose, attributes)
         files.append({"path": name, "solidIndices": part})
     report["partFiles"] = files
     return report

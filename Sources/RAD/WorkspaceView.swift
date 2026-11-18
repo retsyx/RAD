@@ -160,8 +160,8 @@ struct WorkspaceView: View {
             Button { state.saveNewProject() } label: { Label("Save New", systemImage: "square.and.arrow.down") }
                 .help("Save the latest design as a new file (⌘S)")
                 .disabled(!state.canSaveNew)
-            Button { state.exportSTL() } label: {
-                HStack(spacing: 7) { Image(systemName: "arrow.up.right.square"); Text("Export STL").fontWeight(.semibold) }
+            Button { state.export3MF() } label: {
+                HStack(spacing: 7) { Image(systemName: "arrow.up.right.square"); Text("Export 3MF").fontWeight(.semibold) }
                     .padding(.horizontal, 8).padding(.vertical, 5)
             }
             .buttonStyle(.borderedProminent).disabled(!state.canExport)

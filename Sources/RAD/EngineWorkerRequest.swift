@@ -22,8 +22,9 @@ enum EngineWorkerRequest: Encodable, Sendable {
     struct Export: Sendable, Hashable {
         /// Nil exports every solid.
         var solidIndices: [Int]?
+        var partPresentation: [Int: ThreeMFExport.Presentation] = [:]
         var solidTransforms: [AssemblySolidTransform] = []
-        /// One STL file per group of solids, in order.
+        /// One 3MF file per group of solids, in order.
         var individualParts: [[Int]]? = nil
         /// Nil meshes at the worker's export resolution.
         var cellSize: Double? = nil
@@ -81,7 +82,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
 
     private enum Key: String, CodingKey {
         case operation, title, summary, units, script, inputAssets, print, verifyFields, artifact, artifactIdentity, partRoots,
-             solidIndices, solidTransforms, individualParts, cellSize, entities, pairs, poses, printDown,
+             solidIndices, partPresentation, solidTransforms, individualParts, cellSize, entities, pairs, poses, printDown,
              solids, points, directions, maxDistance, tolerance
     }
 
@@ -107,6 +108,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
         case let .export(source, export):
             try encodeSource(source, operation: "export")
             try values.encodeIfPresent(export.solidIndices, forKey: .solidIndices)
+            if !export.partPresentation.isEmpty { try values.encode(export.partPresentation, forKey: .partPresentation) }
             if !export.solidTransforms.isEmpty { try values.encode(export.solidTransforms, forKey: .solidTransforms) }
             try values.encodeIfPresent(export.individualParts, forKey: .individualParts)
             try values.encodeIfPresent(export.cellSize, forKey: .cellSize)

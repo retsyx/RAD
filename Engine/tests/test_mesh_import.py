@@ -16,7 +16,7 @@ import unittest
 import numpy as np
 
 from test_sdf_kernel_native import Kernel, KernelError, library_path
-from sdf_test_support import native, read_stl, signed_volume as stl_volume
+from sdf_test_support import native, read_3mf, signed_volume as stl_volume
 import radsdf
 import sdf_build
 import worker
@@ -810,7 +810,7 @@ class ImportedAssetBuildTests(unittest.TestCase):
                                -10.0, delta=0.2)
         exported, export_folder = native(output, result, "export", solidIndices=[0])
         self.assertEqual(exported["solids"], 1)
-        corners, _ = read_stl(export_folder / "model.stl")
+        corners, _ = read_3mf(export_folder / "model.3mf")
         self.assertAlmostEqual(stl_volume(corners) / 1000.0, 1.0, delta=0.005)
 
     def test_unusable_assets_and_unknown_ids_are_named(self):

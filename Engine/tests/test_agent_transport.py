@@ -42,12 +42,12 @@ class MCPTransportTests(unittest.TestCase):
                 self.assertEqual(tools, [{key: entry[key] for key in ('name', 'description', 'inputSchema', 'annotations')}
                                          for entry in catalog], 'Agents see the catalog without its host properties.')
                 self.assertTrue({'rad_build','rad_inspect','rad_measure','rad_render','rad_screenshot','rad_validate','rad_runtime'} <= names)
-                self.assertIn('rad_export_stl', names)
-                self.assertNotIn('rad_export_step', names, 'SDF designs export STL')
+                self.assertIn('rad_export_3mf', names)
+                self.assertTrue({'rad_export_stl', 'rad_export_step'}.isdisjoint(names), 'SDF designs export 3MF')
                 self.assertIn('rad_import', names, 'STL and OBJ meshes are imported as SDF solids')
                 self.assertFalse({name for name in names if name.startswith('rad_mesh_')}, 'Mesh reconstruction tools are gone')
                 geometry_tools = {'rad_runtime', 'rad_build', 'rad_inspect', 'rad_measure', 'rad_validate',
-                                  'rad_check_motion', 'rad_export_stl'}
+                                  'rad_check_motion', 'rad_export_3mf'}
                 for tool in tools:
                     claims = ('CadQuery', 'OpenCascade', 'STEP', 'BREP') + (('exact',) if tool['name'] in geometry_tools else ())
                     for claim in claims:

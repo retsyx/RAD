@@ -34,7 +34,7 @@ final class ProjectAgentSession {
         /// SHA-256 of an uploaded mesh file, compared with generated geometry.
         var contentDigest: String? = nil
 
-        var isGeometry: Bool { CADInputAsset.supportedFormats.contains(URL(fileURLWithPath: path).pathExtension.lowercased()) }
+        var isGeometry: Bool { ProjectAgentSession.geometryFormats.contains(URL(fileURLWithPath: path).pathExtension.lowercased()) }
     }
 
     let id: UUID
@@ -218,7 +218,7 @@ final class ProjectAgentSession {
                 guard let identity = values[key] as? String else { throw RADError.message("Provide a task file ID for \(key).") }
                 let staged = try file(identity)
                 if tool?.host.references.contains(key) == true, !isOriginalReference(staged) {
-                    throw RADError.message("Import original external reference files uploaded to this task. Geometry RAD generated, such as an STL export, cannot become a reference input.")
+                    throw RADError.message("Import original external reference files uploaded to this task. Geometry RAD generated, such as a 3MF export, cannot become a reference input.")
                 }
                 values[key] = staged.path
             }
@@ -226,7 +226,7 @@ final class ProjectAgentSession {
         if let export {
             // Every download handle denotes one immutable export, including
             // exports of the same artifact before and after later edits.
-            values[export] = "exports/\(UUID().uuidString).stl"
+            values[export] = "exports/\(UUID().uuidString).3mf"
         }
         return values
     }
@@ -318,7 +318,9 @@ final class ProjectAgentSession {
         return name
     }
 
+    nonisolated private static let geometryFormats = CADInputAsset.supportedFormats.union(["3mf"])
+
     nonisolated private static func geometryDigest(_ data: Data, name: String) -> String? {
-        CADInputAsset.supportedFormats.contains(URL(fileURLWithPath: name).pathExtension.lowercased()) ? SHA256.hexDigest(data) : nil
+        geometryFormats.contains(URL(fileURLWithPath: name).pathExtension.lowercased()) ? SHA256.hexDigest(data) : nil
     }
 }

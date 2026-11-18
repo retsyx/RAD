@@ -36,7 +36,7 @@ enum ExternalAgentCapability: String, Codable, CaseIterable, Identifiable {
         case .read: return "Read designs"
         case .build: return "Build candidates"
         case .commit: return "Commit versions"
-        case .export: return "Export STL"
+        case .export: return "Export 3MF"
         case .capture: return "Capture viewport"
         case .manageProjects: return "Create and open designs"
         }

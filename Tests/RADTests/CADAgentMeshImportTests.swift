@@ -100,12 +100,12 @@ final class CADAgentMeshImportTests: XCTestCase {
         XCTAssertEqual(candidate.model.inputAssets?.first?.data, cube)
 
         // Generated geometry never becomes an input, even renamed elsewhere.
-        let export = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": artifactID]).metadata
+        let export = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": artifactID]).metadata
         let exported = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(export["path"] as? String)))
         try exported.write(to: root.appendingPathComponent("renamed.stl"))
         do {
             _ = try await tools.handle(name: "rad_import", arguments: ["path": "renamed.stl"])
-            XCTFail("An exported STL must not become an imported input.")
+            XCTFail("An exported 3MF must not become an imported input.")
         } catch { XCTAssertTrue(error.localizedDescription.contains("generated for this design"), error.localizedDescription) }
 
         do {

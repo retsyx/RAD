@@ -338,12 +338,13 @@ built coordinates; pair results are posed.
   inside their bed contact; a quarter turn keeps each footprint at least as wide
   as deep. Parts placed by a translation of shared geometry share the work.
 - `export`: optional `solidIndices`, `individualParts` (groups of solids, one
-  file each), `solidTransforms`, `cellSize` and `tolerance` → `model.stl` or
-  `part-%04d.stl` (binary STL in millimeters, every part a separate closed
-  shell, no colors) and `{solids, triangles, cellSize, tolerance,
-  meshedTriangles, partFiles?}`. Parts are re-meshed at half the design's
-  default preview cell size (its largest extent over 256), clamped to
-  0.05–0.5 mm, or at `cellSize`, coarsened to fit 4,000,000 meshed triangles,
+  file each), `partPresentation` (names and sRGB colors by solid index),
+  `solidTransforms`, `cellSize` and `tolerance` → `model.3mf` or `part-%04d.3mf`
+  and `{solids, triangles, cellSize, tolerance, meshedTriangles, partFiles?}`.
+  The 3MF stores separate closed meshes in millimeters, each with an sRGB
+  color from the 3MF Materials and Properties Extension. Parts are re-meshed
+  at half the design's default preview cell size (its largest extent over 256),
+  clamped to 0.05–0.5 mm, or at `cellSize`, coarsened to fit 4,000,000 meshed triangles,
   then simplified within `tolerance` mm (default 0.01; at most a quarter of
   the cell; 0 keeps the full mesh), keeping sharp edges and corners
   (SDF-DESIGN.md, "Mesh simplification"). Every part is meshed before any is
@@ -386,7 +387,7 @@ serves requests through private descriptor-confined filesystem IPC. Its tools
 are `rad_runtime`, `rad_request_permission`, `rad_versions`, `rad_version`,
 `rad_build`, `rad_inspect`, `rad_get_part_colors`, `rad_set_part_colors`,
 `rad_measure`, `rad_validate`, `rad_verify`, `rad_render`, `rad_check_motion`,
-`rad_screenshot`, `rad_export_stl` and `rad_import`, all implemented in Swift
+`rad_screenshot`, `rad_export_3mf` and `rad_import`, all implemented in Swift
 (`CADAgentTools`) on this worker's builds and native operations.
 `rad_runtime` stages the agent-neutral modeling guide (the end of
 `Sources/RAD/Resources/model-instructions.md`) in the task workspace.
@@ -475,7 +476,7 @@ is unavailable.
 
 The native process runner enforces a 10-minute deadline and cancellation with
 a hard-kill fallback. Python model files, including stderr logs, have a hard
-512 MB (512,000,000-byte) per-file limit, which STL exports and native graphs
+512 MB (512,000,000-byte) per-file limit, which 3MF exports and native graphs
 share. On completion the app accepts only bounded regular output files, rejects
 symbolic links and hardlinks, verifies the private `model.rsdf` path and header,
 and reads only a bounded diagnostic tail on failure.
@@ -502,7 +503,7 @@ session-only.
 `Engine/tests` covers the kernel through its C API (`test_sdf_kernel_native.py`),
 the bindings and modeling API (`test_radsdf.py`), builds (`test_sdf_build.py`,
 `test_worker.py`, `test_preview_result.py`), native operations (measurements,
-clearance, printing, STL export, validation and probes), motion and couplings,
+clearance, printing, 3MF export, validation and probes), motion and couplings,
 the serving and prepared workers, the agent tool transport and release
 tooling. The kernel tests need `RAD_SDF_LIBRARY` or a built kernel in the
 checkout. Opt-in macOS integration tests check builds inside the real native

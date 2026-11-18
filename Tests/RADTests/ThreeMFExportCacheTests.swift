@@ -2,9 +2,9 @@ import Foundation
 import XCTest
 @testable import RAD
 
-final class STLExportCacheTests: XCTestCase {
+final class ThreeMFExportCacheTests: XCTestCase {
     func testCacheIsBoundedByTotalBytesAndEntriesInLeastRecentlyUsedOrder() {
-        let cache = STLExportCache(maximumBytes: 100, maximumEntries: 3)
+        let cache = ThreeMFExportCache(maximumBytes: 100, maximumEntries: 3)
         let owner = URL(fileURLWithPath: "/tmp/RAD-build-owner", isDirectory: true)
         cache.store([Data(count: 40)], for: "a", owner: owner)
         cache.store([Data(count: 20), Data(count: 20)], for: "b", owner: owner)
@@ -28,19 +28,19 @@ final class STLExportCacheTests: XCTestCase {
     }
 
     func testReleasingBuildArtifactsDropsTheirExportsFromTheSharedCache() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("RAD-stl-cache-\(UUID())", isDirectory: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("RAD-3mf-cache-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
         let released = "released-\(UUID())", retained = "retained-\(UUID())"
         var first: EngineBuildArtifacts? = try EngineBuildArtifacts.create(in: root, token: UUID())
         let second = try EngineBuildArtifacts.create(in: root, token: UUID())
-        STLExportCache.shared.store([Data("RAD binary STL".utf8)], for: released, owner: try XCTUnwrap(first).folder)
-        STLExportCache.shared.store([Data("RAD binary STL".utf8)], for: retained, owner: second.folder)
-        defer { STLExportCache.shared.removeAll(ownedBy: second.folder) }
-        XCTAssertNotNil(STLExportCache.shared.data(for: released))
+        ThreeMFExportCache.shared.store([Data("RAD 3MF bytes".utf8)], for: released, owner: try XCTUnwrap(first).folder)
+        ThreeMFExportCache.shared.store([Data("RAD 3MF bytes".utf8)], for: retained, owner: second.folder)
+        defer { ThreeMFExportCache.shared.removeAll(ownedBy: second.folder) }
+        XCTAssertNotNil(ThreeMFExportCache.shared.data(for: released))
         first = nil
-        XCTAssertNil(STLExportCache.shared.data(for: released), "Released geometry must not keep its STL bytes.")
-        XCTAssertNotNil(STLExportCache.shared.data(for: retained))
-        XCTAssertLessThanOrEqual(STLExportCache.shared.byteCount, ProjectStore.maximumAssetBytes)
+        XCTAssertNil(ThreeMFExportCache.shared.data(for: released), "Released geometry must not keep its 3MF bytes.")
+        XCTAssertNotNil(ThreeMFExportCache.shared.data(for: retained))
+        XCTAssertLessThanOrEqual(ThreeMFExportCache.shared.byteCount, ProjectStore.maximumAssetBytes)
     }
 }

@@ -1,12 +1,13 @@
 """Shared helpers for Engine tests: builds through the worker, staged native
-operations on a build's artifact, and binary STL readback."""
+operations on a build's artifact, and 3MF readback."""
 import itertools
 import json
 from pathlib import Path
 import shutil
-import struct
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 
 import numpy as np
 
@@ -51,14 +52,34 @@ def native(build_folder, result, operation, threads=2, serving=False, **fields):
     return report, folder
 
 
-def read_stl(path):
-    """(triangle corners (N, 3, 3) float64, facet normals (N, 3)) of a binary STL."""
-    data = Path(path).read_bytes()
-    count = struct.unpack_from("<I", data, 80)[0]
-    assert len(data) == 84 + 50 * count, "binary STL size must match its triangle count"
-    records = np.frombuffer(data, dtype=np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)),
-                                                  ("attribute", "<u2")]), count=count, offset=84)
-    return records["vertices"].astype(np.float64), records["normal"].astype(np.float64)
+def read_3mf(path):
+    """Triangle corners and ordered (name, sRGB hex color, vertices, triangles) objects."""
+    namespaces = {"": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02",
+                  "m": "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"}
+    with zipfile.ZipFile(path) as package:
+        relations = ET.fromstring(package.read("_rels/.rels"))
+        model_path, = [relation.attrib["Target"].lstrip("/") for relation in relations
+                       if relation.attrib["Type"] == "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"]
+        types = ET.fromstring(package.read("[Content_Types].xml"))
+        assert any(entry.get("Extension") == "model" or entry.get("PartName") == "/" + model_path for entry in types
+                   if entry.get("ContentType") == "application/vnd.ms-package.3dmanufacturing-3dmodel+xml")
+        model = ET.fromstring(package.read(model_path))
+    assert model.attrib["unit"] == "millimeter"
+    colors = {group.attrib["id"]: [entry.attrib["color"] for entry in group.findall("m:color", namespaces)]
+              for group in model.findall("resources/m:colorgroup", namespaces)}
+    objects = {obj.attrib["id"]: obj for obj in model.findall("resources/object", namespaces)}
+    items = []
+    for item in model.findall("build/item", namespaces):
+        assert item.get("transform") is None  # Pose is baked into exported coordinates.
+        obj = objects[item.attrib["objectid"]]
+        color = colors[obj.attrib["pid"]][int(obj.attrib["pindex"])]
+        vertices = np.array([[float(vertex.attrib[axis]) for axis in ("x", "y", "z")]
+                             for vertex in obj.findall("mesh/vertices/vertex", namespaces)], dtype=np.float64)
+        triangles = np.array([[int(triangle.attrib[index]) for index in ("v1", "v2", "v3")]
+                              for triangle in obj.findall("mesh/triangles/triangle", namespaces)], dtype=np.int64)
+        assert np.isfinite(vertices).all() and 0 <= triangles.min() and triangles.max() < len(vertices)
+        items.append((obj.attrib["name"], color, vertices, triangles))
+    return np.concatenate([vertices[triangles] for _, _, vertices, triangles in items]), items
 
 
 def signed_volume(corners):

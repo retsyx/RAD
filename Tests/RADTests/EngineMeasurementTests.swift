@@ -6,7 +6,7 @@ final class EngineMeasurementTests: XCTestCase {
     @MainActor
     func testPairMeasurementAndSelectedExportUseTheSessionGraph() async throws {
         guard ProcessInfo.processInfo.environment["RAD_RUN_ENGINE_TESTS"] == "1" else {
-            throw XCTSkip("Set RAD_RUN_ENGINE_TESTS=1 to verify native measurement and selected STL export.")
+            throw XCTSkip("Set RAD_RUN_ENGINE_TESTS=1 to verify native measurement and selected 3MF export.")
         }
         let service = EngineService()
         let spec = ModelSpec(title: "Measurement assembly", summary: "A sphere and a separated block.", units: "mm", script: """
@@ -42,12 +42,12 @@ final class EngineMeasurementTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(combined.metrics.first { $0.id == "pair:distance" }?.values.first), 100.5.squareRoot() - 2, accuracy: 0.05)
         XCTAssertEqual(try XCTUnwrap(combined.metrics.first { $0.id == "parts:count" }?.values.first), 1)
         XCTAssertEqual(combined.closestPoints?.count, 2)
-        let selected = try await service.exportSTL(preview, solidIndices: [1], python: EngineService.defaultPython, threads: 4)
-        let exported = try EngineSTLExportTests.summary(selected)
+        let selected = try await service.export3MF(preview, solidIndices: [1], python: EngineService.defaultPython, threads: 4)
+        let exported = try EngineThreeMFExportTests.summary(selected)
         XCTAssertEqual(exported.volume, 1, accuracy: 0.02)
         for (actual, expected) in zip(exported.bounds, [10.0, 0, 0, 11, 1, 1]) { XCTAssertEqual(actual, expected, accuracy: 0.02) }
         try FileManager.default.removeItem(atPath: graph)
-        let cached = try await service.exportSTL(preview, solidIndices: [1], python: "/nonexistent/python", threads: 1)
+        let cached = try await service.export3MF(preview, solidIndices: [1], python: "/nonexistent/python", threads: 1)
         XCTAssertEqual(cached, selected)
     }
 
@@ -84,7 +84,7 @@ final class EngineMeasurementTests: XCTestCase {
         let selections: [Set<Int>] = [[], [-1], [1]]
         for selection in selections {
             do {
-                _ = try await EngineService().exportSTL(preview, solidIndices: selection, python: "/nonexistent/python", threads: 1)
+                _ = try await EngineService().export3MF(preview, solidIndices: selection, python: "/nonexistent/python", threads: 1)
                 XCTFail("Invalid selections must be rejected before resolving a runtime or reading an artifact")
             } catch {
                 XCTAssertEqual(error.localizedDescription, "Select at least one available part to export.")

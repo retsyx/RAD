@@ -79,16 +79,16 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(state.displayedSolidTransforms, layout, "Hiding a part never repacks the plate")
         state.togglePartVisibility([1])
 
-        let full = directory.appendingPathComponent("printing.stl")
-        state.exportSTL(to: full, for3DPrinting: true)
+        let full = directory.appendingPathComponent("printing.3mf")
+        state.export3MF(to: full, for3DPrinting: true)
         try await finish(state, expecting: full)
-        let exported = try EngineSTLExportTests.summary(Data(contentsOf: full))
+        let exported = try EngineThreeMFExportTests.summary(Data(contentsOf: full))
         let union = (0..<3).map { axis in viewBounds.map { $0[axis] }.min()! } + (0..<3).map { axis in viewBounds.map { $0[axis + 3] }.max()! }
         XCTAssertEqual(exported.bounds, union, accuracy: 0.1)
-        let subset = directory.appendingPathComponent("peg.stl")
-        state.exportSTL(to: subset, solidIndices: [1], for3DPrinting: true)
+        let subset = directory.appendingPathComponent("peg.3mf")
+        state.export3MF(to: subset, solidIndices: [1], for3DPrinting: true)
         try await finish(state, expecting: subset)
-        let peg = try EngineSTLExportTests.summary(Data(contentsOf: subset)).bounds
+        let peg = try EngineThreeMFExportTests.summary(Data(contentsOf: subset)).bounds
         XCTAssertEqual(peg[2], 0, accuracy: 0.05)
         XCTAssertEqual(peg[5] - peg[2], 15, accuracy: 0.1)
 
@@ -156,24 +156,24 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertTrue(state.displayedOmittedSolids.isEmpty, "The printing version keeps its reference parts")
         state.printVersionView = false
 
-        let printing = directory.appendingPathComponent("printing.stl")
-        state.exportSTL(to: printing, for3DPrinting: true)
+        let printing = directory.appendingPathComponent("printing.3mf")
+        state.export3MF(to: printing, for3DPrinting: true)
         try await finish(state, expecting: printing)
-        let printed = try EngineSTLExportTests.summary(Data(contentsOf: printing))
+        let printed = try EngineThreeMFExportTests.summary(Data(contentsOf: printing))
         XCTAssertEqual(printed.volume, stats[0].volume + stats[1].volume, accuracy: (stats[0].volume + stats[1].volume) * 0.01)
         XCTAssertEqual(printed.bounds[2], 0, accuracy: 0.05)
-        let whole = directory.appendingPathComponent("design.stl")
-        state.exportSTL(to: whole)
+        let whole = directory.appendingPathComponent("design.3mf")
+        state.export3MF(to: whole)
         try await finish(state, expecting: whole)
-        XCTAssertEqual(try EngineSTLExportTests.summary(Data(contentsOf: whole)).volume, preview.volume,
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(Data(contentsOf: whole)).volume, preview.volume,
                        accuracy: preview.volume * 0.01, "Ordinary exports keep reference parts")
         let folder = directory.appendingPathComponent("parts")
-        state.exportSTL(to: folder, for3DPrinting: true, exportIndividualParts: true, replaceExisting: true)
+        state.export3MF(to: folder, for3DPrinting: true, exportIndividualParts: true, replaceExisting: true)
         try await finish(state, expecting: folder)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), ["Case.stl", "Lid.stl"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), ["Case.3mf", "Lid.3mf"])
 
-        let board = directory.appendingPathComponent("board.stl")
-        state.exportSTL(to: board, solidIndices: [2], for3DPrinting: true)
+        let board = directory.appendingPathComponent("board.3mf")
+        state.export3MF(to: board, solidIndices: [2], for3DPrinting: true)
         let deadline = ContinuousClock.now + .seconds(60)
         while state.isWorking, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(state.error?.contains("reference parts, which are not printed") == true, state.error ?? "no error")
@@ -195,7 +195,7 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertFalse(state.isWorking)
         XCTAssertNil(state.error)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            throw RADError.message("No STL was exported: \(state.error ?? state.activity)")
+            throw RADError.message("No 3MF was exported: \(state.error ?? state.activity)")
         }
     }
 }

@@ -169,7 +169,7 @@ private struct ProjectCommands: Commands {
             Button("Save Design As…") { state?.saveProject(as: true) }
                 .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(state?.canSaveProject != true)
             Divider()
-            Button("Export STL…") { state?.exportSTL() }
+            Button("Export 3MF…") { state?.export3MF() }
                 .keyboardShortcut("e", modifiers: [.command, .shift]).disabled(state?.canExport != true)
         }
         CommandGroup(after: .textEditing) {

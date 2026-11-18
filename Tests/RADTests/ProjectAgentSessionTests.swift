@@ -80,7 +80,7 @@ final class ProjectAgentSessionTests: XCTestCase {
                 XCTAssertNil((tool.inputSchema["properties"] as? [String: Any])?[export])
             }
         }
-        XCTAssertEqual(Set(native.tools.filter { $0.host.exportPath != nil }.map(\.name)), ["rad_export_stl"])
+        XCTAssertEqual(Set(native.tools.filter { $0.host.exportPath != nil }.map(\.name)), ["rad_export_3mf"])
     }
 
     @MainActor
@@ -167,20 +167,19 @@ final class ProjectAgentSessionTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("without versionID"))
         }
-        let export = try metadata(try await task.call(name: "rad_export_stl", arguments: ["artifactID": artifactID]))
-        let stlID = try XCTUnwrap(export["path"] as? String)
-        let downloaded = try await task.downloadFile(fileID: stlID)
+        let export = try metadata(try await task.call(name: "rad_export_3mf", arguments: ["artifactID": artifactID]))
+        let modelFileID = try XCTUnwrap(export["path"] as? String)
+        let downloaded = try await task.downloadFile(fileID: modelFileID)
         let bytes = downloaded.data
-        XCTAssertTrue(String(decoding: bytes.prefix(80), as: UTF8.self).hasPrefix("RAD binary STL"))
-        XCTAssertEqual(try EngineSTLExportTests.summary(bytes).volume, 24, accuracy: 0.05)
-        let secondExport = try metadata(try await task.call(name: "rad_export_stl", arguments: ["artifactID": artifactID]))
-        XCTAssertNotEqual(secondExport["path"] as? String, stlID)
-        let originalDownload = try await task.downloadFile(fileID: stlID)
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(bytes).volume, 24, accuracy: 0.05)
+        let secondExport = try metadata(try await task.call(name: "rad_export_3mf", arguments: ["artifactID": artifactID]))
+        XCTAssertNotEqual(secondExport["path"] as? String, modelFileID)
+        let originalDownload = try await task.downloadFile(fileID: modelFileID)
         XCTAssertEqual(originalDownload.data, bytes)
         // A downloaded export never becomes a reference input, even renamed and uploaded again.
         do {
-            _ = try await task.call(name: "rad_import", arguments: ["path": stlID])
-            XCTFail("A generated STL export must not become an imported input.")
+            _ = try await task.call(name: "rad_import", arguments: ["path": modelFileID])
+            XCTFail("A generated 3MF export must not become an imported input.")
         } catch { XCTAssertTrue(error.localizedDescription.contains("cannot become a reference input")) }
         let reuploaded = try await task.uploadFile(data: bytes, name: "renamed-reference.stl")
         do {
@@ -198,8 +197,8 @@ final class ProjectAgentSessionTests: XCTestCase {
         let cutCandidate = try await task.candidate(artifactID: try XCTUnwrap(cut["artifactID"] as? String))
         XCTAssertEqual(cutCandidate.model.inputAssets?.map(\.name), ["Fixture"])
         XCTAssertEqual(cutCandidate.preview.volume, 1000 - 64, accuracy: 6)
-        // Individual part exports name one STL handle per part.
-        let parts = try metadata(try await task.call(name: "rad_export_stl", arguments: ["artifactID": artifactID, "individualParts": true]))
+        // Individual part exports name one 3MF handle per part.
+        let parts = try metadata(try await task.call(name: "rad_export_3mf", arguments: ["artifactID": artifactID, "individualParts": true]))
         let files = try XCTUnwrap(parts["files"] as? [[String: Any]])
         XCTAssertEqual(files.count, 1)
         let partID = try XCTUnwrap(files.first?["path"] as? String)

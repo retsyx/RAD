@@ -70,7 +70,7 @@ final class EngineBuildArtifacts: @unchecked Sendable {
 
     deinit {
         let folder = folder
-        STLExportCache.shared.removeAll(ownedBy: folder)
+        ThreeMFExportCache.shared.removeAll(ownedBy: folder)
         try? lease.close()
         Self.cleanupQueue.async { _ = Self.removeIfAbandoned(folder) }
     }

@@ -118,14 +118,14 @@ final class AssemblyMotionIntegrationTests: XCTestCase {
         for (actual, expected) in zip(centroid, [-2.0,11,3]) { XCTAssertEqual(actual, expected, accuracy: 0.05) }
         let bounds = try XCTUnwrap(report.metrics.first { $0.id == "parts:minimum" }?.values)
         for (actual, expected) in zip(bounds, [-4.0,10,0]) { XCTAssertEqual(actual, expected, accuracy: 0.05) }
-        let posed = try await engine.exportSTL(preview, solidIndices: [arm], python: python, threads: 1)
-        for (actual, expected) in zip(try EngineSTLExportTests.summary(posed).bounds, [-4.0,10,0,0,12,6]) {
+        let posed = try await engine.export3MF(preview, solidIndices: [arm], python: python, threads: 1)
+        for (actual, expected) in zip(try EngineThreeMFExportTests.summary(posed).bounds, [-4.0,10,0,0,12,6]) {
             XCTAssertEqual(actual, expected, accuracy: 0.05)
         }
         preview.assemblyPose = try motion.solve(parts: preview.parts!, positions: ["hinge": 0])
-        let rest = try await engine.exportSTL(preview, solidIndices: [arm], python: python, threads: 1)
+        let rest = try await engine.export3MF(preview, solidIndices: [arm], python: python, threads: 1)
         XCTAssertNotEqual(posed, rest, "The export cache must include the pose")
-        for (actual, expected) in zip(try EngineSTLExportTests.summary(rest).bounds, [10.0,0,0,12,4,6]) {
+        for (actual, expected) in zip(try EngineThreeMFExportTests.summary(rest).bounds, [10.0,0,0,12,4,6]) {
             XCTAssertEqual(actual, expected, accuracy: 0.05)
         }
         XCTAssertEqual(try Data(contentsOf: native), originalBytes)

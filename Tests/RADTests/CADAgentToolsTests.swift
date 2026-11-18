@@ -168,8 +168,8 @@ final class CADAgentToolsTests: XCTestCase {
             ("rad_verify", ["artifactID": "missing"], "unavailable in this task"),
             ("rad_verify", ["cellSize": 1], "unsupported arguments"),
             ("rad_check_motion", ["joint": "j", "from": 0, "to": 1, "pairs": [["base", "lid"]], "requiredClearance": -1], "‘requiredClearance’"),
-            ("rad_export_stl", ["printLayout": true, "jointPositions": ["j": 1]], "printLayout without jointPositions"),
-            ("rad_export_stl", ["jointPositions": ["j": 1]], "no assembly joints"),
+            ("rad_export_3mf", ["printLayout": true, "jointPositions": ["j": 1]], "printLayout without jointPositions"),
+            ("rad_export_3mf", ["jointPositions": ["j": 1]], "no assembly joints"),
             ("rad_import", ["path": "part.step"], "STL (.stl) or OBJ (.obj)")
         ]
         for (name, arguments, message) in failures {
@@ -287,21 +287,21 @@ final class CADAgentToolsTests: XCTestCase {
         XCTAssertEqual(image.image?.data, png)
         XCTAssertEqual(try XCTUnwrap(NSBitmapImageRep(data: png)).pixelsWide, 400)
 
-        let exported = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "partIDs": ["block"], "path": "exports/block.stl"]).metadata
+        let exported = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "partIDs": ["block"], "path": "exports/block.3mf"]).metadata
         let exportedPath = try XCTUnwrap(exported["path"] as? String)
         XCTAssertTrue(exportedPath.hasPrefix(try EngineArtifact.canonicalDirectory(root).path + "/"))
-        let block = try EngineSTLExportTests.summary(Data(contentsOf: URL(fileURLWithPath: exportedPath)))
+        let block = try EngineThreeMFExportTests.summary(Data(contentsOf: URL(fileURLWithPath: exportedPath)))
         XCTAssertEqual(block.volume, 8, accuracy: 1e-3)
         XCTAssertEqual(block.bounds[2], 9, accuracy: 1e-3)
-        let individual = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "individualParts": true]).metadata
+        let individual = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "individualParts": true]).metadata
         let files = try XCTUnwrap(individual["files"] as? [[String: Any]])
-        XCTAssertEqual(files.compactMap { ($0["path"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } }, ["Plate.stl", "Block.stl"])
+        XCTAssertEqual(files.compactMap { ($0["path"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } }, ["Plate.3mf", "Block.3mf"])
         XCTAssertEqual(files.compactMap { $0["partID"] as? String }, ["plate", "block"])
         let plate = try XCTUnwrap(files.first?["path"] as? String)
-        XCTAssertEqual(try EngineSTLExportTests.summary(Data(contentsOf: URL(fileURLWithPath: plate))).volume, 800 - 16 * .pi, accuracy: 1)
-        let layout = try await tools.handle(name: "rad_export_stl", arguments: ["artifactID": id, "printLayout": true]).metadata
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(Data(contentsOf: URL(fileURLWithPath: plate))).volume, 800 - 16 * .pi, accuracy: 1)
+        let layout = try await tools.handle(name: "rad_export_3mf", arguments: ["artifactID": id, "printLayout": true]).metadata
         XCTAssertEqual(layout["placement"] as? String, "printLayout")
-        let plateLayout = try EngineSTLExportTests.summary(Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(layout["path"] as? String))))
+        let plateLayout = try EngineThreeMFExportTests.summary(Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(layout["path"] as? String))))
         XCTAssertEqual(plateLayout.bounds[2], 0, accuracy: 0.05)
     }
 

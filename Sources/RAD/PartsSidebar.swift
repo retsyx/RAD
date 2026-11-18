@@ -305,11 +305,11 @@ private struct PartActionsMenu: View {
 
     var body: some View {
         Section {
-            Button("Export STL…") {
+            Button("Export 3MF…") {
                 if let node, node.allSolidIndices.isDisjoint(with: state.selectedSolids) {
                     state.selectPartNodes([node.id])
                 }
-                state.exportSelectedPartsSTL()
+                state.exportSelectedParts3MF()
             }
             .disabled(!state.canExport || exportSolidIndices.isEmpty)
         }

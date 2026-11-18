@@ -34,7 +34,7 @@ final class ExternalAgentServerTests: XCTestCase {
         let listed = try metadata(try await fixture.server.call(name: "rad_projects", arguments: [:], client: restricted))
         let projects = try XCTUnwrap(listed["projects"] as? [[String: Any]])
         XCTAssertEqual(projects.compactMap { $0["projectID"] as? String }, [first.projectDocumentID.uuidString])
-        for name in ["rad_build", "rad_commit", "rad_export_stl", "rad_screenshot", "rad_project_create", "rad_project_open"] {
+        for name in ["rad_build", "rad_commit", "rad_export_3mf", "rad_screenshot", "rad_project_create", "rad_project_open"] {
             do {
                 _ = try await fixture.server.call(name: name, arguments: [:], client: restricted)
                 XCTFail("\(name) must be denied before parsing task arguments or opening UI.")
@@ -320,22 +320,22 @@ final class ExternalAgentServerTests: XCTestCase {
         XCTAssertGreaterThan(sampledColors.count, 3, "The native render must contain shaded CAD pixels, rather than only an empty background.")
         let renderEvent = try XCTUnwrap(state.taskAudits.first?.events.first { $0.title == "rad_render" && $0.status == "completed" })
         XCTAssertEqual(renderEvent.imageData, png, "Tool Activity must retain the exact PNG returned over MCP.")
-        let exported = try await httpTool(client, endpoint: endpoint, token: issued.token, name: "rad_export_stl", arguments: ["taskID": taskID, "artifactID": artifactID])
-        let stepID = try XCTUnwrap(metadata(exported)["path"] as? String)
+        let exported = try await httpTool(client, endpoint: endpoint, token: issued.token, name: "rad_export_3mf", arguments: ["taskID": taskID, "artifactID": artifactID])
+        let modelFileID = try XCTUnwrap(metadata(exported)["path"] as? String)
         let standardFiles = try XCTUnwrap((exported["structuredContent"] as? [String: Any])?["files"] as? [[String: Any]])
-        let file = try XCTUnwrap(standardFiles.first { $0["fileID"] as? String == stepID })
+        let file = try XCTUnwrap(standardFiles.first { $0["fileID"] as? String == modelFileID })
         let textFileBlocks = (exported["content"] as? [[String: Any]] ?? []).compactMap { item -> [String: Any]? in
             guard let text = item["text"] as? String, let bytes = text.data(using: .utf8) else { return nil }
             return try? JSONSerialization.jsonObject(with: bytes) as? [String: Any]
         }.flatMap { $0["files"] as? [[String: Any]] ?? [] }
-        XCTAssertTrue(textFileBlocks.contains { $0["fileID"] as? String == stepID && $0["downloadURL"] is String },
+        XCTAssertTrue(textFileBlocks.contains { $0["fileID"] as? String == modelFileID && $0["downloadURL"] is String },
                       "Clients that forward standard text content must receive usable download references.")
         var download = URLRequest(url: try XCTUnwrap(URL(string: try XCTUnwrap(file["downloadURL"] as? String))))
         download.setValue("Bearer \(issued.token)", forHTTPHeaderField: "Authorization")
-        let (step, stepResponse) = try await client.data(for: download)
-        XCTAssertEqual((stepResponse as? HTTPURLResponse)?.statusCode, 200)
-        XCTAssertTrue(String(decoding: step.prefix(80), as: UTF8.self).hasPrefix("RAD binary STL"))
-        XCTAssertEqual(try EngineSTLExportTests.summary(step).volume, 24, accuracy: 0.05)
+        let (modelBytes, modelResponse) = try await client.data(for: download)
+        XCTAssertEqual((modelResponse as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual((modelResponse as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type"), "model/3mf")
+        XCTAssertEqual(try EngineThreeMFExportTests.summary(modelBytes).volume, 24, accuracy: 0.05)
         let commitArguments: [String: Any] = ["taskID": taskID, "artifactID": artifactID, "expectedStateToken": expected, "idempotencyKey": "http-box-commit"]
         let committed = try metadata(try await httpTool(client, endpoint: endpoint, token: issued.token, name: "rad_commit", arguments: commitArguments))
         XCTAssertEqual(committed["committed"] as? Bool, true)

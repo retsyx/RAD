@@ -112,9 +112,9 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testPreviewExportsSTLAndReusesSessionBytes() async throws {
+    func testPreviewExports3MFAndReusesSessionBytes() async throws {
         try requireRuntime()
-        let spec = ModelSpec(title: "STL assembly", summary: "A plate and a post.", units: "mm", script: """
+        let spec = ModelSpec(title: "3MF assembly", summary: "A plate and a post.", units: "mm", script: """
         result = Assembly("Case", id="case")
         result.add(box((7, 8, 2), center=(3.5, 4, 1)), id="base", name="Base")
         result.add(cylinder(2, 3, center=(20, 5, 3.5)), id="post", name="Post")
@@ -122,15 +122,15 @@ final class EngineServiceTests: XCTestCase {
         let service = EngineService()
         let preview = try await service.buildPreview(spec, python: EngineService.defaultPython, threads: 4)
         let graph = URL(fileURLWithPath: try XCTUnwrap(preview.artifactPath))
-        let data = try await service.exportSTL(preview, python: EngineService.defaultPython, threads: 4)
-        let summary = try EngineSTLExportTests.summary(data)
+        let data = try await service.export3MF(preview, python: EngineService.defaultPython, threads: 4)
+        let summary = try EngineThreeMFExportTests.summary(data)
         XCTAssertEqual(summary.volume, preview.volume, accuracy: preview.volume * 0.02)
         for (actual, expected) in zip(summary.bounds, preview.bounds) { XCTAssertEqual(actual, expected, accuracy: 0.1) }
         // A repeated export needs neither the graph nor a runtime.
         try FileManager.default.removeItem(at: graph)
-        let cached = try await service.exportSTL(preview, python: "/nonexistent/python", threads: 1)
+        let cached = try await service.export3MF(preview, python: "/nonexistent/python", threads: 1)
         XCTAssertEqual(cached, data)
-        let shared = try await EngineService().exportSTL(preview, python: "/nonexistent/python", threads: 1)
+        let shared = try await EngineService().export3MF(preview, python: "/nonexistent/python", threads: 1)
         XCTAssertEqual(shared, data, "Every engine shares one bounded export cache.")
     }
 
@@ -140,7 +140,7 @@ final class EngineServiceTests: XCTestCase {
                                   area: 1, solids: 1, buildSeconds: 0, threads: 1,
                                   buildID: UUID().uuidString, artifactPath: "/unrelated/model.rsdf", partRoots: [0])
         do {
-            _ = try await EngineService().exportSTL(preview, python: "/nonexistent/python", threads: 1)
+            _ = try await EngineService().export3MF(preview, python: "/nonexistent/python", threads: 1)
             XCTFail("An unregistered artifact must never be read or sent to Python")
         } catch EngineExportError.nativeArtifactUnavailable {
             // AppState can rebuild an evicted model instead of losing export.

@@ -153,8 +153,7 @@ final class CADAgentTools {
     /// valid solid: its program ran, and only its stand-alone preview failed.
     static let importPreviewStages: Set<String> = ["preview_meshing", "part_bounds"]
 
-    /// Whether a mesh file is a binary STL that RAD wrote: its exports and
-    /// radsdf's Mesh.save_stl start with this header.
+    /// radsdf's Mesh.save_stl and earlier RAD STL exports use this header.
     static func isGeneratedMesh(_ data: Data) -> Bool {
         data.count >= 84 && data.prefix(14) == Data("RAD binary STL".utf8)
     }
@@ -321,8 +320,8 @@ final class CADAgentTools {
             return try result(["pythonExecutable": python, "runtime": try json(runtime!), "threads": threads,
                                "workspace": workspace.root.path, "apiGuidePath": guide.path,
                                "programInterface": "A Python program using the radsdf SDF modeling API assigns its final solid, list of solids or Assembly to result. Every public radsdf name (sphere, box, cylinder, circle, rect, polygon, union, difference, Assembly, Motion, ...), the module as sdf, math, np, rad (rad.print) and imported_assets are preloaded. Millimetres and degrees; distances are negative inside.",
-                               "capabilities": ["3D primitives", "2D profiles", "extrude", "tapered extrude", "revolve", "loft", "booleans", "smooth blends", "shell", "offset", "twist", "elongate", "mirror", "linear, grid and polar arrays", "involute gears", "assemblies", "motion and couplings", "3D printing version", "custom fields (implicit)", "SDF probes", "numeric measurements", "PNG rendering", "STL export", "STL and OBJ mesh import"],
-                               "externalTools": "External tools are user-managed. Before each new optional download or dependency installation, call rad_request_permission with the proposed operation and reason, even after a previous always-allow/always-deny result; Settings can change at any time. Proceed only when the current result has allowed true. That tool returns a decision only; you execute any approved operation in an isolated environment inside this task workspace, using RAD's Python as the base for a helper environment if needed. Never change RAD's shared runtime, global settings, original sources or files outside the task workspace. Final authored geometry must replay using only RAD's bundled CAD dependencies and registered reference inputs. rad_import is only for pre-existing external or reference meshes and faithful format conversions of user-provided inputs; never import or otherwise freeze geometry generated for this design, by RAD (such as an exported STL) or by external tools.",
+                               "capabilities": ["3D primitives", "2D profiles", "extrude", "tapered extrude", "revolve", "loft", "booleans", "smooth blends", "shell", "offset", "twist", "elongate", "mirror", "linear, grid and polar arrays", "involute gears", "assemblies", "motion and couplings", "3D printing version", "custom fields (implicit)", "SDF probes", "numeric measurements", "PNG rendering", "3MF export", "STL and OBJ mesh import"],
+                               "externalTools": "External tools are user-managed. Before each new optional download or dependency installation, call rad_request_permission with the proposed operation and reason, even after a previous always-allow/always-deny result; Settings can change at any time. Proceed only when the current result has allowed true. That tool returns a decision only; you execute any approved operation in an isolated environment inside this task workspace, using RAD's Python as the base for a helper environment if needed. Never change RAD's shared runtime, global settings, original sources or files outside the task workspace. Final authored geometry must replay using only RAD's bundled CAD dependencies and registered reference inputs. rad_import is only for pre-existing external or reference meshes and faithful format conversions of user-provided inputs; never import or otherwise freeze geometry generated for this design, by RAD (such as a 3MF export) or by external tools.",
                                "apiHelp": "The selected runtime is ready to use; no CAD environment bootstrap is needed. Read apiGuidePath for the complete modeling guide and run programs with rad_build.",
                                "inputAssets": inputs.values.sorted { $0.id < $1.id }.map { ["assetID": $0.id, "name": $0.name, "format": $0.format] }])
         case "rad_request_permission":
@@ -415,14 +414,14 @@ final class CADAgentTools {
             let path = try string("path", arguments, required: true)!
             let producerPaths = try (strings("producerPaths", arguments) ?? []).map { try workspace.url($0).path }
             let url = try workspace.url(path)
-            let format = url.pathExtension.lowercased()
-            guard CADInputAsset.supportedFormats.contains(format) else {
-                throw RADError.message("rad_import reads STL (.stl) or OBJ (.obj) triangle meshes from the task workspace. Convert other formats to STL first, asking permission for any tool the conversion needs.")
-            }
             // The workspace's volume may ignore case, so its generated folders do too.
             let relative = String(url.path.dropFirst(workspace.root.path.count + 1)).lowercased()
             guard !["artifacts/", "exports/", "renders/"].contains(where: relative.hasPrefix) else {
                 throw RADError.message(Self.generatedImportRefusal)
+            }
+            let format = url.pathExtension.lowercased()
+            guard CADInputAsset.supportedFormats.contains(format) else {
+                throw RADError.message("rad_import reads STL (.stl) or OBJ (.obj) triangle meshes from the task workspace. Original external meshes in other formats can be converted to STL after asking permission for any tool the conversion needs.")
             }
             let data = try workspace.read(path, maximumBytes: ProjectStore.maximumAssetBytes)
             let digest = SHA256.hexDigest(data)
@@ -456,7 +455,7 @@ final class CADAgentTools {
             info["name"] = asset.name
             info["format"] = format
             info["byteCount"] = data.count
-            info["fidelity"] = "A closed triangle mesh, used as the exact signed distance to its facets. Smooth surfaces are not recovered: curved originals stay faceted, and RAD's previews, measurements and STL exports re-mesh the facets at their resolution."
+            info["fidelity"] = "A closed triangle mesh, used as the exact signed distance to its facets. Smooth surfaces are not recovered: curved originals stay faceted, and RAD's previews, measurements and 3MF exports re-mesh the facets at their resolution."
             info["programBinding"] = "imported_assets[assetID]"
             info["producerPaths"] = producerPaths
             info["provenance"] = producerPaths.isEmpty
@@ -930,7 +929,7 @@ final class CADAgentTools {
             try checkCancellation()
             let url = try workspace.write(png, path: "renders/\(UUID().uuidString).png")
             return try imageResult(url, metadata: ["source": "RAD offscreen fallback; no live viewport is attached", "artifactID": artifact.id])
-        case "rad_export_stl":
+        case "rad_export_3mf":
             try allowed(arguments, ["artifactID", "path", "solidIndices", "partIDs", "individualParts", "jointPositions",
                                     "drivingJoint", "printLayout"])
             let individual = try bool("individualParts", arguments) ?? false
@@ -974,16 +973,18 @@ final class CADAgentTools {
                                                   driving: drivingJoint).solidTransforms
                 placement = "jointPositions"
             }
+            let partPresentation = ThreeMFExport.presentation(in: artifact.parts, overrides: artifact.partColors)
             var info: [String: Any] = ["artifactID": artifact.id, "solidIndices": (indices ?? Set(0..<preview.solids)).sorted(),
-                                       "placement": placement, "format": "binary STL", "units": "mm"]
+                                       "placement": placement, "format": "3MF", "units": "mm"]
             if !leftOut.isEmpty { info["referenceSolidsLeftOut"] = leftOut }
             if individual {
-                let parts = STLIndividualExport.parts(in: artifact.parts, selected: indices, solidCount: preview.solids)
-                let files = try await engine.exportSTLParts(preview, parts: parts.map(\.solidIndices), solidTransforms: transforms,
+                let parts = ThreeMFExport.parts(in: artifact.parts, selected: indices, solidCount: preview.solids)
+                let files = try await engine.export3MFParts(preview, parts: parts.map(\.solidIndices),
+                                                            partPresentation: partPresentation, solidTransforms: transforms,
                                                             python: python, threads: threads)
                 try checkCancellation()
                 var folder = try string("path", arguments) ?? "exports/\(artifact.id)-parts"
-                if folder.lowercased().hasSuffix(".stl") { folder.removeLast(4) }
+                if folder.lowercased().hasSuffix(".3mf") { folder.removeLast(4) }
                 let owners = Self.owners(in: artifact.parts)
                 generatedGeometry.formUnion(files.map { SHA256.hexDigest($0) })
                 info["files"] = try zip(parts, files).map { part, data -> [String: Any] in
@@ -995,11 +996,12 @@ final class CADAgentTools {
                 }
                 info["byteCount"] = files.reduce(0) { $0 + $1.count }
             } else {
-                let data = try await engine.exportSTL(preview, solidIndices: indices, solidTransforms: transforms,
+                let data = try await engine.export3MF(preview, solidIndices: indices,
+                                                      partPresentation: partPresentation, solidTransforms: transforms,
                                                       python: python, threads: threads)
                 try checkCancellation()
                 generatedGeometry.insert(SHA256.hexDigest(data))
-                let url = try workspace.write(data, path: try string("path", arguments) ?? "exports/\(artifact.id).stl")
+                let url = try workspace.write(data, path: try string("path", arguments) ?? "exports/\(artifact.id).3mf")
                 info["path"] = url.path
                 info["byteCount"] = data.count
             }
@@ -1722,7 +1724,7 @@ struct CADAgentWorkspace: Sendable {
     }
 
     /// Inspect bounded output metadata without reading a potentially large
-    /// external reference or STL export into the UI process a second time.
+    /// external reference or 3MF export into the UI process a second time.
     func fileSize(_ path: String, maximumBytes: Int, allowEmpty: Bool = false) throws -> Int {
         let url = try url(path)
         let parent = try parentDescriptor(url, create: false)

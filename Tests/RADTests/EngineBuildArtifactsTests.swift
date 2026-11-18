@@ -133,9 +133,9 @@ final class EngineBuildArtifactsTests: XCTestCase {
         first = nil
         // A validated preview carries its own trusted native ownership, even
         // when another service exports it after the producing service closes.
-        let exported = try await EngineService(temporaryDirectory: root).exportSTL(
+        let exported = try await EngineService(temporaryDirectory: root).export3MF(
             try XCTUnwrap(second), python: EngineService.defaultPython, threads: 2)
-        XCTAssertNoThrow(try EngineService.validateSTL(exported))
+        XCTAssertNoThrow(try EngineService.validate3MF(exported))
         XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path))
         second = nil
         try await waitForRemoval(folder)
