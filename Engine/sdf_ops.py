@@ -28,7 +28,7 @@ import numpy as np
 import radsdf
 from assembly_motion import AssemblyMotionError, validate_pose_records
 from sdf_build import (MAX_GEOMETRY_BYTES, MAX_PARTS, PREVIEW_CELLS_ACROSS, PREVIEW_CREASE_ANGLE,
-                       PREVIEW_MINIMUM_CELL, HostError, ModelError, mesh_parts)
+                       PREVIEW_MINIMUM_CELL, HostError, ModelError, mesh_parts, unrefined_triangles)
 
 SOURCE_NAME = "source.rsdf"
 SOURCE_FIELDS = frozenset({"operation", "artifact", "artifactIdentity", "partRoots"})
@@ -1161,14 +1161,15 @@ def default_cell(source):
 
 def budget_cell(source, solids, cell, budget, threads):
     """`cell`, coarsened so a probe mesh at EXPORT_PROBE_FACTOR times it
-    predicts at most `budget` triangles for the solids."""
+    predicts at most `budget` triangles for the solids (counted before
+    refinement, as in preview_cell_size)."""
     probe = cell * EXPORT_PROBE_FACTOR
     triangles = 0.0
     for solid in solids:
         try:
             mesh = source.graph.mesh(source.roots[solid], cell_size=probe, crease_angle=PREVIEW_CREASE_ANGLE,
                                      threads=threads)
-            triangles += len(mesh.triangles) * EXPORT_PROBE_FACTOR ** 2
+            triangles += unrefined_triangles(mesh) * EXPORT_PROBE_FACTOR ** 2
         except radsdf.SDFError:
             lo, hi = source.bounds(solid)
             a, b, c = (float(value) for value in hi - lo)

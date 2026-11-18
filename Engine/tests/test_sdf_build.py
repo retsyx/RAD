@@ -816,6 +816,26 @@ m.couple("geneva", drive, index, **geneva(N))
         self.assertAlmostEqual(result["volume"], 512, delta=1)
         self.assertEqual(result["partStats"][0]["components"], 512)
 
+    def test_the_preview_budget_counts_the_surface_before_refinement(self):
+        # The mesher refines features narrower than a cell, which these beads
+        # are at the probe's cells but not at the preview's: counting the
+        # probe's refined triangles would coarsen a preview that fits.
+        post = radsdf.union(radsdf.cylinder(4, 2, center=(0, 0, 1)), radsdf.cylinder(4, 2, center=(0, 0, 3)), smooth=0.6)
+        shape = post.grid_array((3, 3, 1), (10, 10, 1))
+        graph = radsdf.Graph([shape])
+        self.addCleanup(graph.close)
+        box = (shape.bounds.lo, shape.bounds.hi)
+        default = float(np.max(box[1] - box[0])) / sdf_build.PREVIEW_CELLS_ACROSS
+        probe = graph.mesh(graph.roots[0], cell_size=default * sdf_build.PREVIEW_PROBE_FACTOR,
+                           crease_angle=sdf_build.PREVIEW_CREASE_ANGLE)
+        self.assertGreater(len(probe.triangles), 1.5 * sdf_build.unrefined_triangles(probe))
+        from unittest import mock
+        with mock.patch.object(sdf_build, "MAX_TRIANGLES", 500_000):
+            cell, expected = sdf_build.preview_cell_size(graph, [box], 2)
+            self.assertEqual(cell, expected)
+            preview = graph.mesh(graph.roots[0], cell_size=cell, crease_angle=sdf_build.PREVIEW_CREASE_ANGLE)
+            self.assertLess(len(preview.triangles), sdf_build.MAX_TRIANGLES)
+
     def test_too_detailed_designs_fail_after_two_remeshes(self):
         calls = []
         real = sdf_build._mesh_part

@@ -557,13 +557,23 @@ def _triangle_estimate(box, cell):
     return 4.0 * (a * b + b * c + c * a) / (cell * cell)
 
 
+def unrefined_triangles(mesh):
+    """A mesh's triangles before the mesher refined features narrower than a
+    cell: two per active cell of the extracted surface."""
+    return 2.0 * mesh.stats.get("active_cells", len(mesh.triangles) / 2)
+
+
 def preview_cell_size(graph, boxes, threads):
     """(cell size, default cell size). The default is the design's largest
     extent over PREVIEW_CELLS_ACROSS. A probe mesh of every part at
     PREVIEW_PROBE_FACTOR times that size estimates the preview's triangles,
     vertices (both scale with 1/cell^2) and crease segments (1/cell); the
     cell size grows until the estimate fits the preview limits. A part the
-    probe cannot mesh counts with its bounding-box estimate."""
+    probe cannot mesh counts with its bounding-box estimate. The mesher's
+    refinement of features narrower than a cell does not scale that way (at
+    the probe's coarse cells more features are that narrow), so the probe
+    counts the extracted surface: two triangles per active cell
+    (unrefined_triangles), and its vertices in proportion."""
     import numpy as np
     import radsdf
     lo = np.min([box[0] for box in boxes], axis=0)
@@ -579,8 +589,9 @@ def preview_cell_size(graph, boxes, threads):
             triangles += _triangle_estimate(box, default)
             vertices += _triangle_estimate(box, default) / 2
             continue
-        triangles += len(mesh.triangles) * area_factor
-        vertices += len(mesh.positions) * area_factor
+        unrefined = unrefined_triangles(mesh)
+        triangles += unrefined * area_factor
+        vertices += len(mesh.positions) * (unrefined / len(mesh.triangles) if len(mesh.triangles) else 1) * area_factor
         segments += len(mesh.creases) * PREVIEW_PROBE_FACTOR
     scale = max(math.sqrt(triangles / MAX_TRIANGLES), math.sqrt(vertices / MAX_VERTICES),
                 segments / MAX_EDGE_SEGMENTS)
