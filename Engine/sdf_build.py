@@ -32,8 +32,7 @@ MAX_GEOMETRY_BYTES = 512_000_000
 MAX_PARTS = 4096
 MAX_PART_NODES = 8192
 MAX_DEPTH = 32
-LIMIT = 100_000.0
-COORDINATE_LIMIT = LIMIT * 10
+COORDINATE_LIMIT = 1_000_000.0
 MAX_WARNINGS = 24
 
 # Preview meshing (one cell size per build). The validation receipt's rules
@@ -41,13 +40,23 @@ MAX_WARNINGS = 24
 PREVIEW_CELLS_ACROSS = 256
 PREVIEW_TRIANGLE_BUDGET = MAX_TRIANGLES
 PREVIEW_CREASE_ANGLE = 35.0
-PREVIEW_REFINE_STEPS = 6  # radsdf passes the kernel's default crossing refinement
 PREVIEW_MINIMUM_CELL = 1e-4
 MAX_PREVIEW_REMESHES = 2
 PREVIEW_MARGIN = 1.05
 PREVIEW_PROBE_FACTOR = 4
 
 ROOT_KEYS = {"title", "summary", "units", "script"}
+FIELD_TO_SOLID = ("a field becomes a solid only through implicit(field, bounds), for example "
+                  "implicit(g, bounds=((-20, -20, -20), (20, 20, 20))), inside where the field is negative.")
+# Custom fields: the build summary analyses at most this many implicit()
+# shapes again for their slope bound and quality; rad_verify reports more.
+MAX_SUMMARY_FIELDS = 32
+MAX_VERIFIED_FIELDS = 64
+IMPLICIT_FAILURE = re.compile(r"node (\d+) \(IMPLICIT\): its field has no finite slope bound over its "
+                              r"bounds: (.*)", re.S)
+FIELD_ADVICE = ("Every operation needs a finite slope inside the bounds: keep divisors and the arguments of "
+                "sqrt and log away from 0 (and sqrt and log from negative values), keep atan2's pole out of "
+                "the bounds, or shrink the bounds. rad_verify reports every custom field.")
 INPUT_FORMATS = {"stl", "obj"}
 FOLDER_PREFIXES = ("user-folder:", "folder:")
 VALIDATION_RULES_VERSION = 1
@@ -70,10 +79,12 @@ class HostError(RuntimeError):
 def validate_spec(spec):
     """Validate a build request before running any program."""
     if (not isinstance(spec, dict) or not ROOT_KEYS <= set(spec)
-            or set(spec) - ROOT_KEYS - {"inputAssets", "print"}):
+            or set(spec) - ROOT_KEYS - {"inputAssets", "print", "verifyFields"}):
         raise ModelError("Design must contain title, summary, units and a complete Python script.")
     if "print" in spec and spec["print"] is not True:
         raise ModelError("The 3D printing build option must be true when present.")
+    if "verifyFields" in spec and spec["verifyFields"] is not True:
+        raise ModelError("The custom field verification option must be true when present.")
     for name, maximum in (("title", 160), ("summary", 6000)):
         if not isinstance(spec[name], str) or not 1 <= len(spec[name]) <= maximum:
             raise ModelError(f"{name} must be a nonempty string of at most {maximum} characters.")
@@ -110,10 +121,12 @@ def runtime_info():
 
 
 def validation_rules(kernel):
-    """The receipt's rules tag: the rules version, the kernel and the mesher parameters."""
+    """The receipt's rules tag: the rules version, the kernel and the mesher
+    parameters (the crossing refinement is the one radsdf meshes with)."""
+    import radsdf
     return (f"rad-sdf-validation-rules-{VALIDATION_RULES_VERSION};kernel={kernel};"
             f"cells={PREVIEW_CELLS_ACROSS};triangles={PREVIEW_TRIANGLE_BUDGET};vertices={MAX_VERTICES};"
-            f"segments={MAX_EDGE_SEGMENTS};crease={PREVIEW_CREASE_ANGLE:g};refine={PREVIEW_REFINE_STEPS};"
+            f"segments={MAX_EDGE_SEGMENTS};crease={PREVIEW_CREASE_ANGLE:g};refine={radsdf._REFINE_STEPS};"
             f"minimum={PREVIEW_MINIMUM_CELL:g};remeshes={MAX_PREVIEW_REMESHES};margin={PREVIEW_MARGIN:g};"
             f"probe={PREVIEW_PROBE_FACTOR}")
 
@@ -362,10 +375,12 @@ def normalize_result(result):
     its hierarchy, ids, names, colors, print-down directions, reference parts
     and motion.
     """
-    from radsdf import SDF2, SDF3
+    from radsdf import SDF2, SDF3, Field
     from radsdf_assembly import Assembly, Part
     if isinstance(result, Assembly):
         return _assembly_result(result)
+    if isinstance(result, Field):
+        raise ModelError(f"Python design result is a custom field; {FIELD_TO_SOLID}")
     if isinstance(result, SDF3):
         shapes, labels = [result], ["The design"]
     elif isinstance(result, (list, tuple)):
@@ -376,6 +391,8 @@ def normalize_result(result):
         for index, shape in enumerate(shapes):
             if isinstance(shape, SDF2):
                 raise ModelError(f"result[{index}] is a 2D profile; extrude or revolve it into a 3D solid.")
+            if isinstance(shape, Field):
+                raise ModelError(f"result[{index}] is a custom field; {FIELD_TO_SOLID}")
             if not isinstance(shape, SDF3):
                 kind = ("an Assembly; use one Assembly with folders for named groups"
                         if isinstance(shape, Assembly) else f"a {type(shape).__name__}, not a 3D shape")
@@ -675,6 +692,12 @@ def _unit_normals(positions, triangles, normals):
     return values.astype(np.float32)
 
 
+def mesh_pieces(stats):
+    """A mesh's separate pieces: its connected surfaces less the sealed
+    cavities (inward-facing surfaces of voids inside a piece)."""
+    return int(stats.get("components", 1)) - int(stats.get("cavities", 0))
+
+
 def _warnings(normalized, meshes, cell, default):
     messages = []
     if cell > default * (1 + 1e-9):
@@ -685,9 +708,9 @@ def _warnings(normalized, meshes, cell, default):
         if nonmanifold:
             messages.append(f"{label} has {nonmanifold} non-manifold mesh edges at the preview cell size of "
                             f"{cell:.4g} mm: features thinner than about {2 * cell:.3g} mm touch or merge.")
-        components = int(mesh.stats.get("components", 1))
-        if components > 1:
-            messages.append(f"{label} has {components} disconnected pieces; they move and export as one "
+        pieces = mesh_pieces(mesh.stats)
+        if pieces > 1:
+            messages.append(f"{label} has {pieces} disconnected pieces; they move and export as one "
                             "rigid part.")
     if len(messages) > MAX_WARNINGS:
         messages[MAX_WARNINGS - 1:] = [f"... and {len(messages) - MAX_WARNINGS + 1} more warnings."]
@@ -723,7 +746,8 @@ def assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerp
         stats.append({"solid": solid, "volume": volume, "area": float(mesh.stats["area"]),
                       "bounds": [*lo.tolist(), *hi.tolist()],
                       "centroid": [float(value) for value in mesh.stats["centroid"]],
-                      "triangles": len(part_triangles), "components": int(mesh.stats.get("components", 1))})
+                      "triangles": len(part_triangles), "components": mesh_pieces(mesh.stats),
+                      "cavities": int(mesh.stats.get("cavities", 0))})
     lo = np.min([item["bounds"][:3] for item in stats], axis=0)
     hi = np.max([item["bounds"][3:] for item in stats], axis=0)
     if np.any(np.abs(lo) > COORDINATE_LIMIT) or np.any(np.abs(hi) > COORDINATE_LIMIT):
@@ -819,43 +843,207 @@ def write_artifact(data, output):
     return path
 
 
-def build(spec, directory, output, threads, started=None):
-    """Run one build request (inputs in `directory`) and publish model.rsdf,
-    mesh.bin and result.json in `output`; returns the result, including the
-    display arrays."""
+# ------------------------------------------------------------------ custom fields
+
+def implicit_nodes(order):
+    """Indices of the IMPLICIT nodes (implicit() shapes) among the encoded nodes."""
+    from radsdf import Opcode
+    return [index for index, node in enumerate(order) if node.opcode == Opcode.IMPLICIT]
+
+
+def implicit_owners(order, shapes, wanted):
+    """{IMPLICIT node index: solid indices of the parts that read it}, for
+    the node indices in `wanted`. Walks the parts' Python graphs, since an
+    exact boolean fold encodes without its inner nodes."""
+    index_of = {id(node): index for index, node in enumerate(order)}
+    owners = {index: [] for index in wanted}
+    for solid, shape in enumerate(shapes):
+        seen, stack = set(), [shape]
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            index = index_of.get(id(node))
+            if index in owners:
+                owners[index].append(solid)
+            stack.extend(node.children)
+    return owners
+
+
+def _owners_text(solids, labels):
+    names = [labels[solid] for solid in solids[:3]]
+    if len(solids) > 3:
+        names.append(f"{len(solids) - 3} more parts")
+    return ", ".join(names) or "The design"
+
+
+def _box_text(params):
+    lo, hi = params[:3], params[3:]
+    return f"(({', '.join(f'{value:g}' for value in lo)}), ({', '.join(f'{value:g}' for value in hi)}))"
+
+
+def field_load_error(error, order, normalized):
+    """A ModelError naming the part and program line of the implicit() shape
+    whose field the kernel could not bound when loading the design, or None
+    for other load failures."""
     import radsdf
-    started = time.perf_counter() if started is None else started
-    validate_spec(spec)
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    runtime = runtime_info()
-    fingerprint = validation_hash(spec, directory, runtime)
-    result, build_mode = run_program(spec["script"], printing=spec.get("print", False),
-                                     assets=ImportedAssets(spec.get("inputAssets", []), directory))
-    # Free the graphs the program's queries loaded (mesh_solid's validation
-    # graph among them) before the design's graph decodes the same meshes.
-    radsdf._release_graphs()
-    normalized = normalize_result(result)
+    match = IMPLICIT_FAILURE.search(str(error))
+    if match is None:
+        return None
+    index = int(match.group(1))
+    if index >= len(order) or order[index].opcode != radsdf.Opcode.IMPLICIT:
+        return None
+    node = order[index]
+    solids = implicit_owners(order, normalized.shapes, [index])[index]
+    line = radsdf._implicit_line(node)
+    where = f"implicit() at line {line}" if line is not None else "an implicit() shape"
+    problem = radsdf._describe_field_nodes(match.group(2).strip(), order).rstrip(".")
+    return ModelError(f"{_owners_text(solids, normalized.labels)}: the custom field of {where} has no finite slope "
+                      f"bound within its bounds {_box_text(node.params)}: {problem}. {FIELD_ADVICE}")
+
+
+def _finite_numbers(values):
+    return all(isinstance(value, (int, float)) and math.isfinite(value) for value in values)
+
+
+def field_record(node, solids, report):
+    """The JSON record of one implicit() shape's analysis (verify_field's
+    dictionary): finite values only."""
+    import radsdf
+    record = {"solids": solids, "bounds": list(node.params)}
+    line = radsdf._implicit_line(node)
+    if line is not None:
+        record["line"] = line
+    record["ok"] = bool(report.get("ok"))
+    if record["ok"]:
+        record["slopeBound"] = report["bound"]
+        if _finite_numbers(report["value_range"]):
+            record["valueRange"] = list(report["value_range"])
+        gradient = report["gradient"]
+        if report["samples"] and _finite_numbers(gradient.values()):
+            record["gradient"] = {key: gradient[key] for key in ("min", "median", "max")}
+        record["quality"] = report["quality"] if math.isfinite(report["quality"]) else 0.0
+        record["boxes"] = report["boxes"]
+    else:
+        record["message"] = report.get("message") or "The field has no finite slope bound within its bounds."
+        region = report.get("region")
+        if region is not None and _finite_numbers([*region[0], *region[1]]):
+            record["region"] = [*region[0], *region[1]]
+    return record
+
+
+def custom_fields(graph, order, normalized):
+    """(records, warnings) of the design's implicit() shapes for the build
+    summary: each one's parts, bounds, proven slope bound and quality,
+    analysed on the loaded graph (the bound is the one the kernel uses)."""
+    nodes = implicit_nodes(order)
+    if not nodes:
+        return [], []
+    owners = implicit_owners(order, normalized.shapes, nodes[:MAX_SUMMARY_FIELDS])
+    records = []
+    for index in nodes[:MAX_SUMMARY_FIELDS]:
+        record = field_record(order[index], owners[index], graph.analyze_field(index))
+        if record["ok"]:  # always: the loaded graph proved every bound with the same analysis
+            records.append({key: record[key] for key in ("solids", "line", "bounds", "slopeBound", "quality")
+                            if key in record})
+    warnings = []
+    if len(nodes) > MAX_SUMMARY_FIELDS:
+        warnings.append(f"The design has {len(nodes)} implicit() shapes; the summary lists the first "
+                        f"{MAX_SUMMARY_FIELDS} (rad_verify reports up to {MAX_VERIFIED_FIELDS}).")
+    return records, warnings
+
+
+def encode_design(normalized):
+    """(RSDF bytes, part root indices, encoded nodes) of the design's parts."""
+    import radsdf
     try:
-        data, roots = radsdf.serialize(normalized.shapes)
+        data, roots, order = radsdf._encode(normalized.shapes, with_order=True)
     except radsdf.SDFError as error:
         raise ModelError(f"The design's shape graph cannot be encoded: {error}") from error
     if len(data) > MAX_GEOMETRY_BYTES:
         raise ModelError("The design's shape graph exceeds 512 MB; share repeated shapes instead of "
                          "rebuilding them.")
+    return data, roots, order
+
+
+def run_design(spec, directory):
+    """Run the request's program; returns its Normalized parts and RADBuildMode."""
+    import radsdf
+    radsdf._implicit_lines.clear()
+    result, build_mode = run_program(spec["script"], printing=spec.get("print", False),
+                                     assets=ImportedAssets(spec.get("inputAssets", []), directory))
+    # Free the graphs the program's queries loaded (mesh_solid's validation
+    # graph among them) before the design's graph decodes the same meshes.
+    radsdf._release_graphs()
+    return normalize_result(result), build_mode
+
+
+def verify_fields(spec, directory, output, threads, started):
+    """rad_verify: run the program and analyse the field of every implicit()
+    shape (at most MAX_VERIFIED_FIELDS) as its load would, without loading
+    or meshing the design, so fields without a finite slope bound are
+    reported rather than failing. Publishes result.json only."""
+    import radsdf
+    runtime = runtime_info()
+    normalized, _ = run_design(spec, directory)
+    _, _, order = encode_design(normalized)
+    nodes = implicit_nodes(order)
+    owners = implicit_owners(order, normalized.shapes, nodes[:MAX_VERIFIED_FIELDS])
+    fields = []
+    for index in nodes[:MAX_VERIFIED_FIELDS]:
+        node = order[index]
+        try:
+            report = radsdf.verify_field(node)
+        except radsdf.SDFError as error:  # it reads another implicit() shape that cannot load
+            report = {"ok": False, "message": str(error)}
+        fields.append(field_record(node, owners[index], report))
+    result = {"solids": len(normalized.shapes), "parts": normalized.parts, "fields": fields,
+              "fieldCount": len(nodes), "buildSeconds": time.perf_counter() - started, "threads": threads,
+              "runtime": runtime}
+    staged = Path(output) / "result.json.tmp"
+    staged.write_text(json.dumps(result, separators=(",", ":"), allow_nan=False))
+    staged.replace(Path(output) / "result.json")
+    return result
+
+
+def build(spec, directory, output, threads, started=None):
+    """Run one build request (inputs in `directory`) and publish model.rsdf,
+    mesh.bin and result.json in `output`; returns the result, including the
+    display arrays. A request with verifyFields analyses its custom fields
+    instead (verify_fields)."""
+    import radsdf
+    started = time.perf_counter() if started is None else started
+    validate_spec(spec)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    if spec.get("verifyFields"):
+        return verify_fields(spec, directory, output, threads, started)
+    runtime = runtime_info()
+    fingerprint = validation_hash(spec, directory, runtime)
+    normalized, build_mode = run_design(spec, directory)
+    data, roots, order = encode_design(normalized)
     try:
         graph = radsdf.Graph.from_bytes(data, roots)
     except radsdf.SDFError as error:
-        raise ModelError(f"The kernel rejected the design's shape graph: {error}") from error
+        failure = field_load_error(error, order, normalized)
+        if failure is not None:
+            raise failure from error
+        message = radsdf._describe_field_nodes(str(error), order)
+        raise ModelError(f"The kernel rejected the design's shape graph: {message}") from error
     with graph:
         boxes = part_bounds(graph, normalized)
         meshes, cell, default = mesh_parts(graph, normalized, boxes, threads)
+        fields, field_warnings = custom_fields(graph, order, normalized)
     artifact = (output / "model.rsdf").resolve()
     preview = assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerprint,
                                build_mode.printing_read)
+    if fields:
+        preview["customFields"] = fields
     write_artifact(data, output)
     preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime)
     # Keep the protocol's key order: warnings follow the runtime facts.
-    preview["warnings"] = preview.pop("warnings")
+    warnings = preview.pop("warnings")
+    preview["warnings"] = warnings + field_warnings[:max(0, MAX_WARNINGS - len(warnings))]
     write_preview_result(preview, output)
     return preview

@@ -68,6 +68,22 @@ struct CADRuntime: Codable, Sendable, Equatable {
     var kernel: String
 }
 
+/// One implicit() shape of a build: the parts that read it, the program
+/// line that made it, its bounds, the upper bound of the field's slope the
+/// kernel proved and divides the field by, and median slope / bound (1 for
+/// a true distance; below 1 the solid's offsets, shells and blends come out
+/// larger than requested).
+struct CADCustomField: Codable, Sendable, Equatable {
+    /// The build summary analyses at most this many implicit() shapes
+    /// (the worker's `MAX_SUMMARY_FIELDS`).
+    static let maximumSummaryFields = 32
+    var solids: [Int]
+    var line: Int? = nil
+    var bounds: [Double]
+    var slopeBound: Double
+    var quality: Double
+}
+
 /// Display geometry for one build. Bulk arrays are packed: SceneKit uploads
 /// Float32 attributes, and the worker publishes them as binary sections beside
 /// its JSON metadata (see `PreviewMeshBuffers`). They are never encoded.
@@ -132,6 +148,8 @@ struct PreviewMesh: Codable, Sendable {
     /// Sorted solid indices of reference parts: shown, measured and checked
     /// for clearance, but never laid out or exported for 3D printing.
     var referenceSolids: [Int]? = nil
+    /// The build's implicit() shapes (custom fields), at most 32.
+    var customFields: [CADCustomField]? = nil
 
     /// Keeps private native files alive across copies and history navigation.
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.
@@ -144,7 +162,7 @@ struct PreviewMesh: Codable, Sendable {
         case buildID, artifactPath, partRoots, bounds, volume, area, solids, parts, partStats
         case meshStatistics = "mesh"
         case buildSeconds, threads, runtime, warnings, validatedHash, assemblyMotion, printVersion, printDown
-        case referenceSolids
+        case referenceSolids, customFields
     }
 
     var vertexCount: Int { positions.count / 3 }

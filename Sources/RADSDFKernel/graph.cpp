@@ -2,7 +2,9 @@
 #include "kernel.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <map>
 #include <memory>
 
 namespace rsdf {
@@ -27,7 +29,7 @@ constexpr uint32_t kMaxLiveBuffers = 65536;
 // culling) are refused.
 constexpr uint64_t kMaxVisits = uint64_t(1) << 30;
 
-enum ChildRule : uint8_t { NO_CHILDREN, ONE_CHILD, TWO_CHILDREN, CHILDREN };
+enum ChildRule : uint8_t { NO_CHILDREN, ONE_CHILD, TWO_CHILDREN, CHILDREN, FOUR_CHILDREN };
 
 struct OpInfo {
     uint32_t op;
@@ -36,6 +38,7 @@ struct OpInfo {
     ChildRule children;
     uint8_t child_dim;  // dimension required of its children
     int params;         // exact parameter count; -1: POLYGON (even, at least six); -2: MESH (checked when decoded)
+    bool field = false; // a field node: read only by field nodes and IMPLICIT
 };
 
 const OpInfo kOps[] = {
@@ -48,6 +51,7 @@ const OpInfo kOps[] = {
     {OP_ELLIPSOID, "ELLIPSOID", 3, NO_CHILDREN, 0, 3},
     {OP_HALFSPACE, "HALFSPACE", 3, NO_CHILDREN, 0, 4},
     {OP_MESH, "MESH", 3, NO_CHILDREN, 0, -2},
+    {OP_IMPLICIT, "IMPLICIT", 3, ONE_CHILD, 3, 6},
     {OP_TRANSFORM, "TRANSFORM", 3, ONE_CHILD, 3, 13},
     {OP_STRETCH, "STRETCH", 3, ONE_CHILD, 3, 3},
     {OP_MIRROR, "MIRROR", 3, ONE_CHILD, 3, 4},
@@ -76,6 +80,30 @@ const OpInfo kOps[] = {
     {OP_UNION2, "UNION2", 2, CHILDREN, 2, 1},
     {OP_INTERSECTION2, "INTERSECTION2", 2, CHILDREN, 2, 1},
     {OP_DIFFERENCE2, "DIFFERENCE2", 2, CHILDREN, 2, 1},
+    {OP_CONST, "CONST", 3, NO_CHILDREN, 0, 1, true},
+    {OP_COORD, "COORD", 3, NO_CHILDREN, 0, 1, true},
+    {OP_ADD, "ADD", 3, TWO_CHILDREN, 3, 0, true},
+    {OP_SUB, "SUB", 3, TWO_CHILDREN, 3, 0, true},
+    {OP_MUL, "MUL", 3, TWO_CHILDREN, 3, 0, true},
+    {OP_DIV, "DIV", 3, TWO_CHILDREN, 3, 0, true},
+    {OP_NEG, "NEG", 3, ONE_CHILD, 3, 0, true},
+    {OP_ABS, "ABS", 3, ONE_CHILD, 3, 0, true},
+    {OP_SQUARE, "SQUARE", 3, ONE_CHILD, 3, 0, true},
+    {OP_SQRT, "SQRT", 3, ONE_CHILD, 3, 0, true},
+    {OP_SIN, "SIN", 3, ONE_CHILD, 3, 0, true},
+    {OP_COS, "COS", 3, ONE_CHILD, 3, 0, true},
+    {OP_EXP, "EXP", 3, ONE_CHILD, 3, 0, true},
+    {OP_LOG, "LOG", 3, ONE_CHILD, 3, 0, true},
+    {OP_POWC, "POWC", 3, ONE_CHILD, 3, 1, true},
+    {OP_ATAN2, "ATAN2", 3, TWO_CHILDREN, 3, 0, true},
+    {OP_MIN, "MIN", 3, CHILDREN, 3, 0, true},
+    {OP_MAX, "MAX", 3, CHILDREN, 3, 0, true},
+    {OP_CLAMP, "CLAMP", 3, ONE_CHILD, 3, 2, true},
+    {OP_LENGTH, "LENGTH", 3, CHILDREN, 3, 0, true},
+    {OP_TRIWAVE, "TRIWAVE", 3, ONE_CHILD, 3, 1, true},
+    {OP_EVAL_AT, "EVAL_AT", 3, FOUR_CHILDREN, 3, 0, true},
+    {OP_SMIN, "SMIN", 3, TWO_CHILDREN, 3, 1, true},
+    {OP_SMAX, "SMAX", 3, TWO_CHILDREN, 3, 1, true},
 };
 
 const OpInfo *find_op(uint32_t op) {
@@ -225,7 +253,31 @@ void validate_params(const Node &node, const double *p, const Checker &check) {
         break;
     case OP_MIRROR2: check.unit(0, 2); break;
     case OP_OUTLINE2: check.positive(0, "thickness"); break;
-    default: break;  // TWIST, OFFSET, REVOLVE, OFFSET2: any finite value; POLYGON: build_polygon
+    case OP_IMPLICIT:
+        for (int a = 0; a < 3; ++a) {
+            if (!(p[a] < p[3 + a]))
+                check.fail(format("bounds must have lo < hi along %c (got %.17g and %.17g)", "xyz"[a], p[a], p[3 + a]));
+            if (!(std::fabs(p[a]) <= 1e150 && std::fabs(p[3 + a]) <= 1e150))
+                check.fail(format("bounds must lie within 1e150 of the origin along %c (got %.17g and %.17g)",
+                                  "xyz"[a], p[a], p[3 + a]));
+        }
+        break;
+    case OP_COORD:
+        if (!(p[0] == 0 || p[0] == 1 || p[0] == 2)) check.fail(format("axis must be 0 (x), 1 (y) or 2 (z) (got %.17g)", p[0]));
+        break;
+    case OP_CLAMP:
+        if (!(p[0] <= p[1])) check.fail(format("lo (%.17g) must not exceed hi (%.17g)", p[0], p[1]));
+        break;
+    case OP_TRIWAVE:  // 2P must neither overflow nor underflow
+        if (!(p[0] >= 1e-300 && p[0] <= 1e300))
+            check.fail(format("period must lie between 1e-300 and 1e300 (got %.17g)", p[0]));
+        break;
+    case OP_SMIN: case OP_SMAX: check.nonnegative(0, "blend radius k"); break;
+    case OP_POWC:  // e - 1 must be exact, so the derivative's power keeps its parity
+        if (!(std::fabs(p[0]) <= 0x1p52))
+            check.fail(format("exponent must be at most 2^52 in magnitude (got %.17g)", p[0]));
+        break;
+    default: break;  // TWIST, OFFSET, REVOLVE, OFFSET2, CONST: any finite value; POLYGON: build_polygon
     }
 }
 
@@ -349,6 +401,51 @@ void half_space_box(Node &node, const double *n, double d) {
         if (n[a] > 0) node.hi[a] = d / n[a];
         else node.lo[a] = d / n[a];
     }
+}
+
+// Whether a 2D node's solid is shown to be nonempty: exact fields are, and
+// any other when one of a 16 x 16 grid of samples of its box is inside.
+bool shown_nonempty(const rsdf_graph &graph, uint32_t id) {
+    const Node &node = graph.nodes[id];
+    if (node.exact) return true;
+    if (!(node.lo[0] <= node.hi[0] && node.lo[1] <= node.hi[1])) return false;
+    constexpr int kSide = 16;
+    static_assert(kSide * kSide <= kBatch, "one batch");
+    double x[kSide * kSide], y[kSide * kSide], value[kSide * kSide];
+    for (int i = 0; i < kSide; ++i)
+        for (int j = 0; j < kSide; ++j) {
+            x[i * kSide + j] = node.lo[0] + (node.hi[0] - node.lo[0]) * i / (kSide - 1);
+            y[i * kSide + j] = node.lo[1] + (node.hi[1] - node.lo[1]) * j / (kSide - 1);
+        }
+    eval_batch(graph, id, kSide * kSide, x, y, nullptr, value);
+    for (int i = 0; i < kSide * kSide; ++i)
+        if (value[i] <= 0) return true;
+    return false;
+}
+
+// A bound of |b - a| over the box [low, high] around a LOFT's profiles a and
+// b (diagonal D; L_a, L_b their slope bounds, L the larger). When both
+// profiles are nonempty it is L D: their solids lie in the box, so b <= L_b
+// dist(p, b's surface) <= L_b D, and -a(p) = v > 0 puts a disc of radius v / L_a
+// around p inside the box, leaving b's surface within D - v / L_a. An empty
+// profile (a cutter covering it, an inward offset wider than it) can be far
+// above D inside the box, so profiles not shown nonempty use |b - a| at the
+// box's centre plus (L_a + L_b) times its half diagonal.
+// Sets `nonempty` when both profiles are shown nonempty.
+double loft_spread(const rsdf_graph &graph, const uint32_t *kids, const double *low, const double *high,
+                   double diagonal, const std::string &where, bool &nonempty) {
+    const Node &a = graph.nodes[kids[0]], &b = graph.nodes[kids[1]];
+    const double x = low[0] + 0.5 * (high[0] - low[0]), y = low[1] + 0.5 * (high[1] - low[1]);
+    double va = 0, vb = 0;
+    eval_batch(graph, kids[0], 1, &x, &y, nullptr, &va);
+    eval_batch(graph, kids[1], 1, &x, &y, nullptr, &vb);
+    // Rounded up generously: a few operations, each within an ulp.
+    const double centred =
+        (std::fabs(vb - va) + (a.step_lipschitz + b.step_lipschitz) * 0.5 * diagonal) * (1 + 1e-12) + 1e-300;
+    if (!std::isfinite(centred)) throw Error(where + ": LOFT profiles have no finite values inside their box");
+    nonempty = shown_nonempty(graph, kids[0]) && shown_nonempty(graph, kids[1]);
+    if (nonempty) return std::min(std::max(a.step_lipschitz, b.step_lipschitz) * diagonal * (1 + 1e-12), centred);
+    return centred;
 }
 
 // Derives bounds, distance ratios, Lipschitz bounds and evaluation constants
@@ -540,22 +637,32 @@ void derive(rsdf_graph &graph, Node &node, const std::string &where) {
         // The profiles' blend changes by |b - a| along z, at most the diagonal
         // D of the box around both profiles inside it (for exact profiles
         // everywhere): c0 = 1 / sqrt(1 + (D / (z1 - z0))^2) keeps the bound.
+        // c1 bounds |b - a| inside the box (loft_spread): a profile that may
+        // be empty steps with the slope c0 sqrt(L^2 + (c1 / (z1 - z0))^2).
         const Node &a = graph.nodes[kids[0]], &b = graph.nodes[kids[1]];
         if (!finite_box(a) || !finite_box(b)) throw Error(where + ": LOFT needs bounded profiles");
-        double extent[2] = {0, 0};
+        double low[2], high[2], extent[2];
         for (int i = 0; i < 2; ++i) {
             node.lo[i] = std::min(a.lo[i], b.lo[i]);
             node.hi[i] = std::max(a.hi[i], b.hi[i]);
-            const double low = std::min({a.lo[i], a.hi[i], b.lo[i], b.hi[i]});
-            const double high = std::max({a.lo[i], a.hi[i], b.lo[i], b.hi[i]});
-            extent[i] = high - low;
+            low[i] = std::min({a.lo[i], a.hi[i], b.lo[i], b.hi[i]});
+            high[i] = std::max({a.lo[i], a.hi[i], b.lo[i], b.hi[i]});
+            extent[i] = high[i] - low[i];
         }
         node.lo[2] = p[0];
         node.hi[2] = p[1];
-        const double slope = std::hypot(extent[0], extent[1]) / (p[1] - p[0]);
+        const double diagonal = std::hypot(extent[0], extent[1]);
+        const double slope = diagonal / (p[1] - p[0]);
         node.c0 = 1 / std::sqrt(1 + slope * slope);
         ratio = std::min(a.ratio, b.ratio) * node.c0;
-        // Margin for inexact profiles, whose |b - a| may exceed D outside the box.
+        bool nonempty = false;
+        node.c1 = loft_spread(graph, kids, low, high, diagonal, where, nonempty);
+        const double lab = std::max(a.step_lipschitz, b.step_lipschitz);
+        if (!nonempty && node.c1 > lab * diagonal) {
+            const double z = node.c1 / (p[1] - p[0]);
+            step = std::max(step, node.c0 * std::sqrt(lab * lab + z * z) * (1 + 1e-12));
+        }
+        // Margin for inexact profiles, whose |b - a| may exceed c1 outside the box.
         step *= std::sqrt(2.0);
         break;
     }
@@ -582,6 +689,33 @@ void derive(rsdf_graph &graph, Node &node, const std::string &where) {
     node.ratio = std::max(ratio, 1e-300);
     node.lipschitz = lipschitz;
     node.step_lipschitz = std::max(step, lipschitz);
+
+    // Exactness and regional stepping bounds (see Node::exact, Node::regional).
+    bool exact = false, regional = false;
+    switch (node.op) {
+    case OP_SPHERE: case OP_BOX: case OP_CYLINDER: case OP_CONE: case OP_CAPSULE: case OP_TORUS:
+    case OP_HALFSPACE: case OP_MESH: case OP_CIRCLE: case OP_RECT: case OP_POLYGON: case OP_SEGMENT:
+    case OP_HALFPLANE:
+        exact = true;
+        break;
+    case OP_TRANSFORM: case OP_TRANSFORM2: case OP_MIRROR: case OP_MIRROR2: case OP_EXTRUDE:
+        exact = child->exact;
+        break;
+    case OP_UNION: case OP_UNION2:  // the minimum of exact distances is the distance to the union
+        exact = p[0] == 0;
+        for (uint32_t i = 0; i < node.child_count; ++i) exact = exact && graph.nodes[kids[i]].exact;
+        break;
+    default: break;
+    }
+    // A twist of an exact child keeps its stepping bound everywhere: outside
+    // the child's cylinder its gradient points away from a point inside it.
+    // An exact loft's |b - a| stays below D everywhere.
+    if (node.op == OP_TWIST) regional = !child->exact;
+    else if (node.op == OP_LOFT) regional = !(graph.nodes[kids[0]].exact && graph.nodes[kids[1]].exact);
+    else
+        for (uint32_t i = 0; i < node.child_count; ++i) regional = regional || graph.nodes[kids[i]].regional;
+    node.exact = exact;
+    node.regional = regional;
 }
 
 // ------------------------------------------------------------------ child trees
@@ -661,6 +795,63 @@ void build_child_tree(rsdf_graph &graph, Node &node) {
     node.child_tree = static_cast<uint32_t>(graph.child_trees.size());
 }
 
+// ------------------------------------------------------------------ fields
+
+// Field nodes have no bounds or Lipschitz bound of their own (an IMPLICIT
+// node proves one over its box).
+void derive_field(Node &node) {
+    for (int a = 0; a < 3; ++a) {
+        node.lo[a] = -kInf;
+        node.hi[a] = kInf;
+    }
+    node.ratio = 1;
+    node.lipschitz = node.step_lipschitz = kInf;
+}
+
+uint32_t attach_tape(rsdf_graph &graph, uint32_t root) {
+    graph.tapes.emplace_back();
+    build_tape(graph, root, graph.tapes.back());
+    return static_cast<uint32_t>(graph.tapes.size());
+}
+
+// What evaluating a tape costs: frames nested below it, point buffers held
+// (its slots plus the deepest shape it reads), node visits per point (each
+// field node once, plus every shape it reads), and whether its queries sort.
+struct TapeCost {
+    uint32_t depth = 0, live = 0;
+    uint64_t visits = 0;
+    bool sorts = false;
+};
+
+TapeCost tape_cost(const rsdf_graph &graph, const FieldTape &tape, const std::vector<uint32_t> &depth,
+                   const std::vector<uint32_t> &live, const std::vector<uint64_t> &visits) {
+    TapeCost cost;
+    cost.live = tape.slots;
+    cost.visits = 1 + tape.code.size();
+    for (const FieldTape::Instr &ins : tape.code) {
+        if (ins.op != FieldTape::kShape && ins.op != OP_EVAL_AT) continue;
+        const uint32_t shape = ins.op == OP_EVAL_AT ? ins.shape : ins.node;
+        cost.depth = std::max(cost.depth, depth[shape] + 1);
+        cost.live = std::max(cost.live, tape.slots + live[shape]);
+        cost.visits = std::min(cost.visits + visits[shape], kMaxVisits + 1);
+        cost.sorts = cost.sorts || graph.nodes[shape].sorts_queries;
+    }
+    cost.sorts = cost.sorts || cost.visits >= 64;
+    return cost;
+}
+
+void check_cost(const std::string &where, uint64_t visits, uint32_t depth, uint32_t live) {
+    if (visits > kMaxVisits)
+        throw Error(where + format(": evaluating it would visit more than %llu nodes per point (a shared "
+                                   "subgraph is evaluated once for every path to it); share less or "
+                                   "flatten repeated booleans",
+                                   static_cast<unsigned long long>(kMaxVisits)));
+    if (depth > kMaxDepth) throw Error(where + format(": nesting depth exceeds the limit of %u levels", kMaxDepth));
+    if (live > kMaxLiveBuffers)
+        throw Error(where + format(": nesting keeps more than %u point buffers alive during evaluation",
+                                   kMaxLiveBuffers));
+}
+
 std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
     if (!bytes) throw Error("RSDF data pointer is null");
     if (length < 16) throw Error(format("RSDF data is truncated: %zu bytes is shorter than the 16-byte header", length));
@@ -682,6 +873,13 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
     graph->nodes.resize(count);
     std::vector<uint32_t> depth(count), live(count);  // nesting levels and live buffers below each node
     std::vector<uint64_t> visits(count);                // node visits per evaluated point, saturating
+    std::vector<uint32_t> consumers(count);             // nodes reading each node
+    // IMPLICIT proofs by the field's tape (its operations, constants, operand
+    // slots and shape reads, so separately built copies of one field match)
+    // and analysis box: an index into graph->proofs, and each proof's
+    // IMPLICIT nodes (the first one names it).
+    std::map<std::pair<std::string, std::array<double, 6>>, uint32_t> proof_keys;
+    std::vector<std::vector<uint32_t>> proof_nodes;
     for (uint32_t index = 0; index < count; ++index) {
         if (reader.remaining() < 16) throw Error(format("RSDF data is truncated in the record of node %u", index));
         Node &node = graph->nodes[index];
@@ -693,18 +891,20 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
         if (!info) throw Error(format("node %u: unknown opcode %u", index, node.op));
         const std::string where = format("node %u (%s)", index, info->name);
         node.dim = info->dim;
+        node.field = info->field;
         if (node_reserved != 0) throw Error(where + format(": reserved field is %u (expected 0)", node_reserved));
         if (node.child_count > kMaxChildren)
             throw Error(where + format(": %u children exceed the limit of %u", node.child_count, kMaxChildren));
         if (node.param_count > (node.op == OP_MESH ? kMaxMeshParams : kMaxParams))
             throw Error(where + format(": %u parameters exceed the limit of %u", node.param_count,
                                        node.op == OP_MESH ? kMaxMeshParams : kMaxParams));
-        static const uint32_t kExactChildren[] = {0, 1, 2};
+        static const uint32_t kExactChildren[] = {0, 1, 2, 0, 4};
         if (info->children == CHILDREN ? node.child_count == 0 : node.child_count != kExactChildren[info->children])
             throw Error(where + format(": has %u children; expected %s", node.child_count,
                                        info->children == CHILDREN ? "at least 1"
                                        : info->children == NO_CHILDREN ? "0"
-                                       : info->children == ONE_CHILD ? "1" : "2"));
+                                       : info->children == ONE_CHILD ? "1"
+                                       : info->children == TWO_CHILDREN ? "2" : "4"));
         if (info->params == -2 ? false
             : info->params >= 0 ? node.param_count != static_cast<uint32_t>(info->params)
                               : (node.param_count < 6 || node.param_count % 2 != 0))
@@ -722,10 +922,18 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
             const uint32_t child = reader.u32();
             if (child >= index)
                 throw Error(where + format(": child %u refers to node %u, which does not precede it", i, child));
-            const uint32_t child_dim = graph->nodes[child].dim;
-            if (child_dim != info->child_dim)
-                throw Error(where + format(": child %u (node %u) is %uD but must be %uD", i, child, child_dim,
+            const Node &kid = graph->nodes[child];
+            if (kid.dim != info->child_dim)
+                throw Error(where + format(": child %u (node %u) is %uD but must be %uD", i, child, kid.dim,
                                            static_cast<uint32_t>(info->child_dim)));
+            if (kid.field && !node.field && node.op != OP_IMPLICIT)
+                throw Error(where + format(": child %u (node %u) is a field (%s); a field becomes a shape only "
+                                           "through IMPLICIT", i, child, op_name(kid.op)));
+            if (kid.field && node.op == OP_EVAL_AT && i == 0)
+                throw Error(where + format(": child 0 (node %u) is a field (%s) but must be a shape (EVAL_AT "
+                                           "evaluates a shape at the point its other children give)",
+                                           child, op_name(kid.op)));
+            ++consumers[child];
             graph->children.push_back(child);
         }
         node.first_param = graph->params.size();
@@ -736,6 +944,71 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
         }
         const double *params = graph->param_values(node);
         validate_params(node, params, Checker(where, params));
+        if (node.field) {
+            derive_field(node);
+            visits[index] = 1;  // fields are costed through their tapes
+            continue;
+        }
+        if (node.op == OP_IMPLICIT) {
+            // Compile the field (shared with the field node itself), cost it,
+            // then prove its slope bound L over the bounds.
+            const uint32_t child = graph->children[node.first_child];
+            Node &kid = graph->nodes[child];
+            const bool fresh = !(kid.field && kid.tape);
+            const uint32_t tape_index = kid.field && kid.tape ? kid.tape : attach_tape(*graph, child);
+            if (kid.field) kid.tape = tape_index;
+            node.tape = tape_index;
+            FieldTape &tape = graph->tapes[tape_index - 1];
+            const TapeCost cost = tape_cost(*graph, tape, depth, live, visits);
+            tape.visits = cost.visits;
+            if (kid.field && fresh) {
+                check_cost(format("node %u (%s)", child, op_name(kid.op)), cost.visits, cost.depth, cost.live);
+                kid.depth = cost.depth;
+                kid.live_buffers = cost.live;
+                kid.sorts_queries = cost.sorts;
+            }
+            depth[index] = cost.depth;
+            live[index] = cost.live + 3;  // the clamped point
+            visits[index] = std::min(cost.visits + 1, kMaxVisits + 1);
+            check_cost(where, visits[index], depth[index], live[index]);
+            node.depth = depth[index];
+            node.live_buffers = live[index];
+            node.sorts_queries = cost.sorts;
+            double analysis_lo[3], analysis_hi[3];
+            implicit_analysis_box(params, params + 3, analysis_lo, analysis_hi);
+            std::pair<std::string, std::array<double, 6>> key{
+                std::string(), {analysis_lo[0], analysis_lo[1], analysis_lo[2], analysis_hi[0], analysis_hi[1], analysis_hi[2]}};
+            for (const FieldTape::Instr &ins : tape.code) {
+                const uint32_t shape = ins.op == FieldTape::kShape ? ins.node : ins.op == OP_EVAL_AT ? ins.shape : 0;
+                const uint32_t head[4] = {ins.op, ins.dst, ins.count, shape};
+                key.first.append(reinterpret_cast<const char *>(head), sizeof head);
+                key.first.append(reinterpret_cast<const char *>(&ins.p0), sizeof ins.p0);
+                key.first.append(reinterpret_cast<const char *>(&ins.p1), sizeof ins.p1);
+                key.first.append(reinterpret_cast<const char *>(tape.args.data() + ins.first), 4 * size_t(ins.count));
+            }
+            key.first.append(reinterpret_cast<const char *>(&tape.result), sizeof tape.result);
+            const auto proof = proof_keys.emplace(key, static_cast<uint32_t>(proof_nodes.size()));
+            if (proof.second) {
+                if (tape.visits > kMaxProvenVisits)
+                    throw Error(where + format(": its field costs %llu node visits per point; a slope bound can be "
+                                               "proven only for fields of at most %llu",
+                                               static_cast<unsigned long long>(tape.visits),
+                                               static_cast<unsigned long long>(kMaxProvenVisits)));
+                proof_nodes.emplace_back();
+            }
+            proof_nodes[proof.first->second].push_back(index);
+            node.proof = proof.first->second + 1;  // L (c0, c1) is proven once every node is read
+            // max(f(clamp(p, B)) / L, box_B(p)) (hypot outside B, see
+            // evaluate.cpp): bounded by B, 1-Lipschitz, at least the distance
+            // to B outside it.
+            for (int a = 0; a < 3; ++a) {
+                node.lo[a] = params[a];
+                node.hi[a] = params[3 + a];
+            }
+            node.ratio = 1;
+            node.lipschitz = node.step_lipschitz = 1;
+            continue;
+        }
         if (node.op == OP_POLYGON) {
             node.polygon = static_cast<uint32_t>(graph->polygons.size());
             graph->polygons.emplace_back();
@@ -782,10 +1055,85 @@ std::unique_ptr<rsdf_graph> parse(const uint8_t *bytes, size_t length) {
     }
     if (reader.remaining() != 0)
         throw Error(format("RSDF data has %zu unexpected trailing bytes after the last node", reader.remaining()));
+    // Prove each distinct IMPLICIT field, in node order (a field reading an
+    // implicit solid uses its L), within the graph's proof work. Every proof
+    // evaluates at least one box and its centre (2v visits for a tape of v
+    // visits per point), so a graph whose proofs cannot all afford that fails
+    // at once. Otherwise a proof gets its default budget or one box plus an
+    // equal share of the work beyond the later proofs' first boxes, whichever
+    // is smaller, and is charged the boxes it evaluates: work a proof leaves
+    // goes to later ones, and many distinct fields load with looser bounds.
+    const size_t proof_count = proof_nodes.size();
+    graph->proofs.resize(proof_count);
+    std::vector<uint64_t> first_box(proof_count);
+    uint64_t needed = 0;
+    for (size_t i = 0; i < proof_count; ++i) {
+        first_box[i] = 2 * std::max<uint64_t>(graph->tapes[graph->nodes[proof_nodes[i].front()].tape - 1].visits, 1);
+        needed += first_box[i];
+    }
+    if (needed > kProofWork) {
+        size_t first = 0;  // the first proof the work cannot pay for
+        for (uint64_t sum = first_box[0]; sum <= kProofWork;) sum += first_box[++first];
+        const uint32_t index = proof_nodes[first].front();
+        throw Error(format("node %u (%s): proving the slope bounds of this design's %zu distinct IMPLICIT fields "
+                           "needs at least %llu node visits (a box and its centre each), more than the %llu one "
+                           "design may spend; use fewer or smaller fields (one implicit() over a whole lattice, "
+                           "or one field whose parameters vary with position), or place copies of one implicit "
+                           "solid",
+                           index, op_name(graph->nodes[index].op), proof_count,
+                           static_cast<unsigned long long>(needed), static_cast<unsigned long long>(kProofWork)));
+    }
+    uint64_t spare = kProofWork - needed;  // the work beyond the first boxes of the proofs left
+    for (size_t i = 0; i < proof_count; ++i) {
+        const uint32_t index = proof_nodes[i].front();
+        const Node &node = graph->nodes[index];
+        const std::string where = format("node %u (%s)", index, op_name(node.op));
+        const FieldTape &tape = graph->tapes[node.tape - 1];
+        const uint64_t alone = field_budget(tape);
+        const uint64_t budget = std::min(alone, 1 + spare / (proof_count - i) / first_box[i]);
+        const double *params = graph->param_values(node);
+        double analysis_lo[3], analysis_hi[3];
+        implicit_analysis_box(params, params + 3, analysis_lo, analysis_hi);
+        FieldBound bound = analyze_field(*graph, tape, analysis_lo, analysis_hi, budget);
+        if (!bound.ok) {
+            std::string problem = bound.problem;
+            if (budget < alone)
+                problem += format("; its share of the proof work of this design's %zu distinct IMPLICIT fields was "
+                                  "%llu boxes of the %llu it gets alone",
+                                  proof_count, static_cast<unsigned long long>(budget),
+                                  static_cast<unsigned long long>(alone));
+            throw Error(where + ": its field has no finite slope bound over its bounds: " + problem);
+        }
+        spare -= (bound.boxes - 1) * first_box[i];  // at most spare / (proof_count - i)
+        for (uint32_t member : proof_nodes[i]) {
+            Node &implicit = graph->nodes[member];
+            implicit.c1 = bound.bound;
+            implicit.c0 = bound.bound > 0 ? bound.bound : 1.0;  // a constant field needs no scaling
+        }
+        graph->proofs[i].bound = std::move(bound);
+    }
+    // Field roots (read by no node) can be queried and analysed directly.
+    for (uint32_t index = 0; index < count; ++index) {
+        Node &node = graph->nodes[index];
+        if (!node.field || node.tape || consumers[index] != 0) continue;
+        node.tape = attach_tape(*graph, index);
+        const TapeCost cost = tape_cost(*graph, graph->tapes[node.tape - 1], depth, live, visits);
+        graph->tapes[node.tape - 1].visits = cost.visits;
+        check_cost(format("node %u (%s)", index, op_name(node.op)), cost.visits, cost.depth, cost.live);
+        node.depth = cost.depth;
+        node.live_buffers = cost.live;
+        node.sorts_queries = cost.sorts;
+    }
     return graph;
 }
 
 }  // namespace
+
+const char *op_name(uint32_t op) {
+    const OpInfo *info = find_op(op);
+    return info ? info->name : "?";
+}
+
 }  // namespace rsdf
 
 using namespace rsdf;
@@ -813,6 +1161,9 @@ int rsdf_node_dimension(const rsdf_graph *graph, uint32_t node) {
 int rsdf_bounds(const rsdf_graph *graph, uint32_t node, double *lo, double *hi, double *lipschitz) {
     return guarded([&] {
                const Node &n = checked_node(checked_graph(graph), node);
+               if (n.field)
+                   throw Error(format("node %u (%s) is a field, which has no bounds; IMPLICIT makes a field a "
+                                      "bounded shape", node, op_name(n.op)));
                for (uint32_t a = 0; a < n.dim; ++a) {
                    if (lo) lo[a] = n.lo[a];
                    if (hi) hi[a] = n.hi[a];

@@ -38,8 +38,8 @@ class MeshStats(ctypes.Structure):
     _fields_ = [("vertex_count", ctypes.c_uint64), ("triangle_count", ctypes.c_uint64),
                 ("crease_segment_count", ctypes.c_uint64), ("active_cells", ctypes.c_uint64),
                 ("boundary_edges", ctypes.c_uint64), ("nonmanifold_edges", ctypes.c_uint64),
-                ("components", ctypes.c_uint64), ("volume", ctypes.c_double), ("area", ctypes.c_double),
-                ("centroid", ctypes.c_double * 3), ("bounds_lo", ctypes.c_double * 3),
+                ("components", ctypes.c_uint64), ("cavities", ctypes.c_uint64), ("volume", ctypes.c_double),
+                ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double), ("centroid", ctypes.c_double * 3), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
                 ("seconds", ctypes.c_double)]
 
@@ -60,7 +60,7 @@ def check_kernel(path):
             ("rsdf_mesh_free", None, [ctypes.c_void_p])]:
         function = getattr(kernel, name)
         function.restype, function.argtypes = restype, argtypes
-    assert kernel.rsdf_abi_version() == 1, kernel.rsdf_abi_version()
+    assert kernel.rsdf_abi_version() == 2, kernel.rsdf_abi_version()
     # RSDF version 1: one SPHERE node (opcode 1, no children, radius 5).
     graph_bytes = b"RSDF" + struct.pack("<III", 1, 1, 0) + struct.pack("<IIIId", 1, 0, 1, 0, 5.0)
     graph = kernel.rsdf_graph_create(graph_bytes, len(graph_bytes))
@@ -87,7 +87,7 @@ def check_kernel(path):
     finally:
         kernel.rsdf_graph_free(graph)
     version = (kernel.rsdf_kernel_version() or b"").decode("utf-8", "replace")
-    return f"SDF kernel {version or 'unknown version'} (ABI 1, evaluation, meshing)"
+    return f"SDF kernel {version or 'unknown version'} (ABI 2, evaluation, meshing)"
 
 
 library = os.environ.get("RAD_SDF_LIBRARY")

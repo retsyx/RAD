@@ -177,25 +177,92 @@ final class EngineService {
     func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int,
                       validatedHash: String? = nil) async throws -> PreviewMesh {
         let output = try await run(python: python, threads: threads, scriptMode: true, validatedHash: validatedHash) { folder in
-            var staged: [EngineWorkerRequest.InputAsset] = []
-            if let assets = spec.inputAssets, !assets.isEmpty {
-                guard assets.count <= 256, Set(assets.map(\.id)).count == assets.count else {
-                    throw RADError.message("The design contains too many or duplicate imported geometry inputs.")
-                }
-                for (index, asset) in assets.enumerated() {
-                    guard CADInputAsset.supportedFormats.contains(asset.format), !asset.data.isEmpty,
-                          asset.data.count <= ProjectStore.maximumAssetBytes else {
-                        throw RADError.message("An imported geometry input is invalid or exceeds 512 MB.")
-                    }
-                    let name = String(format: "input-%03d", index) + ".\(asset.format)"
-                    try asset.data.write(to: folder.appendingPathComponent(name), options: .atomic)
-                    staged.append(.init(id: asset.id, name: asset.name, format: asset.format, path: name))
-                }
-            }
-            try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
-                                          inputAssets: staged, print: print).write(to: folder)
+            try Self.stageBuild(spec, print: print, verifyFields: false, in: folder)
         }
         return try await readPreview(output)
+    }
+
+    /// Writes a program request and its imported inputs into a build folder.
+    nonisolated private static func stageBuild(_ spec: ModelSpec, print: Bool, verifyFields: Bool, in folder: URL) throws {
+        var staged: [EngineWorkerRequest.InputAsset] = []
+        if let assets = spec.inputAssets, !assets.isEmpty {
+            guard assets.count <= 256, Set(assets.map(\.id)).count == assets.count else {
+                throw RADError.message("The design contains too many or duplicate imported geometry inputs.")
+            }
+            for (index, asset) in assets.enumerated() {
+                guard CADInputAsset.supportedFormats.contains(asset.format), !asset.data.isEmpty,
+                      asset.data.count <= ProjectStore.maximumAssetBytes else {
+                    throw RADError.message("An imported geometry input is invalid or exceeds 512 MB.")
+                }
+                let name = String(format: "input-%03d", index) + ".\(asset.format)"
+                try asset.data.write(to: folder.appendingPathComponent(name), options: .atomic)
+                staged.append(.init(id: asset.id, name: asset.name, format: asset.format, path: name))
+            }
+        }
+        try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
+                                      inputAssets: staged, print: print, verifyFields: verifyFields).write(to: folder)
+    }
+
+    /// The custom fields (implicit() shapes) of a program as its build would
+    /// prove them, without meshing: one record per shape, at most 64.
+    struct FieldVerification: Decodable, Sendable, Equatable {
+        /// rad_verify analyses at most this many implicit() shapes (the
+        /// worker's `MAX_VERIFIED_FIELDS`).
+        static let maximumFields = 64
+        /// The verification result carries the design's part tree (up to
+        /// 8,192 nodes with 1,024-byte ids and 160-character names, escaped).
+        static let maximumResultBytes = 64_000_000
+        struct Field: Decodable, Sendable, Equatable {
+            struct Gradient: Decodable, Sendable, Equatable {
+                var min: Double
+                var median: Double
+                var max: Double
+            }
+            var solids: [Int]
+            var line: Int?
+            var bounds: [Double]
+            var ok: Bool
+            /// The proven upper bound of |grad f| over the bounds.
+            var slopeBound: Double?
+            var valueRange: [Double]?
+            var gradient: Gradient?
+            /// Median sampled |grad f| / slopeBound.
+            var quality: Double?
+            var boxes: Int?
+            /// Without a finite slope bound: what fails, and where.
+            var message: String?
+            var region: [Double]?
+        }
+        var solids: Int
+        var parts: [PartNode]?
+        var fields: [Field]
+        /// Every implicit() shape of the design, including any beyond `fields`.
+        var fieldCount: Int
+    }
+
+    /// Run a program's custom field verification (rad_verify) in the build sandbox.
+    func verifyFields(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int) async throws -> FieldVerification {
+        let output = try await run(python: python, threads: threads, scriptMode: true,
+                                   action: "verify this design's custom fields") { folder in
+            try Self.stageBuild(spec, print: print, verifyFields: true, in: folder)
+        }
+        let folder = output.folder
+        let data = try await Task.detached(priority: .userInitiated) {
+            try EngineArtifact.read(folder.appendingPathComponent("result.json"), in: folder,
+                                    maximumBytes: FieldVerification.maximumResultBytes)
+        }.value
+        guard output.token == generation, !Task.isCancelled else { throw CancellationError() }
+        let result = try JSONDecoder().decode(FieldVerification.self, from: data)
+        guard (1...4_096).contains(result.solids), (0...4_000_000).contains(result.fieldCount),
+              result.fields.count <= min(FieldVerification.maximumFields, result.fieldCount),
+              result.fields.allSatisfy({ field in
+                  !field.solids.isEmpty && field.solids.allSatisfy { (0..<result.solids).contains($0) } &&
+                  field.bounds.count == 6 && field.bounds.allSatisfy(\.isFinite) &&
+                  (field.ok ? field.slopeBound.map { $0.isFinite && $0 >= 0 } == true : field.message?.isEmpty == false)
+              }) else {
+            throw RADError.message("The CAD engine returned an invalid custom field report.")
+        }
+        return result
     }
 
     func runtimeInfo(python: String, threads: Int) async throws -> CADRuntime {
@@ -440,7 +507,10 @@ final class EngineService {
             var closed: Bool
             var boundaryEdges: Int
             var nonmanifoldEdges: Int
+            /// Separate pieces (outward surfaces); sealed voids are `cavities`.
             var components: Int
+            var cavities: Int? = nil
+            var previewCavities: Int? = nil
             var volume: Double
             var previewVolume: Double
             /// Relative change from the preview volume.
@@ -453,7 +523,8 @@ final class EngineService {
     }
 
     /// Re-mesh every part at `cellSize` (nil: half the preview cell size) and
-    /// report open, non-manifold, split or vanishing surfaces and volume changes.
+    /// report open, non-manifold, split or vanishing surfaces, cavities that
+    /// open or close, and volume changes.
     func validate(_ preview: PreviewMesh, cellSize: Double? = nil, python: String, threads: Int) async throws -> Validation {
         if let cellSize { guard cellSize.isFinite, cellSize > 0 else { throw RADError.message("The validation cell size must be positive.") } }
         let source = try nativeSource(preview)
@@ -466,8 +537,8 @@ final class EngineService {
             let result = try JSONDecoder().decode(Validation.self, from: data)
             guard result.cellSize.isFinite, result.cellSize > 0, result.parts.map(\.solid) == Array(0..<solidCount),
                   result.parts.allSatisfy({ part in
-                      part.boundaryEdges >= 0 && part.nonmanifoldEdges >= 0 && part.components >= 0 &&
-                      [part.volume, part.previewVolume, part.volumeChange].allSatisfy(\.isFinite)
+                      part.boundaryEdges >= 0 && part.nonmanifoldEdges >= 0 && part.components >= 0 && (part.cavities ?? 0) >= 0 &&
+                      (part.previewCavities ?? 0) >= 0 && [part.volume, part.previewVolume, part.volumeChange].allSatisfy(\.isFinite)
                   }),
                   result.warnings.count <= 256, result.warnings.allSatisfy({ $0.utf8.count <= 4_096 }) else {
                 throw RADError.message("The CAD engine returned an invalid validation report.")

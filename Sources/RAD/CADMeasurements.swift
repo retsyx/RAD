@@ -29,11 +29,13 @@ struct CADPart: Codable, Sendable, Equatable {
     var bounds: [Double]
     var centroid: [Double]
     var triangles: Int
-    /// Disconnected pieces of this one rigid part.
+    /// Disconnected pieces of this one rigid part (outward surfaces).
     var components: Int
+    /// Sealed internal voids (surfaces enclosing negative volume).
+    var cavities: Int? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case solidIndex = "solid", area, volume, bounds, centroid, triangles, components
+        case solidIndex = "solid", area, volume, bounds, centroid, triangles, components, cavities
     }
 }
 

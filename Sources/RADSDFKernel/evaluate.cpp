@@ -44,6 +44,7 @@ public:
     }
     size_t top() const { return top_; }
     void release(size_t mark) { top_ = mark; }
+    double *block(size_t index) const { return blocks_[index]; }  // a buffer taken earlier (index < top())
 
     void reset() {
         top_ = 0;
@@ -463,11 +464,170 @@ void finish_unary(const Node &node, const double *p, int n, const double *z, dou
     }
 }
 
+// |(a mod 2P) - P| with the floored remainder: fmod is exact and cannot
+// overflow (a / 2P can for tiny periods), so values lie in [0, P].
+inline double triwave(double a, double period) {
+    const double twice = 2 * period;
+    double rest = std::fmod(a, twice);
+    if (rest < 0) rest += twice;
+    return std::fabs(rest - period);
+}
+
+// One instruction of a field tape (not a shape read) over n points.
+template <class Operand>
+void run_instruction(const FieldTape::Instr &ins, const uint32_t *args, int n, const Operand &operand, double *out) {
+    const double *a = ins.count ? operand(args[0]) : nullptr;
+    const double *b = ins.count > 1 ? operand(args[1]) : nullptr;
+    switch (ins.op) {
+    case OP_CONST: for (int i = 0; i < n; ++i) out[i] = ins.p0; break;
+    case OP_ADD: for (int i = 0; i < n; ++i) out[i] = a[i] + b[i]; break;
+    case OP_SUB: for (int i = 0; i < n; ++i) out[i] = a[i] - b[i]; break;
+    case OP_MUL: for (int i = 0; i < n; ++i) out[i] = a[i] * b[i]; break;
+    case OP_DIV: for (int i = 0; i < n; ++i) out[i] = a[i] / b[i]; break;
+    case OP_NEG: for (int i = 0; i < n; ++i) out[i] = -a[i]; break;
+    case OP_ABS: for (int i = 0; i < n; ++i) out[i] = std::fabs(a[i]); break;
+    case OP_SQUARE: for (int i = 0; i < n; ++i) out[i] = a[i] * a[i]; break;
+    case OP_SQRT: for (int i = 0; i < n; ++i) out[i] = std::sqrt(a[i]); break;
+    case OP_SIN: for (int i = 0; i < n; ++i) out[i] = std::sin(a[i]); break;
+    case OP_COS: for (int i = 0; i < n; ++i) out[i] = std::cos(a[i]); break;
+    case OP_EXP: for (int i = 0; i < n; ++i) out[i] = std::exp(a[i]); break;
+    case OP_LOG: for (int i = 0; i < n; ++i) out[i] = std::log(a[i]); break;
+    case OP_POWC: {
+        const double e = ins.p0;
+        if (e == 2) for (int i = 0; i < n; ++i) out[i] = a[i] * a[i];
+        else for (int i = 0; i < n; ++i) out[i] = std::pow(a[i], e);
+        break;
+    }
+    case OP_ATAN2: for (int i = 0; i < n; ++i) out[i] = std::atan2(a[i], b[i]); break;
+    case OP_MIN: case OP_MAX: {
+        const bool lowest = ins.op == OP_MIN;
+        for (int i = 0; i < n; ++i) out[i] = a[i];
+        for (uint32_t k = 1; k < ins.count; ++k) {
+            const double *c = operand(args[k]);
+            if (lowest) for (int i = 0; i < n; ++i) out[i] = std::fmin(out[i], c[i]);
+            else for (int i = 0; i < n; ++i) out[i] = std::fmax(out[i], c[i]);
+        }
+        break;
+    }
+    case OP_CLAMP:
+        for (int i = 0; i < n; ++i) out[i] = std::fmin(std::fmax(a[i], ins.p0), ins.p1);
+        break;
+    case OP_LENGTH: {
+        for (int i = 0; i < n; ++i) out[i] = a[i] * a[i];
+        for (uint32_t k = 1; k < ins.count; ++k) {
+            const double *c = operand(args[k]);
+            for (int i = 0; i < n; ++i) out[i] += c[i] * c[i];
+        }
+        for (int i = 0; i < n; ++i) out[i] = std::sqrt(out[i]);
+        break;
+    }
+    case OP_TRIWAVE: for (int i = 0; i < n; ++i) out[i] = triwave(a[i], ins.p0); break;
+    case OP_SMIN: case OP_SMAX: {  // the polynomial smooth minimum of the booleans; smax(a, b) = -smin(-a, -b)
+        const double k = ins.p0, sign = ins.op == OP_SMIN ? 1.0 : -1.0;
+        for (int i = 0; i < n; ++i) {
+            const double u = sign * a[i], v = sign * b[i];
+            const double h = k > 0 ? std::fmax(k - std::fabs(u - v), 0.0) / k : 0.0;
+            out[i] = sign * (std::fmin(u, v) - h * h * k * 0.25);
+        }
+        break;
+    }
+    default: throw Error(format("internal error: field opcode %u in a tape", ins.op));
+    }
+}
+
+// Advances the frame of an IMPLICIT node or a queried field root through its
+// tape. The frame's buffers are the clamped point (IMPLICIT only) and the
+// tape's slots; a shape read (at the base point, or at EVAL_AT's point)
+// pushes the shape's frame, writing into the instruction's slot, and the
+// frame resumes after it (Frame::stage is 1 + the next instruction).
+bool run_tape(const rsdf_graph &graph, Scratch &s, Frame &f, const Node &node, const double *p) {
+    const FieldTape &tape = graph.tapes[node.tape - 1];
+    const bool implicit = node.op == OP_IMPLICIT;
+    const int n = f.n;
+    const size_t first_slot = f.mark + (implicit ? 3 : 0);
+    if (f.stage == 0) {
+        if (implicit) {
+            double *c[3] = {s.take(), s.take(), s.take()};
+            const double *q[3] = {f.x, f.y, f.z};
+            for (int a = 0; a < 3; ++a)
+                for (int i = 0; i < n; ++i) c[a][i] = std::fmin(std::fmax(q[a][i], p[a]), p[3 + a]);
+        }
+        for (uint32_t k = 0; k < tape.slots; ++k) s.take();
+        f.stage = 1;
+    }
+    const double *base[3] = {f.x, f.y, f.z};
+    if (implicit)
+        for (int a = 0; a < 3; ++a) base[a] = s.block(f.mark + a);
+    const auto operand = [&](uint32_t k) -> const double * {
+        return k < 3 ? base[k] : s.block(first_slot + k - 3);
+    };
+    const uint32_t *args = tape.args.data();
+    if (!implicit && f.stage >= 2 && tape.code[f.stage - 2].op == OP_EVAL_AT) {
+        // A field root's warp is unproven: a shape read at a point that is
+        // not finite or beyond 1e150 (the query limit) has no value there.
+        // (A destination never shares a slot with its own operands.)
+        const FieldTape::Instr &at = tape.code[f.stage - 2];
+        double *dst = s.block(first_slot + at.dst - 3);
+        for (int k = 0; k < 3; ++k) {
+            const double *c = operand(args[at.first + k]);
+            for (int i = 0; i < n; ++i)
+                if (!(std::fabs(c[i]) <= 1e150)) dst[i] = NAN;
+        }
+    }
+    for (size_t pc = f.stage - 1; pc < tape.code.size(); ++pc) {
+        const FieldTape::Instr &ins = tape.code[pc];
+        double *dst = s.block(first_slot + ins.dst - 3);
+        if (ins.op == FieldTape::kShape) {
+            f.stage = static_cast<uint32_t>(pc + 2);
+            push(s, ins.node, n, base[0], base[1], base[2], dst);
+            return false;
+        }
+        if (ins.op == OP_EVAL_AT) {
+            const uint32_t *at = args + ins.first;
+            f.stage = static_cast<uint32_t>(pc + 2);
+            push(s, ins.shape, n, operand(at[0]), operand(at[1]), operand(at[2]), dst);
+            return false;
+        }
+        run_instruction(ins, args + ins.first, n, operand, dst);
+    }
+    const double *value = operand(tape.result);
+    double *out = f.out;
+    if (!implicit) {
+        std::copy(value, value + n, out);
+        return true;
+    }
+    // h = f(c) / L at c = clamp(p, B), and the exact distance d = box_B(p) to
+    // the box B: max(h, d), except outside B where h > 0, which takes
+    // hypot(h, d) = |(h, p - c)|. That stays 1-Lipschitz (h is, in c, and
+    // projecting onto a convex set gives |c - c'|^2 + |(p - c) - (p' - c')|^2
+    // <= |p - p'|^2) and keeps a gradient away from the solid outside B.
+    const double L = node.c0;
+    double center[3], half[3];
+    for (int a = 0; a < 3; ++a) {
+        center[a] = 0.5 * (p[a] + p[3 + a]);
+        half[a] = 0.5 * (p[3 + a] - p[a]);
+    }
+    for (int i = 0; i < n; ++i) {
+        const double qx = std::fabs(f.x[i] - center[0]) - half[0];
+        const double qy = std::fabs(f.y[i] - center[1]) - half[1];
+        const double qz = std::fabs(f.z[i] - center[2]) - half[2];
+        const double ox = std::fmax(qx, 0.0), oy = std::fmax(qy, 0.0), oz = std::fmax(qz, 0.0);
+        const double box = std::sqrt(ox * ox + oy * oy + oz * oz) + std::fmin(std::fmax(qx, std::fmax(qy, qz)), 0.0);
+        const double h = value[i] / L;
+        out[i] = h > 0 && box > 0 ? std::hypot(h, box) : std::fmax(h, box);
+    }
+    return true;
+}
+
 // Advances frame `f`. Returns true when the frame's values are complete.
 // Pushing a child invalidates `f`, so every push is the last action.
 bool step(const rsdf_graph &graph, Scratch &s, Frame &f) {
     const Node &node = graph.nodes[f.node];
     const double *p = graph.param_values(node);
+    if (node.tape) return run_tape(graph, s, f, node, p);
+    if (node.field)
+        throw Error(format("node %u (%s) is a field read by other fields; query its root field or its IMPLICIT node",
+                           f.node, op_name(node.op)));
     const int n = f.n;
     const double *x = f.x, *y = f.y, *z = f.z;
     double *out = f.out;

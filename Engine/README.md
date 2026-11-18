@@ -90,12 +90,18 @@ publishes its outputs, each written to a temporary name and renamed:
 - `result.json`, written last: `buildID` (a random UUID), `artifactPath`
   (absolute path of `model.rsdf`), `partRoots` (RSDF node of each part),
   `bounds`, `volume`, `area`, `solids`, `parts`, `partStats`
-  (`[{solid, volume, area, bounds, centroid, triangles, components}]`), `mesh`
+  (`[{solid, volume, area, bounds, centroid, triangles, components,
+  cavities}]`: separate pieces and sealed internal voids), `mesh`
   (`{cellSize, boundaryEdges, nonmanifoldEdges}`), optional `assemblyMotion`,
-  `printVersion`, `printDown` and `referenceSolids`, `validatedHash`,
-  `buildSeconds`, `threads`,
+  `printVersion`, `printDown`, `referenceSolids` and `customFields`,
+  `validatedHash`, `buildSeconds`, `threads`,
   `runtime` (`{python, numpy, kernel}`), `warnings` and `meshBuffers` (the
-  section offsets and value counts of `mesh.bin`).
+  section offsets and value counts of `mesh.bin`). `customFields` lists the
+  first 32 `implicit()` shapes (custom fields) as `{solids, line?, bounds,
+  slopeBound, quality}`: the parts that read the shape, the program line that
+  made it, its bounds, the slope bound the kernel proved and divides the field
+  by, and median sampled slope / bound (1 for a true distance); more shapes
+  add a warning.
 
 Bounds are the exact extremes of the Float32 vertex positions; volumes, areas,
 centroids and piece counts come from the kernel's mesh statistics. The preview
@@ -103,9 +109,21 @@ cell size is the design's largest extent over 256, coarsened (with a warning)
 until the predicted mesh fits one million triangles, one million vertices and
 250,000 crease segments. A part whose mesh is empty, open or encloses no volume
 is a design error naming the part and suggesting thicker features. Non-manifold
-edges and parts with several disconnected pieces add warnings. Failed builds
+edges and parts with several disconnected pieces add warnings (sealed cavities
+are voids inside a piece, not pieces). Failed builds
 leave no outputs besides `error.json`. The CLI prints
 `{"status": "complete", "solids": N}` on success.
+
+A request with `verifyFields: true` (rad_verify) runs the program and, instead
+of loading and meshing the design, analyses the field of each of the first 64
+`implicit()` shapes as its load would (`radsdf.verify_field`), so a field
+without a finite slope bound is reported rather than failing. It publishes
+only `result.json`: `solids`, `parts`, `fields` (`{solids, bounds, line?, ok}`
+plus `slopeBound`, `valueRange`, `gradient {min, median, max}`, `quality` and
+`boxes`, or `message` and `region` when no bound exists), `fieldCount`,
+`buildSeconds`, `threads` and `runtime`. A field without a finite slope bound
+fails an ordinary build with a design error naming the part, the
+`implicit()` line, the operation and the region.
 
 Once the app has decoded a build, it deletes everything in the build folder
 except `model.rsdf`, which stays private to the session and is never a design
@@ -151,6 +169,17 @@ result.add(sphere(3, center=(30, 0, 9)), id="knob", name="Knob")
   `"#RRGGBB"`; colors, `print_down` and `reference` pass to descendants and
   attach to physical parts only. `at` is a rigid placement (a 4×4 matrix or
   `Placement(translate=…, rotate=(angle, axis))`) composed from the root down.
+
+- Custom fields: `x`, `y`, `z` are symbolic coordinates; arithmetic, `sin`,
+  `cos`, `exp`, `log`, `sqrt`, `atan2`, `minimum`, `maximum` (with
+  `smooth=k`, the blends of the booleans), `clamp`, `length`, `triwave`,
+  `shape.field` and `shape.at(fx, fy, fz)` record a
+  native expression (field nodes, opcodes 200–223) instead of computing
+  numbers; with numbers these functions return numbers. `implicit(field,
+  bounds)` is the only way a field becomes a solid: the kernel proves a slope
+  bound L over the bounds when the graph loads and uses the field divided by
+  L. `verify_field(field, bounds)` returns that proof. A `result` (or part)
+  that is a field is a design error.
 
 Programs are not a Python-language security boundary. The app runs them in a
 macOS process sandbox (below); apply equivalent isolation when running the
@@ -320,10 +349,12 @@ built coordinates; pair results are posed.
   (SDF-DESIGN.md, "Mesh simplification"). Every part is meshed before any is
   simplified.
 - `validate`: optional `cellSize` → `{ok, cellSize, parts: [{solid, closed,
-  boundaryEdges, nonmanifoldEdges, components, volume, previewVolume,
-  volumeChange}], warnings}`. Every part is re-meshed at half the preview cell
-  size (or `cellSize`); open or non-manifold surfaces, parts that split or
-  vanish, and volume changes above 2% are problems and clear `ok`.
+  boundaryEdges, nonmanifoldEdges, components, cavities, previewCavities,
+  volume, previewVolume, volumeChange}], warnings}`. Every part is re-meshed at
+  half the preview cell size (or `cellSize`); open or non-manifold surfaces,
+  parts that split or vanish (pieces compared without sealed cavities), sealed
+  cavities that open or close, and volume changes above 2% are problems and
+  clear `ok`.
 - `probe`: optional `solids`, up to 65,536 world `points`, optional
   `directions` (one per point) and `maxDistance` → `{solids, samples}`, where
   `samples[i][j]` is `{distance, normal}` of point i for part `solids[j]`; with
@@ -354,8 +385,8 @@ stdio MCP adapter. The native app connects it for each agent invocation and
 serves requests through private descriptor-confined filesystem IPC. Its tools
 are `rad_runtime`, `rad_request_permission`, `rad_versions`, `rad_version`,
 `rad_build`, `rad_inspect`, `rad_get_part_colors`, `rad_set_part_colors`,
-`rad_measure`, `rad_validate`, `rad_render`, `rad_check_motion`,
-`rad_screenshot` and `rad_export_stl`, all implemented in Swift
+`rad_measure`, `rad_validate`, `rad_verify`, `rad_render`, `rad_check_motion`,
+`rad_screenshot`, `rad_export_stl` and `rad_import`, all implemented in Swift
 (`CADAgentTools`) on this worker's builds and native operations.
 `rad_runtime` stages the agent-neutral modeling guide (the end of
 `Sources/RAD/Resources/model-instructions.md`) in the task workspace.

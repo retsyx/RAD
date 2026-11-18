@@ -74,6 +74,7 @@ public:
         vertex_normals();
         split_vertices(mesh);
         analyse_edges(mesh);
+        prune_spurs(mesh);
         statistics(mesh);
         mesh.base_vertices = vertex_count_;
         mesh.interior_normals.assign(tri_normals_.begin(), tri_normals_.end());
@@ -312,6 +313,140 @@ private:
         }
     }
 
+    // Drops crease noise from the displayed lines: beside a sharp edge whose
+    // vertices sit on either side of it (as along twisted edges) a stray mesh
+    // edge or two crease off the line. Chains of crease edges run between
+    // vertices whose crease degree is not 2; a chain shorter than a cell is
+    // dropped when it hangs from a free end to a junction where the junction's
+    // two other lines continue within 30 degrees of straight (a spur beside a
+    // line; short real edges, such as those meeting at a chamfered corner,
+    // meet other lines at a turn) or closes on its own junction, and one
+    // shorter than two cells when it joins two junctions that a shorter chain
+    // also joins (a detour beside the line). The crease edges simplification
+    // reads keep them all.
+    void prune_spurs(rsdf_mesh &mesh) {
+        const size_t count = mesh.crease_edges.size() / 2;
+        const double h = mesh.stats.cell_size;
+        if (count == 0 || !(h > 0)) return;
+        const uint32_t *ends = mesh.crease_edges.data();
+        std::vector<uint32_t> start(vertex_count_ + 1, 0);
+        for (size_t i = 0; i < 2 * count; ++i) ++start[ends[i] + 1];
+        for (size_t v = 0; v < vertex_count_; ++v) start[v + 1] += start[v];
+        std::vector<uint32_t> fill(start.begin(), start.end() - 1), incident(2 * count);
+        for (size_t i = 0; i < 2 * count; ++i) incident[fill[ends[i]]++] = static_cast<uint32_t>(i / 2);
+        auto degree = [&](uint32_t v) { return start[v + 1] - start[v]; };
+        struct Chain {
+            uint32_t from, to, first, last;  // end vertices (from <= to) and end segments
+            double length;
+            std::vector<uint32_t> segments;
+        };
+        std::vector<Chain> chains;  // short chains between vertices of degree other than 2
+        for (size_t v = 0; v < vertex_count_; ++v) {
+            const uint32_t d = degree(static_cast<uint32_t>(v));
+            if (d == 0 || d == 2) continue;
+            for (uint32_t k = start[v]; k < start[v + 1]; ++k) {
+                Chain chain{static_cast<uint32_t>(v), 0, incident[k], 0, 0, {}};
+                uint32_t at = chain.from, segment = chain.first;
+                while (chain.length < 2 * h) {
+                    chain.segments.push_back(segment);
+                    const uint32_t next = ends[2 * segment] == at ? ends[2 * segment + 1] : ends[2 * segment];
+                    const double *p = &surface_.positions[3 * size_t(at)], *q = &surface_.positions[3 * size_t(next)];
+                    chain.length += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) +
+                                              (p[2] - q[2]) * (p[2] - q[2]));
+                    at = next;
+                    if (degree(next) != 2) break;
+                    const uint32_t s0 = incident[start[next]], s1 = incident[start[next] + 1];
+                    segment = s0 == segment ? s1 : s0;
+                }
+                if (!(chain.length < 2 * h)) continue;
+                chain.to = at;
+                chain.last = chain.segments.back();
+                // Each chain is walked from both ends: keep one walk.
+                if (chain.to < chain.from || (chain.to == chain.from && chain.last < chain.first)) continue;
+                if (chain.to == chain.from && chain.last == chain.first && chain.segments.size() > 1) continue;
+                chains.push_back(std::move(chain));
+            }
+        }
+        std::vector<uint8_t> removed(count, 0);
+        auto drop = [&](const Chain &chain) {
+            for (uint32_t segment : chain.segments) removed[segment] = 1;
+        };
+        // Detours: chains joining the same two junctions, all but the shortest.
+        std::sort(chains.begin(), chains.end(), [](const Chain &a, const Chain &b) {
+            if (a.from != b.from) return a.from < b.from;
+            if (a.to != b.to) return a.to < b.to;
+            if (a.length != b.length) return a.length < b.length;
+            return a.first < b.first;
+        });
+        // Spurs: (junction, its segment) of chains shorter than a cell from a
+        // free end to a junction.
+        std::vector<std::pair<uint32_t, uint32_t>> spurs;
+        for (const Chain &chain : chains) {
+            const uint32_t df = degree(chain.from), dt = degree(chain.to);
+            if (chain.from != chain.to && (df == 1 || dt == 1) && (df >= 3 || dt >= 3) && chain.length < h)
+                spurs.emplace_back(df >= 3 ? chain.from : chain.to, df >= 3 ? chain.first : chain.last);
+        }
+        std::sort(spurs.begin(), spurs.end());
+        // The unit direction of the crease line leaving `v` along `segment`,
+        // to the point about a cell along it (or its next junction).
+        auto direction = [&](uint32_t v, uint32_t segment, double *out) {
+            uint32_t at = v;
+            double length = 0;
+            for (;;) {
+                const uint32_t next = ends[2 * segment] == at ? ends[2 * segment + 1] : ends[2 * segment];
+                const double *p = &surface_.positions[3 * size_t(at)], *q = &surface_.positions[3 * size_t(next)];
+                length += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) +
+                                    (p[2] - q[2]) * (p[2] - q[2]));
+                at = next;
+                if (length >= h || degree(next) != 2 || next == v) break;
+                const uint32_t s0 = incident[start[next]], s1 = incident[start[next] + 1];
+                segment = s0 == segment ? s1 : s0;
+            }
+            double norm = 0;
+            for (int a = 0; a < 3; ++a) {
+                out[a] = surface_.positions[3 * size_t(at) + a] - surface_.positions[3 * size_t(v) + a];
+                norm += out[a] * out[a];
+            }
+            norm = std::sqrt(norm);
+            for (int a = 0; a < 3; ++a) out[a] = norm > 0 ? out[a] / norm : 0.0;
+        };
+        // Whether the lines at junction v other than its spurs are two that
+        // continue within 30 degrees of straight.
+        auto spurs_beside_line = [&](uint32_t v) {
+            uint32_t other[2], found = 0;
+            for (uint32_t k = start[v]; k < start[v + 1]; ++k) {
+                const uint32_t segment = incident[k];
+                if (std::binary_search(spurs.begin(), spurs.end(), std::make_pair(v, segment))) continue;
+                if (found == 2) return false;
+                other[found++] = segment;
+            }
+            if (found != 2) return false;
+            double a[3], b[3];
+            direction(v, other[0], a);
+            direction(v, other[1], b);
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] <= -0.8660254037844386;  // cos 150 degrees
+        };
+        for (size_t i = 0; i < chains.size(); ++i) {
+            const Chain &chain = chains[i];
+            const uint32_t df = degree(chain.from), dt = degree(chain.to);
+            if (chain.from == chain.to) {
+                if (df >= 3 && chain.length < h) drop(chain);  // a short loop on a junction
+            } else if (df == 1 || dt == 1) {
+                if ((df >= 3 || dt >= 3) && chain.length < h && spurs_beside_line(df >= 3 ? chain.from : chain.to))
+                    drop(chain);  // a spur beside a line
+            } else if (i > 0 && chains[i - 1].from == chain.from && chains[i - 1].to == chain.to) {
+                drop(chain);  // a longer detour between the junctions of a shorter chain
+            }
+        }
+        size_t kept = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (!removed[i]) {
+                if (kept != i) std::copy_n(&mesh.creases[6 * i], 6, &mesh.creases[6 * kept]);
+                ++kept;
+            }
+        mesh.creases.resize(6 * kept);
+    }
+
     void statistics(rsdf_mesh &mesh) {
         rsdf_mesh_stats &stats = mesh.stats;
         stats.vertex_count = mesh.positions.size() / 3;
@@ -377,6 +512,69 @@ private:
                 if (a != b) parent[std::max(a, b)] = std::min(a, b);
             }
         for (size_t v = 0; v < vertex_count_; ++v) stats.components += root(static_cast<uint32_t>(v)) == v;
+
+        // Sealed voids: components enclosing negative volume (surfaces facing
+        // into a void), summed per component in triangle order. A speck or a
+        // void below a cell can mesh as a folded sliver enclosing a tiny
+        // volume of either sign, so a component enclosing less than half a
+        // cell cubed either way is classified by what surrounds it: a void
+        // when most of 26 field samples around it (the corners, edge
+        // midpoints and face centres of its bounding box grown by half a
+        // cell) are inside material, a piece otherwise.
+        const double h = stats.cell_size, small = 0.5 * h * h * h;
+        std::vector<double> enclosed(vertex_count_, 0.0);
+        for (size_t t = 0; t < triangle_count_; ++t) {
+            const uint32_t first = surface_.triangles[3 * t];
+            double q[3], facet[3];
+            for (int a = 0; a < 3; ++a) q[a] = p[3 * size_t(first) + a] - reference[a];
+            face_vector(surface_, t, facet);
+            enclosed[root(first)] += dot(q, facet) / 6;
+        }
+        std::vector<uint32_t> slot(vertex_count_, UINT32_MAX);  // a small component's index, at its root
+        std::vector<double> boxes;                               // lo[3], hi[3] per small component
+        for (size_t v = 0; v < vertex_count_; ++v)
+            if (root(static_cast<uint32_t>(v)) == v && std::fabs(enclosed[v]) < small) {
+                slot[v] = static_cast<uint32_t>(boxes.size() / 6);
+                boxes.insert(boxes.end(), {INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY});
+            }
+        for (size_t v = 0; v < vertex_count_; ++v) {
+            const uint32_t s = slot[root(static_cast<uint32_t>(v))];
+            if (s == UINT32_MAX) continue;
+            for (int a = 0; a < 3; ++a) {
+                boxes[6 * size_t(s) + a] = std::min(boxes[6 * size_t(s) + a], p[3 * v + a]);
+                boxes[6 * size_t(s) + 3 + a] = std::max(boxes[6 * size_t(s) + 3 + a], p[3 * v + a]);
+            }
+        }
+        const size_t samples = 26 * (boxes.size() / 6);
+        std::vector<double> sample(4 * samples);  // x, y, z and the field value, in blocks
+        double *sx = sample.data(), *sy = sx + samples, *sz = sy + samples, *value = sz + samples;
+        for (size_t i = 0; i < samples; ++i) {
+            const size_t s = i / 26, k = i % 26;
+            const int cell = static_cast<int>(k < 13 ? k : k + 1);  // of the 3 x 3 x 3 around the box, not its centre
+            const int step[3] = {cell % 3, cell / 3 % 3, cell / 9};
+            double *out[3] = {sx + i, sy + i, sz + i};
+            for (int a = 0; a < 3; ++a) {
+                const double lo = boxes[6 * s + a] - 0.5 * h, hi = boxes[6 * s + 3 + a] + 0.5 * h;
+                *out[a] = step[a] == 0 ? lo : step[a] == 2 ? hi : 0.5 * (lo + hi);
+            }
+        }
+        parallel_chunks(chunks_of(samples, kChunk), threads_, [&](size_t chunk) {
+            const size_t begin = chunk * kChunk, end = std::min(samples, begin + kChunk);
+            field_.evaluate(static_cast<int>(end - begin), sx + begin, sy + begin, sz + begin, value + begin);
+        });
+        for (size_t v = 0; v < vertex_count_; ++v) {
+            if (root(static_cast<uint32_t>(v)) != v) continue;
+            bool cavity = enclosed[v] <= -small;
+            if (slot[v] != UINT32_MAX) {
+                int inside = 0;
+                for (size_t k = 0; k < 26; ++k) inside += value[26 * size_t(slot[v]) + k] < 0;
+                cavity = inside > 13;
+            }
+            if (cavity) {
+                ++stats.cavities;
+                stats.cavity_volume += std::fabs(enclosed[v]);
+            }
+        }
     }
 
     const Surface &surface_;
@@ -395,6 +593,9 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
     if (!options) throw Error("mesh options are null");
     const Node &n = checked_node(graph, node);
     if (n.dim != 3) throw Error(format("meshing needs a 3D node; node %u is 2D", node));
+    if (n.field)
+        throw Error(format("meshing needs a shape; node %u (%s) is a field (IMPLICIT makes it a shape)", node,
+                           op_name(n.op)));
     const double h = options->cell_size;
     if (!(h > 0) || !std::isfinite(h)) throw Error("cell_size must be positive and finite");
     const double crease = std::isnan(options->crease_angle) || options->crease_angle <= 0 ? 35.0

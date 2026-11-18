@@ -14,7 +14,9 @@
 namespace rsdf {
 
 void MeshField::evaluate(int n, const double *x, const double *y, const double *z, double *out) const {
-    eval_batch(*graph, node, n, x, y, z, out);
+    // eval_batch takes at most kBatch points per call.
+    for (int first = 0; first < n; first += kBatch)
+        eval_batch(*graph, node, std::min(kBatch, n - first), x + first, y + first, z + first, out + first);
     for (int i = 0; i < n; ++i) {
         const double qx = std::fmax(lo[0] - x[i], x[i] - hi[0]);
         const double qy = std::fmax(lo[1] - y[i], y[i] - hi[1]);

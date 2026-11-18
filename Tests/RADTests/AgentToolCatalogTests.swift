@@ -9,19 +9,39 @@ final class AgentToolCatalogTests: XCTestCase {
         for tool in catalog.tools { capabilities[tool.host.capability, default: []].insert(tool.name) }
         XCTAssertEqual(capabilities[.capture], ["rad_screenshot"])
         XCTAssertEqual(capabilities[.export], ["rad_export_stl"])
-        XCTAssertEqual(capabilities[.build], ["rad_build", "rad_import", "rad_request_permission", "rad_set_part_colors"])
+        XCTAssertEqual(capabilities[.build], ["rad_build", "rad_import", "rad_request_permission", "rad_set_part_colors",
+                                              "rad_verify"], "rad_verify runs programs, as builds do.")
         XCTAssertNil(capabilities[.commit], "Only the external transport commits candidates.")
         XCTAssertNil(capabilities[.manageProjects])
         XCTAssertEqual(catalog.imageToolNames, ["rad_render", "rad_screenshot"])
         XCTAssertEqual(ProjectActivityEvent.savedImageTools, catalog.imageToolNames)
         XCTAssertEqual(catalog.tools.filter(\.host.requestsPermission).map(\.name), ["rad_request_permission"])
-        XCTAssertEqual(catalog.tools.filter { !$0.host.programs.isEmpty }.map(\.name), ["rad_build"])
+        XCTAssertEqual(catalog.tools.filter { !$0.host.programs.isEmpty }.map(\.name), ["rad_build", "rad_verify"])
         XCTAssertEqual(catalog.tools.filter { !$0.host.references.isEmpty }.map(\.name), ["rad_import"])
         XCTAssertEqual(catalog.tools.filter { !$0.host.sources.isEmpty }.map(\.name), ["rad_import"])
         XCTAssertNil(catalog["rad_export_step"], "Exports are STL.")
         for tool in catalog.tools {
             XCTAssertEqual(tool.annotations["readOnlyHint"] as? Bool, [.read, .capture].contains(tool.host.capability), tool.name)
         }
+    }
+
+    func testExternalSchemasNameOnlyTheirOwnParameters() throws {
+        // External clients pass programID; no description may name the native programPath.
+        for tool in try AgentToolCatalog.external().tools {
+            let properties = try XCTUnwrap(tool.inputSchema["properties"] as? [String: Any], tool.name)
+            XCTAssertNil(properties["programPath"], tool.name)
+            XCTAssertFalse(tool.description.contains("programPath"), tool.name)
+            for (name, value) in properties {
+                let description = (value as? [String: Any])?["description"] as? String ?? ""
+                XCTAssertFalse(description.contains("programPath"), "\(tool.name).\(name): \(description)")
+            }
+        }
+    }
+
+    @MainActor
+    func testModelingGuideNamesNoNativeParameter() throws {
+        // External clients also download the modeling guide (rad_runtime's apiGuidePath).
+        XCTAssertFalse(try CADAgentTools.modelingGuide().contains("programPath"))
     }
 
     func testCatalogRejectsDuplicateToolsAndHostArgumentsOutsideTheSchema() throws {

@@ -61,9 +61,10 @@ enum EngineWorkerRequest: Encodable, Sendable {
     }
 
     /// Replay a CAD program. Imported geometry is staged beside the request.
-    /// `print` builds the program's 3D printing version.
+    /// `print` builds the program's 3D printing version; `verifyFields` runs
+    /// the program and analyses its custom fields instead of meshing.
     case build(title: String, summary: String, units: String, script: String, inputAssets: [InputAsset],
-               print: Bool = false)
+               print: Bool = false, verifyFields: Bool = false)
     case runtime
     case export(NativeSource, Export)
     /// Minimum distance and closest points between one or two items.
@@ -79,7 +80,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case probe(NativeSource, solids: [Int]?, points: [[Double]], directions: [[Double]]?, maxDistance: Double?)
 
     private enum Key: String, CodingKey {
-        case operation, title, summary, units, script, inputAssets, print, artifact, artifactIdentity, partRoots,
+        case operation, title, summary, units, script, inputAssets, print, verifyFields, artifact, artifactIdentity, partRoots,
              solidIndices, solidTransforms, individualParts, cellSize, entities, pairs, poses, printDown,
              solids, points, directions, maxDistance, tolerance
     }
@@ -93,13 +94,14 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encode(source.partRoots, forKey: .partRoots)
         }
         switch self {
-        case let .build(title, summary, units, script, inputAssets, print):
+        case let .build(title, summary, units, script, inputAssets, print, verifyFields):
             try values.encode(title, forKey: .title)
             try values.encode(summary, forKey: .summary)
             try values.encode(units, forKey: .units)
             try values.encode(script, forKey: .script)
             if !inputAssets.isEmpty { try values.encode(inputAssets, forKey: .inputAssets) }
             if print { try values.encode(true, forKey: .print) }
+            if verifyFields { try values.encode(true, forKey: .verifyFields) }
         case .runtime:
             try values.encode("runtime", forKey: .operation)
         case let .export(source, export):

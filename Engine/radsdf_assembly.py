@@ -38,12 +38,11 @@ import numpy as np
 
 import radsdf
 from assembly_motion import has_control_characters
-from radsdf import SDF2, SDF3, SDFError
+from radsdf import SDF2, SDF3, Field, SDFError
 
 __all__ = ["Assembly", "Part", "Placement", "Motion", "gear", "rack", "screw", "cam", "geneva"]
 
 MAX_TABLE_SAMPLES = 4096
-_FOLDER_PREFIXES = ("user-folder:", "folder:")
 _AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
 
 
@@ -177,6 +176,8 @@ def _rigid(matrix, label):
 def _solid(shape, label):
     if isinstance(shape, SDF2):
         raise SDFError(f"{label} needs a 3D solid; extrude or revolve the 2D profile first.")
+    if isinstance(shape, Field):
+        raise SDFError(f"{label} needs a 3D solid; a custom field becomes one through implicit(field, bounds).")
     if not isinstance(shape, SDF3):
         raise SDFError(f"{label} needs a 3D shape, got {type(shape).__name__}.")
     return shape

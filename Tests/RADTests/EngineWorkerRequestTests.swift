@@ -22,6 +22,10 @@ final class EngineWorkerRequestTests: XCTestCase {
                                                  inputAssets: [], print: true)
         XCTAssertEqual(try object(printing), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
                                               "print": true])
+        let fields = EngineWorkerRequest.build(title: "Box", summary: "A box.", units: "mm", script: "result = 1\n",
+                                               inputAssets: [], verifyFields: true)
+        XCTAssertEqual(try object(fields), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
+                                            "verifyFields": true])
         XCTAssertEqual(try object(.runtime), ["operation": "runtime"])
     }
 

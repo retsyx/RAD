@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,7 +23,7 @@ namespace rsdf {
 enum Op : uint32_t {
     OP_SPHERE = 1, OP_BOX = 2, OP_CYLINDER = 3, OP_CONE = 4, OP_CAPSULE = 5,
     OP_TORUS = 6, OP_ELLIPSOID = 7, OP_HALFSPACE = 8,
-    OP_MESH = 9,
+    OP_MESH = 9, OP_IMPLICIT = 10,
     OP_TRANSFORM = 20, OP_STRETCH = 21, OP_MIRROR = 22, OP_TWIST = 23,
     OP_ELONGATE = 24, OP_OFFSET = 25, OP_SHELL = 26,
     OP_UNION = 30, OP_INTERSECTION = 31, OP_DIFFERENCE = 32,
@@ -32,6 +33,12 @@ enum Op : uint32_t {
     OP_TRANSFORM2 = 120, OP_STRETCH2 = 121, OP_MIRROR2 = 122, OP_OFFSET2 = 123,
     OP_OUTLINE2 = 124,
     OP_UNION2 = 130, OP_INTERSECTION2 = 131, OP_DIFFERENCE2 = 132,
+    // Field nodes (traced expressions): 3D, no bounds of their own, read only
+    // by other field nodes or by IMPLICIT (see field.cpp).
+    OP_CONST = 200, OP_COORD = 201, OP_ADD = 202, OP_SUB = 203, OP_MUL = 204, OP_DIV = 205,
+    OP_NEG = 206, OP_ABS = 207, OP_SQUARE = 208, OP_SQRT = 209, OP_SIN = 210, OP_COS = 211,
+    OP_EXP = 212, OP_LOG = 213, OP_POWC = 214, OP_ATAN2 = 215, OP_MIN = 216, OP_MAX = 217,
+    OP_CLAMP = 218, OP_LENGTH = 219, OP_TRIWAVE = 220, OP_EVAL_AT = 221, OP_SMIN = 222, OP_SMAX = 223,
 };
 
 // Points per evaluation batch.
@@ -54,6 +61,12 @@ struct Node {
     uint32_t polygon = 0;         // into rsdf_graph::polygons (POLYGON only)
     uint32_t mesh = 0;            // into rsdf_graph::meshes (MESH only)
     uint32_t child_tree = 0;      // 1 + index into rsdf_graph::child_trees, or 0 (large UNION/DIFFERENCE)
+    // 1 + index into rsdf_graph::tapes, or 0: the compiled field of an
+    // IMPLICIT node, or of a field node that IMPLICIT or nothing reads (only
+    // those field nodes can be queried).
+    uint32_t tape = 0;
+    uint32_t proof = 0;           // IMPLICIT: 1 + index into rsdf_graph::proofs
+    bool field = false;           // a field node (opcodes 200-223)
     // Conservative bounds of the solid (may be infinite). An empty solid may
     // keep an inverted box (lo > hi along some axis): box_distance() to it is
     // positive everywhere, which keeps `ratio` meaningful for empty solids.
@@ -66,7 +79,15 @@ struct Node {
     double ratio = 1;
     double lipschitz = 1;         // the specified Lipschitz bound (reported by rsdf_bounds)
     double step_lipschitz = 1;    // >= lipschitz; used for pruning and ray stepping
-    double c0 = 0, c1 = 0;        // derived constants, see derive() in graph.cpp
+    // An exact distance outside its solid (exact primitives and meshes, rigid
+    // transforms and mirrors of exact fields, their extrusions and exact
+    // unions): its gradient there points away from a nearest surface point.
+    bool exact = false;
+    // Its stepping bound holds only near its box: the subtree has a TWIST of
+    // an inexact child or a LOFT of inexact profiles, whose slope grows with
+    // the distance from their box. Fields reading it use shape_lipschitz().
+    bool regional = false;
+    double c0 = 0, c1 = 0;        // derived constants, see derive() in graph.cpp (IMPLICIT: L used, proven L)
     // Point queries of this node visit points in Morton order: its evaluation
     // costs enough (64 node visits per point, or a large polygon) that compact
     // batches, which culling and polygon pruning need, repay the sort.
@@ -145,6 +166,85 @@ struct TriangleMesh {
 // into `mesh`; throws Error describing an invalid mesh.
 void build_triangle_mesh(TriangleMesh &mesh, const double *params, size_t param_count);
 
+// A field DAG compiled to straight-line code (field.cpp). Every node of the
+// field runs once per batch, in topological order, into a value slot that is
+// reused after its last read, so shared subexpressions cost nothing extra.
+// Operands 0-2 are the base point's coordinates (an IMPLICIT's clamped point,
+// or the query point of a field root); operand 3 + k is slot k.
+struct FieldTape {
+    static constexpr uint32_t kShape = 0;  // Instr::op of a shape read as a field at the base point
+    struct Instr {
+        uint32_t op;           // field opcode (never COORD, which is an operand), or kShape
+        uint32_t node;         // the graph node computed (kShape: the shape node)
+        uint32_t dst;          // operand written (>= 3)
+        uint32_t first, count; // operands in args
+        uint32_t shape;        // EVAL_AT: the shape node
+        double p0, p1;         // CONST c, POWC e, CLAMP lo hi, TRIWAVE P
+    };
+    std::vector<Instr> code;
+    std::vector<uint32_t> args;
+    uint32_t slots = 0;
+    uint32_t result = 0;       // operand holding the field's value
+    uint32_t root = 0;         // the field's root node
+    uint64_t visits = 1;       // node visits per evaluated point (instructions plus the shapes read)
+};
+
+// Compiles the field rooted at `root` (a field node or a 3D shape node).
+void build_tape(const rsdf_graph &graph, uint32_t root, FieldTape &tape);
+
+// The proven slope bound of a field over a box (field.cpp, "Custom fields"
+// in SDF-DESIGN.md): forward-mode interval arithmetic of values and
+// gradients with adaptive subdivision. Deterministic and single-threaded.
+struct FieldBound {
+    bool ok = false;
+    double bound = INFINITY;              // upper bound of |grad f| over the box
+    double value_lo = -INFINITY, value_hi = INFINITY;
+    uint64_t boxes = 0;                   // boxes evaluated
+    uint32_t failed_node = 0;             // without a bound: the node whose slope is unbounded
+    double failed_lo[3] = {0, 0, 0}, failed_hi[3] = {0, 0, 0};  // and the region
+    std::string problem;                  // without a bound: what failed, naming the node and region
+};
+
+constexpr uint64_t kFieldBoxes = 32768;  // default subdivision budget
+
+// One proven IMPLICIT field (graph.cpp), shared by the IMPLICIT nodes whose
+// fields compile to the same tape over the same box. The sampled gradient
+// statistics are filled in by the first rsdf_field_analyze of its bounds.
+struct Proof {
+    FieldBound bound;
+    mutable bool sampled = false;  // the statistics below, under rsdf_graph::proofs_mutex
+    mutable uint64_t samples = 0;
+    mutable double gradient_min = 0, gradient_median = 0, gradient_max = 0;
+};
+
+// The default budget of boxes for a tape: 32,768, fewer for large fields so
+// that an analysis visits at most about 2^24 nodes (a box and its centre are
+// two evaluations).
+uint64_t field_budget(const FieldTape &tape);
+
+FieldBound analyze_field(const rsdf_graph &graph, const FieldTape &tape, const double *lo, const double *hi,
+                         uint64_t max_boxes);
+
+// The box IMPLICIT analyses: its bounds grown by 1e-6 of their largest extent.
+void implicit_analysis_box(const double *lo, const double *hi, double *analysis_lo, double *analysis_hi);
+
+// A Lipschitz bound of the 3D shape `node` over the box [lo, hi] of its own
+// coordinates: its stepping bound unless it is regional (field.cpp).
+double shape_lipschitz(const rsdf_graph &graph, uint32_t node, const double *lo, const double *hi);
+
+// Proof limits: a field costing more node visits per point cannot be proven
+// (one box and its centre would exceed the 2^24 visits of a default proof),
+// and the IMPLICIT proofs of one graph may visit at most kProofWork nodes:
+// each distinct proof gets its default budget or one box plus an equal share
+// of the work left beyond the later proofs' first boxes, whichever is
+// smaller, and a graph fails at once when its proofs cannot all evaluate one
+// box (graph.cpp).
+constexpr uint64_t kMaxProvenVisits = uint64_t(1) << 23;
+constexpr uint64_t kProofWork = uint64_t(1) << 28;
+
+// The RSDF name of an opcode ("?" when unknown).
+const char *op_name(uint32_t op);
+
 }  // namespace rsdf
 
 struct rsdf_graph {
@@ -154,6 +254,9 @@ struct rsdf_graph {
     std::vector<rsdf::Polygon> polygons;
     std::vector<rsdf::ChildTree> child_trees;
     std::vector<rsdf::TriangleMesh> meshes;
+    std::vector<rsdf::FieldTape> tapes;
+    std::vector<rsdf::Proof> proofs;
+    mutable std::mutex proofs_mutex;  // guards Proof::sampled and the statistics
 
     const uint32_t *child_ids(const rsdf::Node &node) const { return children.data() + node.first_child; }
     const double *param_values(const rsdf::Node &node) const { return params.data() + node.first_param; }

@@ -36,6 +36,11 @@ OPCODES = {1: "SPHERE", 2: "BOX", 3: "CYLINDER", 4: "CONE", 5: "CAPSULE", 6: "TO
            122: "MIRROR2", 123: "OFFSET2", 124: "OUTLINE2", 130: "UNION2", 131: "INTERSECTION2",
            132: "DIFFERENCE2"}
 OPCODES[9] = "MESH"  # imported triangle meshes (test_mesh_import.py)
+# Custom fields (test_sdf_fields.py, test_sdf_fields_native.py).
+OPCODES[10] = "IMPLICIT"
+OPCODES.update(enumerate(["CONST", "COORD", "ADD", "SUB", "MUL", "DIV", "NEG", "ABS", "SQUARE", "SQRT", "SIN", "COS",
+                          "EXP", "LOG", "POWC", "ATAN2", "MIN", "MAX", "CLAMP", "LENGTH", "TRIWAVE", "EVAL_AT", "SMIN",
+                          "SMAX"], 200))
 
 ROT_X90 = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
 ROT_Y90 = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]
@@ -704,8 +709,9 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(options), 88)
         self.assertEqual((options.max_cells.offset, options.bounds_lo.offset, options.bounds_valid.offset),
                          (16, 32, 80))
-        self.assertEqual(ctypes.sizeof(stats), 160)
-        self.assertEqual((stats.volume.offset, stats.centroid.offset, stats.cell_size.offset), (56, 72, 144))
+        self.assertEqual(ctypes.sizeof(stats), 176)
+        self.assertEqual((stats.cavities.offset, stats.volume.offset, stats.cavity_volume.offset,
+                          stats.centroid.offset, stats.cell_size.offset), (56, 64, 80, 88, 160))
 
     def test_library_search_order(self):
         with tempfile.TemporaryDirectory() as folder:

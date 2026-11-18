@@ -52,10 +52,6 @@ mkdir -p "$PACKAGED_ENGINE"
 cp "$ROOT"/Engine/*.py "$ROOT/Engine/agent-tools.json" "$ROOT/Engine/script.sb" "$ROOT/Engine/requirements-lock.txt" \
    "$PACKAGED_ENGINE/"
 [[ -f "$PACKAGED_ENGINE/worker.py" && -f "$PACKAGED_ENGINE/radsdf.py" ]] || { echo "The Engine modules are incomplete." >&2; exit 1; }
-# The radsdf modeling API reference, when present.
-for DOC in "$ROOT"/Engine/radsdf*.md; do
-    if [[ -f "$DOC" ]]; then cp "$DOC" "$PACKAGED_ENGINE/"; fi
-done
 ditto "$ROOT/Examples" "$ASSEMBLED/Contents/Resources/Examples"
 # Ship a verified offline payload. First use prepares a versioned private
 # interpreter/venv in Application Support without changing the signed app.

@@ -859,9 +859,9 @@ m.couple("geneva", drive, index, **geneva(N))
         encoded, loaded = [], []
         encode, load = radsdf._encode, radsdf.Graph.from_bytes
 
-        def counting_encode(roots):
+        def counting_encode(roots, **options):
             encoded.append(len(roots))
-            return encode(roots)
+            return encode(roots, **options)
 
         def recording_load(data, roots):
             loaded.append((data, roots))

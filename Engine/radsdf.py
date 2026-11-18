@@ -22,11 +22,16 @@ import collections.abc
 import contextlib
 import ctypes
 import enum
+import functools
 import itertools
 import math
+import numbers
+import operator
 import os
 from pathlib import Path
+import re
 import struct
+import sys
 import threading
 import weakref
 
@@ -67,6 +72,7 @@ class Opcode(enum.IntEnum):
     ELLIPSOID = 7
     HALFSPACE = 8
     MESH = 9
+    IMPLICIT = 10
     TRANSFORM = 20
     STRETCH = 21
     MIRROR = 22
@@ -95,6 +101,31 @@ class Opcode(enum.IntEnum):
     UNION2 = 130
     INTERSECTION2 = 131
     DIFFERENCE2 = 132
+    # Field nodes (custom fields): read only by other field nodes and IMPLICIT.
+    CONST = 200
+    COORD = 201
+    ADD = 202
+    SUB = 203
+    MUL = 204
+    DIV = 205
+    NEG = 206
+    ABS = 207
+    SQUARE = 208
+    SQRT = 209
+    SIN = 210
+    COS = 211
+    EXP = 212
+    LOG = 213
+    POWC = 214
+    ATAN2 = 215
+    MIN = 216
+    MAX = 217
+    CLAMP = 218
+    LENGTH = 219
+    TRIWAVE = 220
+    EVAL_AT = 221
+    SMIN = 222
+    SMAX = 223
 
 
 # Operations whose opcode depends only on the shape's dimension.
@@ -354,7 +385,8 @@ class _Shape:
         if not all(map(math.isfinite, params)):
             raise SDFError(f"{opcode.name} parameters must be finite.")
         children = tuple(children)
-        if not all(isinstance(child, _Shape) for child in children):
+        kinds = (_Shape, _FieldNode) if opcode == Opcode.IMPLICIT else _Shape
+        if not all(isinstance(child, kinds) for child in children):
             raise SDFError(f"{opcode.name} children must be shapes.")
         object.__setattr__(self, "_opcode", opcode)
         object.__setattr__(self, "_params", params)
@@ -575,6 +607,23 @@ class SDF3(_Shape):
                        "polar_array count must be between 1 and 10000.")
         step = _polar_step(count, _finite(angle, "polar_array angle"))
         return union(*[self.rotate(step * i, axis, center) for i in range(count)])
+
+    # -- custom fields --------------------------------------------------------
+    @property
+    def field(self):
+        """The shape's signed distance as a Field, for custom field expressions."""
+        return Field(self)
+
+    def at(self, *point):
+        """A Field: this shape's signed distance evaluated at the point (fx, fy,
+        fz), three fields or numbers (or one triple), instead of at (x, y, z).
+        Warping the evaluation point bends, twists or tapers the shape;
+        implicit() makes the result a solid."""
+        if len(point) == 1 and isinstance(point[0], (list, tuple)):
+            point = tuple(point[0])
+        if len(point) != 3:
+            raise SDFError("at() takes three coordinates (fx, fy, fz): fields or numbers.")
+        return Field(_FieldNode(Opcode.EVAL_AT, (), (self, *(_field_operand(value, "at()") for value in point))))
 
     # -- native queries -----------------------------------------------------
     def gradient(self, points, eps=None, *, threads=0):
@@ -899,6 +948,8 @@ def _flatten(items):
     for item in items:
         if isinstance(item, _Shape):
             flat.append(item)
+        elif isinstance(item, Field):
+            raise SDFError(_FIELD_IS_NOT_A_SHAPE)
         elif isinstance(item, collections.abc.Iterable) and not isinstance(item, (str, bytes)):
             flat.extend(_flatten(item))
         else:
@@ -945,6 +996,8 @@ def intersection(*shapes, smooth=0.0):
 
 def difference(base, *cutters, smooth=0.0):
     """`base` with every cutter removed."""
+    if isinstance(base, Field):
+        raise SDFError(_FIELD_IS_NOT_A_SHAPE)
     if not isinstance(base, _Shape):
         raise SDFError(f"Expected a shape, got {type(base).__name__}.")
     cutters = _flatten(cutters)
@@ -972,21 +1025,607 @@ def raycast(shape, origins, directions, max_distance=1e5, tolerance=1e-4, max_st
     return shape.raycast(origins, directions, max_distance, tolerance, max_steps)
 
 
+# ================================================================ custom fields
+#
+# A Field is a scalar function of the point traced from Python arithmetic over
+# the symbolic coordinates x, y, z, numbers and shapes' signed distances
+# (SDF-DESIGN.md, "Custom fields"). Every operation records a native
+# expression node (opcodes 200-223); nothing runs in Python per point. A field
+# becomes a solid only through implicit(field, bounds): loading that shape
+# proves an upper bound L of |grad field| over the bounds and uses the field
+# divided by L, a distance bound every algorithm accepts.
+
+_FIELD_IS_NOT_A_SHAPE = ("A custom field is not a shape: make it a solid with implicit(field, bounds) before "
+                         "combining, transforming or using it as a part (use shape.field for arithmetic with a "
+                         "shape's signed distance).")
+_FIELD_IS_SYMBOLIC = ("A custom field has no value while the program runs (x, y and z are symbolic), so it "
+                      "cannot be compared or tested with if/and/or: use minimum(), maximum() or clamp() "
+                      "instead (for example maximum(a, b) instead of `a if a > b else b`).")
+_FIELD_HAS_NO_NUMBER = ("A custom field has no number value while the program runs (x, y and z are symbolic): "
+                        "use radsdf's sin, cos, exp, log, sqrt, atan2, minimum, maximum, clamp, length and "
+                        "triwave, which accept fields, instead of math functions.")
+_FIELD_JUMPS = ("% and // jump, so custom fields cannot use them; triwave(value, period) is a continuous "
+                "repeating pattern.")
+
+
+class _FieldNode:
+    """One immutable node of a custom field (opcodes 200-223): its opcode,
+    parameters and children (field nodes or 3D shapes), exactly as RSDF
+    stores them. Programs work with Field, which wraps these nodes."""
+    __slots__ = ("_opcode", "_params", "_children")
+    dimension = 3
+
+    def __init__(self, opcode, params=(), children=()):
+        opcode = Opcode(opcode)
+        params = tuple(map(float, params))
+        if not all(map(math.isfinite, params)):
+            raise SDFError("Field constants must be finite numbers.")
+        children = tuple(children)
+        for child in children:
+            if isinstance(child, SDF2):
+                raise SDFError("A custom field reads 3D shapes only; extrude or revolve the profile first.")
+            if not isinstance(child, (_FieldNode, SDF3)):
+                raise SDFError(f"{opcode.name} children must be fields or 3D shapes.")
+        object.__setattr__(self, "_opcode", opcode)
+        object.__setattr__(self, "_params", params)
+        object.__setattr__(self, "_children", children)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Fields are immutable; every operation returns a new field.")
+
+    def __delattr__(self, name):
+        raise AttributeError("Fields are immutable; every operation returns a new field.")
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    @property
+    def opcode(self):
+        return self._opcode
+
+    @property
+    def params(self):
+        return self._params
+
+    @property
+    def children(self):
+        return self._children
+
+    def __repr__(self):
+        return f"<field node {self._opcode.name}>"
+
+
+def _constant(value):
+    return _FieldNode(Opcode.CONST, (value,))
+
+
+def _field_number(value, operation):
+    """A finite float operand of a field operation (not a field)."""
+    if isinstance(value, _Shape):
+        raise SDFError(f"{operation}: a shape is not a field; use shape.field for its signed distance, or "
+                       "shape.at(fx, fy, fz) to evaluate it at a warped point.")
+    if isinstance(value, (bool, np.bool_)):
+        raise SDFError(f"{operation} needs numbers or fields, not booleans.")
+    if isinstance(value, numbers.Real) or (isinstance(value, np.ndarray) and value.ndim == 0
+                                           and value.dtype.kind in "fiu"):
+        number = float(value)
+        if not math.isfinite(number):
+            raise SDFError(f"{operation}: field constants must be finite numbers.")
+        return number
+    if isinstance(value, (np.ndarray, list, tuple)):
+        raise SDFError(f"{operation}: fields combine with single numbers, not arrays or sequences.")
+    raise SDFError(f"{operation} needs numbers or fields, got {type(value).__name__}.")
+
+
+def _field_operand(value, operation):
+    """The node of a field operand: a Field's node, or a CONST node for a number."""
+    if isinstance(value, Field):
+        return value._node
+    return _constant(_field_number(value, operation))
+
+
+def _field_operation(opcode, operands, operation, params=()):
+    return Field(_FieldNode(opcode, params, [_field_operand(value, operation) for value in operands]))
+
+
+class Field:
+    """A scalar function of the point, traced from Python: build fields from
+    the coordinates x, y, z, numbers, shape.field (a shape's signed distance)
+    and shape.at(fx, fy, fz), with + - * /, unary -, abs(), ** (a number
+    exponent) and sin, cos, exp, log, sqrt, atan2, minimum, maximum, clamp,
+    length and triwave. Running the program records the expression once; the
+    kernel evaluates it natively. implicit(field, bounds) makes it a solid
+    (inside where the field is negative). Fields have no value while the
+    program runs: comparisons and `if field` raise SDFError (use minimum,
+    maximum or clamp)."""
+    __slots__ = ("_node",)
+
+    def __init__(self, node):
+        if not isinstance(node, (_FieldNode, SDF3)):
+            raise SDFError("Build fields from x, y, z, numbers, shape.field and shape.at().")
+        object.__setattr__(self, "_node", node)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Fields are immutable; every operation returns a new field.")
+
+    def __delattr__(self, name):
+        raise AttributeError("Fields are immutable; every operation returns a new field.")
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __repr__(self):
+        return f"<Field {self._node.opcode.name}>"
+
+    # -- arithmetic -----------------------------------------------------------
+    def __add__(self, other):
+        return _field_operation(Opcode.ADD, (self, other), "+")
+
+    def __radd__(self, other):
+        return _field_operation(Opcode.ADD, (other, self), "+")
+
+    def __sub__(self, other):
+        return _field_operation(Opcode.SUB, (self, other), "-")
+
+    def __rsub__(self, other):
+        return _field_operation(Opcode.SUB, (other, self), "-")
+
+    def __mul__(self, other):
+        return _field_operation(Opcode.MUL, (self, other), "*")
+
+    def __rmul__(self, other):
+        return _field_operation(Opcode.MUL, (other, self), "*")
+
+    def __truediv__(self, other):
+        if not isinstance(other, Field) and _field_number(other, "/") == 0:
+            raise SDFError("A custom field divided by zero.")
+        return _field_operation(Opcode.DIV, (self, other), "/")
+
+    def __rtruediv__(self, other):
+        return _field_operation(Opcode.DIV, (other, self), "/")
+
+    def __neg__(self):
+        return Field(_FieldNode(Opcode.NEG, (), (self._node,)))
+
+    def __pos__(self):
+        return self
+
+    def __abs__(self):
+        return Field(_FieldNode(Opcode.ABS, (), (self._node,)))
+
+    def __pow__(self, exponent, modulo=None):
+        if modulo is not None:
+            raise SDFError("pow() of a custom field takes no modulus.")
+        if isinstance(exponent, Field):
+            raise SDFError("The exponent of a custom field must be a number; use exp(b * log(a)) for a field "
+                           "exponent.")
+        power = _field_number(exponent, "**")
+        if abs(power) > 2.0 ** 52:  # beyond, e - 1 rounds and loses the derivative's parity
+            raise SDFError("The exponent of a custom field must be at most 2**52 in magnitude.")
+        if power == 0:
+            return Field(_constant(1.0))
+        if power == 1:
+            return self
+        if power == 2:
+            return Field(_FieldNode(Opcode.SQUARE, (), (self._node,)))
+        return Field(_FieldNode(Opcode.POWC, (power,), (self._node,)))
+
+    def __rpow__(self, base):
+        base = _field_number(base, "**")
+        if base <= 0:
+            raise SDFError("A number raised to a custom field's power needs a positive base.")
+        return exp(self * math.log(base))
+
+    def __mod__(self, other):
+        raise SDFError(_FIELD_JUMPS)
+
+    __rmod__ = __floordiv__ = __rfloordiv__ = __divmod__ = __rdivmod__ = __mod__
+
+    # -- no values while tracing -------------------------------------------------
+    def __bool__(self):
+        raise SDFError(_FIELD_IS_SYMBOLIC)
+
+    def _compare(self, other):
+        raise SDFError(_FIELD_IS_SYMBOLIC)
+
+    __lt__ = __le__ = __gt__ = __ge__ = __eq__ = __ne__ = _compare
+    __hash__ = object.__hash__
+
+    def __float__(self):
+        raise SDFError(_FIELD_HAS_NO_NUMBER)
+
+    __int__ = __index__ = __complex__ = __float__
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        """numpy functions with a radsdf counterpart (np.sin(x), 2.0 * x with
+        a numpy number, ...) build fields; others raise SDFError."""
+        operation = _FIELD_UFUNCS.get(ufunc.__name__) if method == "__call__" and not kwargs else None
+        if operation is None:
+            raise SDFError(f"numpy's {ufunc.__name__} cannot take a custom field. Fields support + - * / ** and "
+                           "abs(), and radsdf's sin, cos, exp, log, sqrt, atan2, minimum, maximum, clamp, length "
+                           "and triwave.")
+        values = [value if isinstance(value, Field) else _field_number(value, f"np.{ufunc.__name__}")
+                  for value in inputs]
+        return operation(*values)
+
+    # -- native queries -----------------------------------------------------
+    def evaluate(self, points, *, threads=0):
+        """Field values at points of shape (..., 3); a float for one point."""
+        return _graph_for(self._node).evaluate(self._node, points, threads=threads)
+
+    __call__ = evaluate
+
+
+x = Field(_FieldNode(Opcode.COORD, (0.0,)))
+y = Field(_FieldNode(Opcode.COORD, (1.0,)))
+z = Field(_FieldNode(Opcode.COORD, (2.0,)))
+
+
+def _not_a_shape(value, name):
+    if isinstance(value, _Shape):
+        raise SDFError(f"{name}() takes numbers or fields; use shape.field for a shape's signed distance.")
+
+
+def _unary(opcode, scalar, array, name, doc):
+    """A function of one number, array or field."""
+    def function(value):
+        if isinstance(value, Field):
+            return Field(_FieldNode(opcode, (), (value._node,)))
+        _not_a_shape(value, name)
+        return scalar(value) if np.ndim(value) == 0 else array(value)
+    function.__name__ = function.__qualname__ = name
+    function.__doc__ = doc
+    return function
+
+
+sin = _unary(Opcode.SIN, math.sin, np.sin, "sin", "Sine of radians: a number, an array or a field.")
+cos = _unary(Opcode.COS, math.cos, np.cos, "cos", "Cosine of radians: a number, an array or a field.")
+exp = _unary(Opcode.EXP, math.exp, np.exp, "exp", "e to the power of a number, an array or a field.")
+log = _unary(Opcode.LOG, math.log, np.log, "log", "Natural logarithm of a number, an array or a field (the "
+                                                  "field must stay positive within its bounds).")
+sqrt = _unary(Opcode.SQRT, math.sqrt, np.sqrt, "sqrt", "Square root of a number, an array or a field (a field "
+                                                       "must not reach 0 where it changes; use length() for "
+                                                       "distances).")
+
+
+def atan2(y_value, x_value):
+    """The angle of (x_value, y_value) in radians, in (-pi, pi]: numbers,
+    arrays or fields. Across the negative x axis the angle jumps by 2 pi, so
+    a field may use it there only through sin or cos of whole multiples."""
+    if isinstance(y_value, Field) or isinstance(x_value, Field):
+        return _field_operation(Opcode.ATAN2, (y_value, x_value), "atan2()")
+    _not_a_shape(y_value, "atan2")
+    _not_a_shape(x_value, "atan2")
+    if np.ndim(y_value) == 0 and np.ndim(x_value) == 0:
+        return math.atan2(y_value, x_value)
+    return np.arctan2(y_value, x_value)
+
+
+_EXTREMUM_GROUP = 1024
+
+
+def _smooth_extremum(values, name, k, lowest):
+    """The left fold of the polynomial smooth minimum (or maximum) with
+    radius k, as union(..., smooth=k) blends shapes: SMIN/SMAX nodes, whose
+    slope bound is the larger of their operands' (a + b would add them)."""
+    if any(isinstance(value, Field) for value in values):
+        node = _field_operand(values[0], f"{name}()")
+        for value in values[1:]:
+            node = _FieldNode(Opcode.SMIN if lowest else Opcode.SMAX, (k,), (node, _field_operand(value, f"{name}()")))
+        return Field(node)
+    for value in values:
+        _not_a_shape(value, name)
+    sign = 1.0 if lowest else -1.0
+    result = values[0]
+    for value in values[1:]:
+        u, v = np.multiply(sign, result), np.multiply(sign, value)
+        h = np.maximum(k - np.abs(u - v), 0.0) / k
+        result = sign * (np.minimum(u, v) - h * h * k / 4)
+    return float(result) if np.ndim(result) == 0 else result
+
+
+def _extremum(opcode, values, name, scalar, array, smooth=0):
+    if len(values) == 1 and isinstance(values[0], (list, tuple)):
+        values = tuple(values[0])
+    if not values:
+        raise SDFError(f"{name}() needs at least one value.")
+    smooth = _field_number(smooth, f"{name}() smooth")
+    if smooth < 0:
+        raise SDFError(f"{name}() smooth must not be negative.")
+    if len(values) == 1 and isinstance(values[0], Field):
+        return values[0]
+    if smooth > 0 and len(values) > 1:
+        return _smooth_extremum(values, name, smooth, opcode == Opcode.MIN)
+    if any(isinstance(value, Field) for value in values):
+        nodes = [_field_operand(value, f"{name}()") for value in values]
+        # Wider extrema nest in groups (min and max are associative): a field
+        # keeps every operand of one node alive until it runs, so groups keep
+        # few values alive at a time.
+        while len(nodes) > _EXTREMUM_GROUP:
+            nodes = [_FieldNode(opcode, (), nodes[i:i + _EXTREMUM_GROUP]) if len(nodes) - i > 1 else nodes[i]
+                     for i in range(0, len(nodes), _EXTREMUM_GROUP)]
+        return Field(_FieldNode(opcode, (), nodes))
+    for value in values:
+        _not_a_shape(value, name)
+    if all(np.ndim(value) == 0 for value in values):
+        return scalar(values)
+    return functools.reduce(array, values)
+
+
+def minimum(*values, smooth=0):
+    """The smallest of numbers, arrays or fields (also of one list of them).
+    smooth=k blends them with radius k, as union(..., smooth=k) blends shapes."""
+    return _extremum(Opcode.MIN, values, "minimum", min, np.minimum, smooth)
+
+
+def maximum(*values, smooth=0):
+    """The largest of numbers, arrays or fields (also of one list of them).
+    smooth=k blends them with radius k, as intersection(..., smooth=k) does."""
+    return _extremum(Opcode.MAX, values, "maximum", max, np.maximum, smooth)
+
+
+def clamp(value, lo, hi):
+    """`value` limited to [lo, hi]: numbers, arrays or fields."""
+    if any(isinstance(item, Field) for item in (value, lo, hi)):
+        if isinstance(value, Field) and not isinstance(lo, Field) and not isinstance(hi, Field):
+            low, high = _field_number(lo, "clamp() lo"), _field_number(hi, "clamp() hi")
+            if low > high:
+                raise SDFError("clamp() needs lo <= hi.")
+            return Field(_FieldNode(Opcode.CLAMP, (low, high), (value._node,)))
+        return maximum(lo, minimum(value, hi))
+    for item in (value, lo, hi):
+        _not_a_shape(item, "clamp")
+    if np.ndim(value) == 0 and np.ndim(lo) == 0 and np.ndim(hi) == 0:
+        if lo > hi:
+            raise SDFError("clamp() needs lo <= hi.")
+        return min(max(value, lo), hi)
+    return np.clip(value, lo, hi)
+
+
+def length(*components):
+    """Euclidean length sqrt(a**2 + b**2 + ...) of numbers, arrays or fields
+    (also of one list of them). length(x, y, z) - r is a sphere's exact
+    distance; unlike sqrt, its slope stays bounded at 0."""
+    if len(components) == 1 and isinstance(components[0], (list, tuple)):
+        components = tuple(components[0])
+    if not components:
+        raise SDFError("length() needs at least one component.")
+    if any(isinstance(value, Field) for value in components):
+        if len(components) > _MAX_CHILDREN:
+            raise SDFError(f"length() takes at most {_MAX_CHILDREN} components.")
+        return _field_operation(Opcode.LENGTH, components, "length()")
+    for value in components:
+        _not_a_shape(value, "length")
+    if all(np.ndim(value) == 0 for value in components):
+        return math.hypot(*components)
+    return np.sqrt(sum(np.square(value) for value in components))
+
+
+def triwave(value, period):
+    """A continuous triangle wave of slope 1: |(value mod 2*period) - period|,
+    between 0 and `period` (a number from 1e-300 to 1e300) and repeating
+    every 2*period. Numbers, arrays or fields; use it for repeating patterns
+    instead of %."""
+    period = _positive(period, "triwave period")
+    if not 1e-300 <= period <= 1e300:
+        raise SDFError("triwave period must lie between 1e-300 and 1e300.")
+    if isinstance(value, Field):
+        return Field(_FieldNode(Opcode.TRIWAVE, (period,), (value._node,)))
+    _not_a_shape(value, "triwave")
+    twice = 2 * period  # the remainder by fmod is exact, as in the kernel
+    if np.ndim(value) == 0:
+        rest = math.fmod(value, twice)
+        return abs((rest + twice if rest < 0 else rest) - period)
+    rest = np.fmod(value, twice)
+    return np.abs(np.where(rest < 0, rest + twice, rest) - period)
+
+
+_FIELD_UFUNCS = {
+    "add": operator.add, "subtract": operator.sub, "multiply": operator.mul, "true_divide": operator.truediv,
+    "negative": operator.neg, "positive": operator.pos, "absolute": abs, "fabs": abs,
+    "square": lambda value: value ** 2, "power": operator.pow, "sqrt": sqrt, "sin": sin, "cos": cos,
+    "exp": exp, "log": log, "arctan2": atan2, "minimum": minimum, "maximum": maximum, "fmin": minimum,
+    "fmax": maximum, "hypot": length,
+}
+
+
+# The design program's line of each implicit() call, for messages naming it:
+# {id(shape): (shape, line)}. Builds clear it before running their program.
+_implicit_lines = {}
+
+
+def _program_line():
+    """The innermost line of the design program ("<RAD model>") calling in."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_filename == "<RAD model>":
+            return frame.f_lineno
+        frame = frame.f_back
+    return None
+
+
+def _implicit_line(shape):
+    entry = _implicit_lines.get(id(shape))
+    return entry[1] if entry is not None and entry[0] is shape else None
+
+
+def _field_root(value, operation):
+    """The node a custom field operation reads: a Field's node or a 3D shape."""
+    if isinstance(value, Field):
+        return value._node
+    if isinstance(value, SDF3):
+        return value
+    if isinstance(value, SDF2):
+        raise SDFError(f"{operation} needs a 3D field; extrude or revolve the profile first.")
+    raise SDFError(f"{operation} needs a custom field built from x, y, z (or a 3D shape), got "
+                   f"{type(value).__name__}.")
+
+
+def _field_box(bounds, operation):
+    box = _as_bounds(bounds, f"{operation} bounds")
+    if box.lo.shape != (3,):
+        raise SDFError(f"{operation} bounds must be 3D: ((x0, y0, z0), (x1, y1, z1)).")
+    if not box.finite or np.any(np.abs(box.lo) > 1e150) or np.any(np.abs(box.hi) > 1e150):
+        raise SDFError(f"{operation} bounds must be finite, within 1e150 of the origin.")
+    if np.any(box.lo >= box.hi):
+        raise SDFError(f"{operation} bounds need lo < hi along every axis.")
+    return box
+
+
+def implicit(field, bounds):
+    """A solid from a custom field: inside where the field is negative.
+
+    The field is used only within `bounds` ((x0, y0, z0), (x1, y1, z1)) or a
+    Bounds, which become the solid's bounds: keep them a little larger than
+    the solid, and more where an outward offset, shell or blend of it reaches
+    past them (there it sees the box, not the field). When the solid loads,
+    the kernel proves an upper bound L of |grad field| over the bounds and
+    uses max(field / L, signed distance to the bounds box) inside them and,
+    outside, hypot(field(c) / L, d) where field(c) > 0, else d (c the nearest
+    point of the box, d the distance to it): a distance bound like every other
+    shape's. Where |grad field| is below L that underestimates the distance,
+    so the solid's offsets, shells, blends and clearances come out larger
+    there (by up to L / |grad field|; inward offsets remove more) and probed
+    distances are smaller than true ones (verify_field and rad_verify report
+    L and how close the field is to a true distance). A field without a
+    finite slope bound (a division by a value that reaches 0, sqrt or log at
+    0, atan2 at its pole) fails the build, naming the region.
+    """
+    node = _field_root(field, "implicit")
+    box = _field_box(bounds, "implicit")
+    shape = SDF3(Opcode.IMPLICIT, (*box.lo, *box.hi), (node,))
+    line = _program_line()
+    if line is not None:
+        _implicit_lines[id(shape)] = (shape, line)
+    return shape
+
+
+def _analysis_box(lo, hi):
+    """The box IMPLICIT analyses: its bounds grown by 1e-6 of their largest
+    extent (the kernel's arithmetic, so the bound is the same)."""
+    lo, hi = [float(value) for value in lo], [float(value) for value in hi]
+    grow = 1e-6 * max(0.0, *(high - low for low, high in zip(lo, hi)))
+    return [value - grow for value in lo], [value + grow for value in hi]
+
+
+_NODE_REFERENCE = re.compile(r"node (\d+) \(([A-Z0-9_]+)\)")
+_FIELD_CONSTRUCTS = {
+    "CONST": "a number", "COORD": "a coordinate", "ADD": "a sum (+)", "SUB": "a difference (-)",
+    "MUL": "a product (*)", "DIV": "a division (/)", "NEG": "a negation (-)", "ABS": "abs()",
+    "SQUARE": "a square (** 2)", "SQRT": "sqrt()", "SIN": "sin()", "COS": "cos()", "EXP": "exp()",
+    "LOG": "log()", "POWC": "a power (**)", "ATAN2": "atan2()", "MIN": "minimum()", "MAX": "maximum()",
+    "CLAMP": "clamp()", "LENGTH": "length()", "TRIWAVE": "triwave()", "EVAL_AT": "shape.at()",
+    "SMIN": "minimum(..., smooth=k)", "SMAX": "maximum(..., smooth=k)",
+}
+
+
+def _describe_field_nodes(message, order):
+    """`message` with the kernel's references to field and IMPLICIT nodes
+    ("node 12 (DIV)") replaced by the Python constructs that made them;
+    `order` lists the encoded nodes by index."""
+    def describe(match):
+        index, name = int(match.group(1)), match.group(2)
+        node = order[index] if index < len(order) else None
+        if node is None or node.opcode.name != name:
+            return match.group(0)
+        if node.opcode == Opcode.IMPLICIT:
+            line = _implicit_line(node)
+            return "implicit()" + (f" at line {line}" if line is not None else "")
+        if isinstance(node, _FieldNode):
+            return _FIELD_CONSTRUCTS.get(name, match.group(0))
+        return match.group(0)
+    return _NODE_REFERENCE.sub(describe, message)
+
+
+def _field_report(report, order=None):
+    """A verify_field dictionary of a native rsdf_field_report; with `order`
+    (the encoded nodes) the failure names Python constructs, not nodes."""
+    ok = bool(report.ok)
+    result = {"ok": ok, "bound": float(report.bound) if ok else math.inf,
+              "value_range": (float(report.value_lo), float(report.value_hi)),
+              "gradient": {"min": float(report.gradient_min), "median": float(report.gradient_median),
+                           "max": float(report.gradient_max)},
+              "quality": float(report.quality), "boxes": int(report.boxes), "samples": int(report.samples)}
+    if not ok:
+        message = report.message.decode("utf-8", "replace")
+        result["message"] = message if order is None else _describe_field_nodes(message, order)
+        result["region"] = (tuple(report.failed_lo), tuple(report.failed_hi))
+    return result
+
+
+def _analyze_field(node, lo, hi):
+    """verify_field's analysis of a field root (a field node or a 3D shape,
+    read through a one-child MAX) over the box implicit(node, (lo, hi))
+    analyses at load."""
+    root = node if isinstance(node, _FieldNode) else _FieldNode(Opcode.MAX, (), (node,))
+    data, roots, order = _encode([root], with_order=True)
+    try:
+        graph = Graph.from_bytes(data, roots)
+    except SDFError as error:
+        raise SDFError(_describe_field_nodes(str(error), order)) from None
+    with graph:
+        report = graph.analyze_field(roots[0], (lo, hi))
+    if "message" in report:
+        report["message"] = _describe_field_nodes(report["message"], order)
+    return report
+
+
+def verify_field(field, bounds=None):
+    """The proof implicit(field, bounds) makes when its solid loads, as a
+    dictionary: `ok` (a finite slope bound exists), `bound` (the proven upper
+    bound L of |grad field|, inf without one), `value_range` (proven
+    (lo, hi) of the field), `gradient` (min, median and max of |grad field|
+    at up to 4,096 sample points, fewer for costly fields), `quality`
+    (median / bound: 1 for a true distance, lower where implicit()
+    underestimates distances), `boxes` and `samples`; without a bound also
+    `message` and `region` ((lo, hi) where it fails). An implicit() shape
+    may be passed without bounds.
+    """
+    if bounds is None and isinstance(field, SDF3) and field.opcode == Opcode.IMPLICIT:
+        return _analyze_field(field.children[0], field.params[:3], field.params[3:])
+    if bounds is None:
+        raise SDFError("verify_field needs the bounds the field is used in (or an implicit() shape).")
+    box = _field_box(bounds, "verify_field")
+    return _analyze_field(_field_root(field, "verify_field"), box.lo, box.hi)
+
+
+__all__ += ["Field", "x", "y", "z", "sin", "cos", "exp", "log", "sqrt", "atan2", "minimum", "maximum", "clamp",
+            "length", "triwave", "implicit", "verify_field"]
+
+
 # ================================================================== RSDF encoding
 
+def _node_of(value):
+    """The graph node of a shape, a Field or a field node (None otherwise)."""
+    if isinstance(value, (_Shape, _FieldNode)):
+        return value
+    if isinstance(value, Field):
+        return value._node
+    return None
+
+
 def _root_list(shapes):
-    if isinstance(shapes, _Shape):
-        return [shapes]
+    """The graph nodes of a shape or field, or of a list of them."""
+    single = _node_of(shapes)
+    if single is not None:
+        return [single]
     try:
         roots = list(shapes)
     except TypeError:
         raise SDFError(f"Expected a shape or shapes, got {type(shapes).__name__}.") from None
     if not roots:
         raise SDFError("Expected at least one shape.")
-    for root in roots:
-        if not isinstance(root, _Shape):
+    nodes = [_node_of(root) for root in roots]
+    for root, node in zip(roots, nodes):
+        if node is None:
             raise SDFError(f"Expected a shape, got {type(root).__name__}.")
-    return roots
+    return nodes
 
 
 _EXACT_FOLDS = frozenset({Opcode.UNION, Opcode.INTERSECTION, Opcode.DIFFERENCE,
@@ -1027,8 +1666,9 @@ def _record_children(node, uses):
     return [*children, *itertools.chain.from_iterable(reversed(levels))] if levels else children
 
 
-def _encode(roots):
-    """RSDF bytes of every node reachable from `roots`, and each root's index."""
+def _encode(roots, with_order=False):
+    """RSDF bytes of every node reachable from `roots`, and each root's index
+    (plus the nodes in record order with `with_order`)."""
     uses = _use_counts(roots)
     # Iterative depth-first post-order keeps children before parents, visits
     # shared nodes once and survives graphs deeper than the recursion limit.
@@ -1067,11 +1707,13 @@ def _encode(roots):
         if size > _MAX_BYTES:
             raise SDFError("The shape graph exceeds the 512 MB RSDF size limit.")
         records.append(record)
+    if with_order:
+        return b"".join(records), [index[id(root)] for root in roots], order
     return b"".join(records), [index[id(root)] for root in roots]
 
 
 def serialize(roots):
-    """Encode a shape, or a list of shapes, as an RSDF version 1 graph.
+    """Encode a shape or field, or a list of them, as an RSDF version 1 graph.
 
     Returns (data, root_indices): the bytes and the node index of each root,
     in order. A node shared by several parents or roots is written once, and
@@ -1084,7 +1726,7 @@ def serialize(roots):
 
 _LIBRARY_NAME = "libRADSDF.dylib"
 _LIBRARY_VARIABLE = "RAD_SDF_LIBRARY"
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 _REFINE_STEPS = 6  # the kernel's documented default crossing refinement
 _MIN_CREASE_ANGLE = 1e-9  # degrees; a crease angle of 0 creases every edge
 
@@ -1101,7 +1743,8 @@ class _MeshStats(ctypes.Structure):
     _fields_ = [("vertex_count", ctypes.c_uint64), ("triangle_count", ctypes.c_uint64),
                 ("crease_segment_count", ctypes.c_uint64), ("active_cells", ctypes.c_uint64),
                 ("boundary_edges", ctypes.c_uint64), ("nonmanifold_edges", ctypes.c_uint64),
-                ("components", ctypes.c_uint64), ("volume", ctypes.c_double), ("area", ctypes.c_double),
+                ("components", ctypes.c_uint64), ("cavities", ctypes.c_uint64), ("volume", ctypes.c_double),
+                ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double),
                 ("centroid", ctypes.c_double * 3), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
                 ("seconds", ctypes.c_double)]
@@ -1109,6 +1752,15 @@ class _MeshStats(ctypes.Structure):
 
 class _SimplifyOptions(ctypes.Structure):
     _fields_ = [("tolerance", ctypes.c_double), ("threads", ctypes.c_int32), ("reserved", ctypes.c_int32)]
+
+
+class _FieldReport(ctypes.Structure):
+    _fields_ = [("bound", ctypes.c_double), ("value_lo", ctypes.c_double), ("value_hi", ctypes.c_double),
+                ("gradient_min", ctypes.c_double), ("gradient_median", ctypes.c_double),
+                ("gradient_max", ctypes.c_double), ("quality", ctypes.c_double), ("boxes", ctypes.c_uint64),
+                ("samples", ctypes.c_uint64), ("ok", ctypes.c_int32), ("failed_node", ctypes.c_uint32),
+                ("failed_lo", ctypes.c_double * 3), ("failed_hi", ctypes.c_double * 3),
+                ("message", ctypes.c_char * 512)]
 
 
 class _GraphHandle(ctypes.Structure):
@@ -1149,6 +1801,8 @@ _PROTOTYPES = {
     "rsdf_mesh_triangles": (ctypes.POINTER(ctypes.c_uint32), [_MESH]),
     "rsdf_mesh_creases": (_FLOATS, [_MESH]),
     "rsdf_mesh_simplify": (_MESH, [_GRAPH, ctypes.c_uint32, _MESH, ctypes.POINTER(_SimplifyOptions)]),
+    "rsdf_field_analyze": (ctypes.c_int, [_GRAPH, ctypes.c_uint32, _DOUBLES, _DOUBLES, ctypes.c_uint32,
+                                          ctypes.POINTER(_FieldReport)]),
 }
 
 
@@ -1274,8 +1928,11 @@ class Graph:
 
     def __init__(self, shapes):
         shapes = _root_list(shapes)
-        data, roots = _encode(shapes)
-        self._load(data, "Building the shape graph")
+        data, roots, order = _encode(shapes, with_order=True)
+        try:
+            self._load(data, "Building the shape graph")
+        except SDFError as error:
+            raise SDFError(_describe_field_nodes(str(error), order)) from None
         self.roots = tuple(roots)
         self._targets = {id(shape): (shape, index) for shape, index in zip(shapes, roots)}
 
@@ -1363,12 +2020,13 @@ class Graph:
                 self._release()
 
     def _target(self, target):
-        """(node index, dimension) of a root shape or a raw node index."""
-        if isinstance(target, _Shape):
-            entry = self._targets.get(id(target))
-            if entry is None or entry[0] is not target:
+        """(node index, dimension) of a root shape or field, or a raw node index."""
+        node = _node_of(target)
+        if node is not None:
+            entry = self._targets.get(id(node))
+            if entry is None or entry[0] is not node:
                 raise SDFError("The shape is not one of this graph's roots.")
-            return entry[1], target.dimension
+            return entry[1], node.dimension
         index = _whole(target, "node index", 0, self.node_count - 1)
         with self._live() as handle:
             dimension = _native().rsdf_node_dimension(handle, index)
@@ -1381,6 +2039,24 @@ class Graph:
         if dimension != 3:
             raise SDFError(f"{operation} needs a 3D solid; extrude or revolve the profile first.")
         return node
+
+    def analyze_field(self, target, bounds=None):
+        """verify_field's dictionary for an IMPLICIT node of the graph (over
+        the box it analyses at load when `bounds` is None, so the bound is
+        its L) or a field root (over `bounds` as implicit() analyses it).
+        Node references in a failure message are the graph's node indices."""
+        node, _ = self._target(target)
+        if bounds is None:
+            lo = hi = None
+        else:
+            box = _field_box(bounds, "analyze_field")
+            analysis_lo, analysis_hi = _analysis_box(box.lo, box.hi)
+            lo, hi = (ctypes.c_double * 3)(*analysis_lo), (ctypes.c_double * 3)(*analysis_hi)
+        report = _FieldReport()
+        with self._live() as handle:
+            _check(_native().rsdf_field_analyze(handle, node, lo, hi, 0, ctypes.byref(report)),
+                   "Analyzing the field")
+        return _field_report(report)
 
     def _bounds_and_lipschitz(self, target):
         node, dimension = self._target(target)
@@ -1639,7 +2315,8 @@ def auto_cell_size(bounds, cells_across=200, minimum=0.02):
 
 _STL_HEADER = b"RAD binary STL, millimetres".ljust(80, b" ")
 _STL_RECORD = np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
-_SUMMED_STATS = ("active_cells", "boundary_edges", "nonmanifold_edges", "components", "seconds")
+_SUMMED_STATS = ("active_cells", "boundary_edges", "nonmanifold_edges", "components", "cavities", "cavity_volume",
+                 "seconds")
 
 
 def _mesh_array(values, dtype, tail, name):
@@ -1735,6 +2412,8 @@ class Mesh:
         creases = self.creases.astype(np.float64) @ linear.T + offset
         mesh = Mesh(positions, normals, triangles, creases, self.stats)
         mesh.stats.update(_measure(mesh.positions, mesh.triangles))
+        if "cavity_volume" in mesh.stats:  # cavities keep their count
+            mesh.stats["cavity_volume"] = float(mesh.stats["cavity_volume"]) * abs(determinant)
         return mesh
 
 
@@ -1773,8 +2452,6 @@ def merge_meshes(meshes):
 # (SDF-DESIGN.md). The readers weld vertices and mend zero-area triangles that
 # close T-junctions; the kernel validates the mesh when it is loaded, which
 # mesh_solid does at once.
-
-import re  # noqa: E402
 
 __all__ += ["mesh_solid", "load_stl", "load_obj"]
 

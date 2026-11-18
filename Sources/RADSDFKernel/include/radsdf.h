@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define RSDF_ABI_VERSION 1
+#define RSDF_ABI_VERSION 2
 
 typedef struct rsdf_graph rsdf_graph;
 typedef struct rsdf_mesh rsdf_mesh;
@@ -42,8 +42,11 @@ typedef struct {
     uint64_t boundary_edges;     /* edges with a single adjacent triangle */
     uint64_t nonmanifold_edges;  /* edges shared by more than two triangles */
     uint64_t components;         /* connected surface components */
+    uint64_t cavities;           /* sealed voids: components enclosing at least half a cell cubed of negative
+                                    volume, or less volume of either sign and surrounded by material */
     double volume;
     double area;
+    double cavity_volume;        /* volume enclosed by the cavity surfaces (islands inside them included) */
     double centroid[3];
     double bounds_lo[3];
     double bounds_hi[3];
@@ -113,6 +116,37 @@ typedef struct {
  * meshes), or NULL on failure. */
 rsdf_mesh *rsdf_mesh_simplify(const rsdf_graph *graph, uint32_t node, const rsdf_mesh *mesh,
                               const rsdf_simplify_options *options);
+
+/* Custom fields. A field (a traced expression, opcodes 200-223) becomes a
+ * solid through an IMPLICIT node, whose load proves an upper bound L of
+ * |grad f| over its bounds. rsdf_field_analyze repeats that proof for an
+ * IMPLICIT node's field or a field node that no other field reads (a field
+ * root) over the box [lo, hi] (both NULL: an IMPLICIT node's bounds grown by
+ * 1e-6 of their largest extent, as at load), with up to max_boxes interval
+ * evaluations (0 = the default budget: at most 32768, fewer for large
+ * fields), and, when a bound exists, samples |grad f| at a fixed
+ * low-discrepancy set of points of the box. Returns 0 when the report was
+ * written, whether or not a finite bound exists (report->ok), and a negative
+ * value for invalid arguments. */
+typedef struct {
+    double bound;            /* proven upper bound of |grad f| over the box; INFINITY when none exists */
+    double value_lo;         /* proven range of f over the box */
+    double value_hi;
+    double gradient_min;     /* |grad f| at the sample points (finite samples only) */
+    double gradient_median;
+    double gradient_max;
+    double quality;          /* gradient_median / bound: 1 for a true distance; 0 without a bound */
+    uint64_t boxes;          /* boxes evaluated */
+    uint64_t samples;        /* sample points with a finite gradient */
+    int32_t ok;              /* 1 when a finite bound was proven */
+    uint32_t failed_node;    /* without a bound: the node whose slope is unbounded */
+    double failed_lo[3];     /* without a bound: the region where it fails */
+    double failed_hi[3];
+    char message[512];       /* without a bound: what failed, naming the node and region; else "" */
+} rsdf_field_report;
+
+int rsdf_field_analyze(const rsdf_graph *graph, uint32_t node, const double *lo, const double *hi,
+                       uint32_t max_boxes, rsdf_field_report *report);
 
 #ifdef __cplusplus
 }

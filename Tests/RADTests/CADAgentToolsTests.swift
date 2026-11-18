@@ -163,6 +163,10 @@ final class CADAgentToolsTests: XCTestCase {
             ("rad_measure", ["points": [["point": [0, 0, 0], "partID": "case"]]], "Points snap to one physical part"),
             ("rad_measure", ["points": [["point": [500, 500, 500]]]], "is not near any part"),
             ("rad_validate", ["cellSize": 0], "must be positive"),
+            ("rad_verify", ["artifactID": "current", "programPath": "program.py"], "not both"),
+            ("rad_verify", ["assetIDs": [String]()], "apply when verifying a program file"),
+            ("rad_verify", ["artifactID": "missing"], "unavailable in this task"),
+            ("rad_verify", ["cellSize": 1], "unsupported arguments"),
             ("rad_check_motion", ["joint": "j", "from": 0, "to": 1, "pairs": [["base", "lid"]], "requiredClearance": -1], "‘requiredClearance’"),
             ("rad_export_stl", ["printLayout": true, "jointPositions": ["j": 1]], "printLayout without jointPositions"),
             ("rad_export_stl", ["jointPositions": ["j": 1]], "no assembly joints"),
@@ -325,6 +329,105 @@ final class CADAgentToolsTests: XCTestCase {
         XCTAssertEqual(passed.metadata["cellSize"] as? Double, 0.05)
         let committed = try await tools.committableCandidate(artifactID: valid)
         XCTAssertNotNil(committed.preview.validatedHash, "A committed candidate carries its validation receipt.")
+    }
+
+    @MainActor
+    func testCustomFieldsReportTheirProvenSlopeBoundAndFailingRegions() async throws {
+        guard ProcessInfo.processInfo.environment["RAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set RAD_RUN_ENGINE_TESTS=1 to build and verify custom fields.")
+        }
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gyroid = """
+            k = 2 * math.pi / 10.0
+            g = sin(k*x)*cos(k*y) + sin(k*y)*cos(k*z) + sin(k*z)*cos(k*x)
+            lattice = implicit(abs(g) - 0.35, bounds=((-20, -20, -20), (20, 20, 20)))
+            result = Assembly("Lattice")
+            result.add(intersection(box(40), lattice), id="lattice", name="Lattice")
+            """
+        try Data(gyroid.utf8).write(to: root.appendingPathComponent("gyroid.py"))
+        try Data("result = implicit(1 / x, ((-1, -1, -1), (1, 1, 1)))\n".utf8).write(to: root.appendingPathComponent("pole.py"))
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+                                      current: nil, currentPreview: nil, engine: EngineService())
+        // A program is verified before it is built.
+        let unbuilt = try await tools.handle(name: "rad_verify", arguments: ["programPath": "gyroid.py"]).metadata
+        XCTAssertEqual(unbuilt["verified"] as? Bool, true)
+        XCTAssertEqual(unbuilt["fieldCount"] as? Int, 1)
+        let field = try XCTUnwrap((unbuilt["fields"] as? [[String: Any]])?.first)
+        let bound = try XCTUnwrap(field["slopeBound"] as? Double)
+        // The gyroid's steepest slope is sqrt(3) * k; the proof may not go below it.
+        XCTAssertGreaterThanOrEqual(bound, 3.squareRoot() * 2 * .pi / 10)
+        XCTAssertLessThan(bound, 1.6)
+        XCTAssertEqual(field["line"] as? Int, 3)
+        XCTAssertEqual((field["parts"] as? [[String: Any]])?.first?["partID"] as? String, "lattice")
+        XCTAssertTrue((0.3...1).contains(try XCTUnwrap(field["distanceQuality"] as? Double)))
+        XCTAssertEqual((field["gradientLength"] as? [String: Double])?.keys.sorted(), ["max", "median", "min"])
+
+        let built = try await tools.handle(name: "rad_build", arguments: ["programPath": "gyroid.py", "title": "Lattice"]).metadata
+        let summary = try XCTUnwrap((built["customFields"] as? [[String: Any]])?.first)
+        XCTAssertEqual(summary["slopeBound"] as? Double, bound, "The solid divides its field by the bound rad_verify proves.")
+        XCTAssertEqual(summary["parts"] as? [String], ["Lattice"])
+        XCTAssertEqual(summary["line"] as? Int, 3)
+        XCTAssertNotNil(built["customFieldsNote"])
+        let artifact = try XCTUnwrap(built["artifactID"] as? String)
+        let verified = try await tools.handle(name: "rad_verify", arguments: ["artifactID": artifact]).metadata
+        XCTAssertEqual((verified["fields"] as? [[String: Any]])?.first?["slopeBound"] as? Double, bound)
+
+        do {
+            _ = try await tools.handle(name: "rad_build", arguments: ["programPath": "pole.py"])
+            XCTFail("A field without a finite slope bound does not build.")
+        } catch {
+            for detail in ["implicit() at line 1", "a division (/)", "divisor may be 0", "rad_verify"] {
+                XCTAssertTrue(error.localizedDescription.contains(detail), error.localizedDescription)
+            }
+        }
+        let pole = try await tools.handle(name: "rad_verify", arguments: ["programPath": "pole.py"]).metadata
+        XCTAssertEqual(pole["verified"] as? Bool, false)
+        let failed = try XCTUnwrap((pole["fields"] as? [[String: Any]])?.first)
+        XCTAssertEqual(failed["ok"] as? Bool, false)
+        XCTAssertNil(failed["slopeBound"])
+        XCTAssertTrue((failed["problem"] as? String)?.contains("the divisor may be 0") == true)
+        let region = try XCTUnwrap(failed["region"] as? [Double])
+        XCTAssertLessThanOrEqual(region[0], 0)
+        XCTAssertGreaterThanOrEqual(region[3], 0, "The failing region holds the plane x = 0.")
+
+        // Fields beyond the 64 verified ones leave the design unverified.
+        let beads = (0..<70).map { index -> String in
+            let pole = index == 69 ? " + 0.1 / (x - \(index * 3))" : ""
+            return "parts.append(implicit(length(x - \(index * 3), y, z) - 1\(pole), ((\(index * 3 - 2), -2, -2), (\(index * 3 + 2), 2, 2))))"
+        }
+        try Data((["parts = []"] + beads + ["result = union(parts)"]).joined(separator: "\n").utf8)
+            .write(to: root.appendingPathComponent("beads.py"))
+        let many = try await tools.handle(name: "rad_verify", arguments: ["programPath": "beads.py"]).metadata
+        XCTAssertEqual(many["fieldCount"] as? Int, 70)
+        XCTAssertEqual((many["fields"] as? [[String: Any]])?.count, EngineService.FieldVerification.maximumFields)
+        XCTAssertEqual((many["fields"] as? [[String: Any]])?.allSatisfy { $0["ok"] as? Bool == true }, true)
+        XCTAssertEqual(many["verified"] as? Bool, false, "The unverified 70th field has no bound.")
+        XCTAssertTrue((many["fieldsTruncated"] as? String)?.contains("first 64 of 70") == true)
+    }
+
+    @MainActor
+    func testSealedCavitiesAreReportedApartFromPieces() async throws {
+        guard ProcessInfo.processInfo.environment["RAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set RAD_RUN_ENGINE_TESTS=1 to build designs.")
+        }
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("result = box(10) - sphere(3)\n".utf8).write(to: root.appendingPathComponent("hollow.py"))
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+                                      current: nil, currentPreview: nil, engine: EngineService())
+        let built = try await tools.handle(name: "rad_build", arguments: ["programPath": "hollow.py", "title": "Hollow"]).metadata
+        let part = try XCTUnwrap((built["parts"] as? [[String: Any]])?.first)
+        XCTAssertEqual(part["pieces"] as? Int, 1)
+        XCTAssertEqual(part["cavities"] as? Int, 1)
+        XCTAssertNotNil(built["cavitiesNote"])
+        XCTAssertEqual((built["warnings"] as? [String])?.filter { $0.contains("pieces") } ?? [], [])
+        let artifact = try XCTUnwrap(built["artifactID"] as? String)
+        let validated = try await tools.handle(name: "rad_validate", arguments: ["artifactID": artifact]).metadata
+        XCTAssertEqual(validated["valid"] as? Bool, true)
+        let checked = try XCTUnwrap((validated["parts"] as? [[String: Any]])?.first)
+        XCTAssertEqual(checked["pieces"] as? Int, 1)
+        XCTAssertEqual(checked["cavities"] as? Int, 1)
     }
 
     private func content(_ result: CADAgentToolResult) throws -> [String: Any] {

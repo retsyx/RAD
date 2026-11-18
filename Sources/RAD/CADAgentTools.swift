@@ -321,7 +321,7 @@ final class CADAgentTools {
             return try result(["pythonExecutable": python, "runtime": try json(runtime!), "threads": threads,
                                "workspace": workspace.root.path, "apiGuidePath": guide.path,
                                "programInterface": "A Python program using the radsdf SDF modeling API assigns its final solid, list of solids or Assembly to result. Every public radsdf name (sphere, box, cylinder, circle, rect, polygon, union, difference, Assembly, Motion, ...), the module as sdf, math, np, rad (rad.print) and imported_assets are preloaded. Millimetres and degrees; distances are negative inside.",
-                               "capabilities": ["3D primitives", "2D profiles", "extrude", "tapered extrude", "revolve", "loft", "booleans", "smooth blends", "shell", "offset", "twist", "elongate", "mirror", "linear, grid and polar arrays", "involute gears", "assemblies", "motion and couplings", "3D printing version", "SDF probes", "numeric measurements", "PNG rendering", "STL export", "STL and OBJ mesh import"],
+                               "capabilities": ["3D primitives", "2D profiles", "extrude", "tapered extrude", "revolve", "loft", "booleans", "smooth blends", "shell", "offset", "twist", "elongate", "mirror", "linear, grid and polar arrays", "involute gears", "assemblies", "motion and couplings", "3D printing version", "custom fields (implicit)", "SDF probes", "numeric measurements", "PNG rendering", "STL export", "STL and OBJ mesh import"],
                                "externalTools": "External tools are user-managed. Before each new optional download or dependency installation, call rad_request_permission with the proposed operation and reason, even after a previous always-allow/always-deny result; Settings can change at any time. Proceed only when the current result has allowed true. That tool returns a decision only; you execute any approved operation in an isolated environment inside this task workspace, using RAD's Python as the base for a helper environment if needed. Never change RAD's shared runtime, global settings, original sources or files outside the task workspace. Final authored geometry must replay using only RAD's bundled CAD dependencies and registered reference inputs. rad_import is only for pre-existing external or reference meshes and faithful format conversions of user-provided inputs; never import or otherwise freeze geometry generated for this design, by RAD (such as an exported STL) or by external tools.",
                                "apiHelp": "The selected runtime is ready to use; no CAD environment bootstrap is needed. Read apiGuidePath for the complete modeling guide and run programs with rad_build.",
                                "inputAssets": inputs.values.sorted { $0.id < $1.id }.map { ["assetID": $0.id, "name": $0.name, "format": $0.format] }])
@@ -593,7 +593,7 @@ final class CADAgentTools {
                 }
                 return try result(["artifactID": artifact.id, "kind": kind, "coordinateSpace": space, "solidIndices": probed,
                                    "points": rows, "units": "mm",
-                                   "note": "distance is the signed distance field value: negative inside, 0 on the surface. Smooth blends, booleans and offsets make it a lower bound of the true distance away from the surface; rays trace to the actual surface."])
+                                   "note": "distance is the signed distance field value: negative inside, 0 on the surface. Smooth blends, booleans and offsets make it a lower bound of the true distance away from the surface, and implicit() parts report f / slopeBound, smaller still where distanceQuality is below 1; rays trace to the actual surface."])
             }
         case "rad_measure":
             try allowed(arguments, ["artifactID", "partIDs", "solidIndices", "points"])
@@ -667,18 +667,89 @@ final class CADAgentTools {
             info["parts"] = validation.parts.map { part -> [String: Any] in
                 var item: [String: Any] = ["solidIndex": part.solid, "closed": part.closed, "boundaryEdges": part.boundaryEdges,
                                            "nonmanifoldEdges": part.nonmanifoldEdges, "pieces": part.components,
-                                           "volume": part.volume, "previewVolume": part.previewVolume,
-                                           "volumeChange": part.volumeChange]
+                                           "cavities": part.cavities ?? 0, "volume": part.volume,
+                                           "previewVolume": part.previewVolume, "volumeChange": part.volumeChange]
+                if let cavities = part.previewCavities { item["previewCavities"] = cavities }
                 if let owner = owners[part.solid] { item["partID"] = owner.id; item["name"] = owner.name }
                 return item
             }
             info["checks"] = ["program ran and every part has a finite, nonempty SDF",
                               "every part meshed closed at the preview resolution with positive volume",
                               "every part re-meshed at the validation cell size: closed surface, no boundary or non-manifold edges",
-                              "the same number of pieces as the preview mesh",
+                              "the same number of pieces and sealed cavities as the preview mesh",
                               "volume within 2% of the preview mesh"]
             if !validation.ok {
-                info["nextStep"] = "Thicken features thinner than about two preview cells, separate touching parts or surfaces, or remove slivers, then rebuild and validate again."
+                info["nextStep"] = "Thicken features thinner than about two preview cells, separate touching parts or surfaces, remove slivers, or close sealed gaps that thin (such as clearance between bodies unioned into one part; add bodies that move as separate parts), then rebuild and validate again."
+            }
+            return try result(info)
+        case "rad_verify":
+            try allowed(arguments, ["artifactID", "programPath", "assetIDs", "print"])
+            let model: ModelSpec
+            let printing: Bool
+            var parts: [PartNode]? = nil
+            var info: [String: Any] = ["units": "mm"]
+            if let path = try string("programPath", arguments) {
+                guard arguments["artifactID"] == nil else {
+                    throw RADError.message("Verify either an artifact or a program file, not both.")
+                }
+                let bytes = try workspace.read(path, maximumBytes: 200_000)
+                guard let script = String(data: bytes, encoding: .utf8), !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw RADError.message("The CAD program must be nonempty UTF-8 Python text.")
+                }
+                let selected = try resolveAssets(ids: try strings("assetIDs", arguments) ?? (current?.inputAssets ?? []).map(\.id))
+                model = ModelSpec(title: "Custom field verification", summary: "Custom fields verified by RAD.", units: "mm",
+                                  script: script, inputAssets: selected.isEmpty ? nil : selected)
+                printing = try bool("print", arguments) ?? false
+                info["programPath"] = try workspace.url(path).path
+            } else {
+                guard arguments["assetIDs"] == nil, arguments["print"] == nil else {
+                    throw RADError.message("assetIDs and print apply when verifying a program file; an artifact keeps its own inputs and build.")
+                }
+                let id = try string("artifactID", arguments) ?? "current"
+                if let artifact = artifacts[id] {
+                    model = artifact.model
+                    printing = artifact.print
+                    if !artifact.parts.isEmpty { parts = artifact.parts }
+                } else if id == "current", let current {
+                    model = current
+                    printing = false
+                } else {
+                    throw RADError.message(id == "current" ? "There is no current design. Build a CAD program first." : "The requested CAD artifact is unavailable in this task.")
+                }
+                info["artifactID"] = id
+            }
+            let verification = try await engine.verifyFields(model, print: printing, python: python, threads: threads)
+            try checkCancellation()
+            let owners = Self.owners(in: parts ?? verification.parts ?? [])
+            info["fieldCount"] = verification.fieldCount
+            let complete = verification.fields.count == verification.fieldCount
+            info["verified"] = complete && verification.fields.allSatisfy(\.ok)
+            info["fields"] = verification.fields.map { field -> [String: Any] in
+                var item: [String: Any] = ["ok": field.ok, "bounds": field.bounds,
+                                           "parts": field.solids.map { solid -> [String: Any] in
+                                               var part: [String: Any] = ["solidIndex": solid]
+                                               if let owner = owners[solid] { part["partID"] = owner.id; part["name"] = owner.name }
+                                               return part
+                                           }]
+                if let line = field.line { item["line"] = line }
+                if let bound = field.slopeBound { item["slopeBound"] = bound }
+                if let range = field.valueRange { item["valueRange"] = range }
+                if let gradient = field.gradient {
+                    item["gradientLength"] = ["min": gradient.min, "median": gradient.median, "max": gradient.max]
+                }
+                if let quality = field.quality { item["distanceQuality"] = quality }
+                if let boxes = field.boxes { item["boxes"] = boxes }
+                if let message = field.message { item["problem"] = message }
+                if let region = field.region { item["region"] = region }
+                return item
+            }
+            if !complete {
+                info["fieldsTruncated"] = "Only the first \(verification.fields.count) of \(verification.fieldCount) implicit() shapes were verified, so verified is false; rad_build proves every field when the design loads and fails on any without a bound."
+            }
+            if verification.fieldCount == 0 {
+                info["note"] = "The program has no implicit() shapes."
+            } else {
+                info["interpretation"] = "slopeBound is the proven upper bound of |grad f| over the bounds; inside the bounds the solid's field is max(f / slopeBound, signed distance to the bounds box), and outside them hypot(f(c) / slopeBound, d) where f(c) > 0, else d (c the nearest point of the box, d the distance to it): a distance bound. Outward offsets, shells, smooth blends and clearance pockets that reach past the bounds bulge past the requested surface there (by up to about 0.4 of the reach for a true distance, more where distanceQuality is lower), so make the bounds enclose the solid by more than that reach divided by distanceQuality. distanceQuality is the median sampled gradient length / slopeBound: 1 for a true distance. Below 1 the solid's field underestimates distances, so its outward offsets, shells, smooth blend radii and clearance pockets come out larger than requested (by up to about 1/distanceQuality), inward offsets remove more, and probed distances are smaller than true distances; to compensate, multiply requested distances by about distanceQuality, or build the thickness into the field. A field without a finite slope bound fails rad_build: change the operation named in problem within region, or shrink the bounds."
             }
             return try result(info)
         case "rad_render":
@@ -1115,6 +1186,7 @@ final class CADAgentTools {
             var item: [String: Any] = ["solidIndex": part.solidIndex, "volume": part.volume, "area": part.area,
                                        "bounds": part.bounds, "centroid": part.centroid, "triangles": part.triangles,
                                        "pieces": part.components]
+            if let cavities = part.cavities, cavities > 0 { item["cavities"] = cavities }
             if references.contains(part.solidIndex) { item["reference"] = true }
             if let owner = owners[part.solidIndex] {
                 item["partID"] = owner.id; item["name"] = owner.name
@@ -1418,6 +1490,9 @@ final class CADAgentTools {
             let posed = CADMeasurements.posedParts(Array(stats.prefix(Self.summaryParts)),
                                                    transforms: preview.assemblyPose?.solidTransforms ?? [:])
             result["parts"] = (try? partItems(posed, artifact: artifact)) ?? []
+            if stats.contains(where: { ($0.cavities ?? 0) > 0 }) {
+                result["cavitiesNote"] = "cavities counts sealed voids inside a part, which are not separate pieces; printed, they trap powder, resin or support material."
+            }
             if stats.count > Self.summaryParts {
                 result["partsTruncated"] = "The first \(Self.summaryParts) of \(stats.count) parts; page the rest with rad_inspect kind=parts."
             }
@@ -1435,6 +1510,18 @@ final class CADAgentTools {
         }
         if let references = preview.referenceSolids, !references.isEmpty {
             result["referenceSolids"] = references
+        }
+        if let fields = preview.customFields, !fields.isEmpty {
+            let owners = Self.owners(in: artifact.parts)
+            result["customFields"] = fields.map { field -> [String: Any] in
+                var item: [String: Any] = ["solidIndices": field.solids, "bounds": field.bounds,
+                                           "slopeBound": field.slopeBound, "distanceQuality": field.quality]
+                let names = field.solids.compactMap { owners[$0]?.name }
+                if !names.isEmpty { item["parts"] = names }
+                if let line = field.line { item["line"] = line }
+                return item
+            }
+            result["customFieldsNote"] = "Each implicit() solid divides its field by slopeBound. distanceQuality below 1 makes its offsets, shells, blends and clearances larger than requested (by up to about 1/distanceQuality) and its probed distances smaller; rad_verify reports value ranges, gradient statistics and failures."
         }
         return result
     }

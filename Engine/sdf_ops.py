@@ -28,7 +28,7 @@ import numpy as np
 import radsdf
 from assembly_motion import AssemblyMotionError, validate_pose_records
 from sdf_build import (MAX_GEOMETRY_BYTES, MAX_PARTS, PREVIEW_CELLS_ACROSS, PREVIEW_CREASE_ANGLE,
-                       PREVIEW_MINIMUM_CELL, HostError, ModelError, mesh_parts, unrefined_triangles)
+                       PREVIEW_MINIMUM_CELL, HostError, ModelError, mesh_parts, mesh_pieces, unrefined_triangles)
 
 SOURCE_NAME = "source.rsdf"
 SOURCE_FIELDS = frozenset({"operation", "artifact", "artifactIdentity", "partRoots"})
@@ -417,6 +417,28 @@ def project(source, solids, pose, points, threads, steps=PROJECTION_STEPS):
     return points
 
 
+def snap(source, solid, point, threads):
+    """A point (built coordinates) moved onto its part's surface: projected
+    along the field's gradients, else from the nearest vertex of the part's
+    sampling mesh (where the gradient leads nowhere, such as a field without
+    a slope toward its surface)."""
+    built = Pose([], source.solids)
+    tolerance = CONTACT_TOLERANCE * (1.0 + float(np.abs(point).max()))
+
+    def projected(start):
+        moved = project(source, [solid], built, start[None], threads, steps=16)[0]
+        value = float(group_field(source, [solid], built, moved[None], threads)[0][0])
+        return moved if np.all(np.isfinite(moved)) and abs(value) <= tolerance else None
+
+    snapped = projected(point)
+    if snapped is None:
+        positions = source.sample_mesh(solid, threads).positions.astype(np.float64)
+        snapped = projected(positions[int(np.argmin(np.sum((positions - point) ** 2, axis=1)))])
+    if snapped is None:
+        raise ModelError(f"The point {_vector(point)} cannot be moved onto the surface of {source.label(solid)}.")
+    return snapped
+
+
 def posed_samples(source, solids, pose, threads):
     """World positions (float64) of the group's sampling-mesh vertices."""
     return np.concatenate([pose.apply(solid, source.sample_mesh(solid, threads).positions.astype(np.float64))
@@ -680,11 +702,10 @@ def measure(spec, source, output, threads):
     if len(parsed) == 2 and parsed[0] == parsed[1]:
         raise ModelError("Choose two different items to measure.")
     pose = Pose(spec.get("solidTransforms", []), source.solids)
-    built = Pose([], source.solids)
     report, points, world = {"metrics": []}, [], []
     for kind, solid, point in parsed:
         if kind == "point":
-            snapped = project(source, [solid], built, np.array([point], dtype=np.float64), threads, steps=16)[0]
+            snapped = snap(source, solid, np.array(point, dtype=np.float64), threads)
             normal = source.graph.gradient(source.roots[solid], snapped, threads=threads)
             points.append({"solid": solid, "point": _vector(snapped), "normal": _vector(normal)})
             world.append(pose.apply(solid, snapped[None])[0])
@@ -1304,7 +1325,8 @@ class _Labels:
 def validate(spec, source, output, threads):
     """Re-mesh every part finer than its preview (half the preview cell size
     unless cellSize is given) and report open or non-manifold surfaces,
-    parts that split or lose pieces, and volume changes above 2%."""
+    parts that split or lose pieces, sealed cavities that open or close, and
+    volume changes above 2%."""
     requested = positive_cell(spec, "validation")
     boxes = [source.bounds(solid) for solid in range(source.solids)]
     # The preview is deterministic: replaying its meshing reproduces the
@@ -1328,8 +1350,10 @@ def validate(spec, source, output, threads):
         triangles = len(mesh.triangles)
         boundary = int(stats.get("boundary_edges", 0))
         nonmanifold = int(stats.get("nonmanifold_edges", 0))
-        components = int(stats.get("components", 0)) if triangles else 0
-        before = int(preview.stats.get("components", 1))
+        components = mesh_pieces(stats) if triangles else 0  # sealed cavities are not pieces
+        cavities = int(stats.get("cavities", 0)) if triangles else 0
+        before = mesh_pieces(preview.stats)
+        preview_cavities = int(preview.stats.get("cavities", 0))
         volume = float(stats.get("volume", 0.0)) if triangles else 0.0
         preview_volume = float(preview.stats["volume"])
         change = (volume - preview_volume) / preview_volume
@@ -1349,6 +1373,10 @@ def validate(spec, source, output, threads):
             elif components < before:
                 problems.append(f"{label} has {components} pieces at {cell:.4g} mm where the preview shows "
                                 f"{before}: some preview pieces vanish or merge at a finer resolution.")
+            if cavities != preview_cavities:
+                problems.append(f"{label} has {cavities} sealed cavities at {cell:.4g} mm where the preview shows "
+                                f"{preview_cavities}: a void, or a wall or opening around one, is thinner than the "
+                                f"preview cell size of {preview_cell:.4g} mm.")
             if abs(change) > VALIDATE_VOLUME_CHANGE:
                 problems.append(f"{label} changes volume by {change:+.1%} at {cell:.4g} mm ({preview_volume:.6g} "
                                 f"to {volume:.6g} mm³): features thinner than the preview cell size of "
@@ -1356,7 +1384,8 @@ def validate(spec, source, output, threads):
         ok = ok and not problems
         warnings.extend(problems)
         parts.append({"solid": solid, "closed": bool(triangles) and not boundary, "boundaryEdges": boundary,
-                      "nonmanifoldEdges": nonmanifold, "components": components, "volume": volume,
+                      "nonmanifoldEdges": nonmanifold, "components": components, "cavities": cavities,
+                      "previewCavities": preview_cavities, "volume": volume,
                       "previewVolume": preview_volume, "volumeChange": change})
     if len(warnings) > MAX_WARNINGS:
         warnings[MAX_WARNINGS - 1:] = [f"... and {len(warnings) - MAX_WARNINGS + 1} more warnings."]

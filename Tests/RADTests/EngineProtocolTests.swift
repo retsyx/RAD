@@ -305,6 +305,17 @@ final class EngineProtocolTests: XCTestCase {
     /// The field names of each item of a list of lists.
     private func table(_ value: Any?) -> [[Set<String>]] { ((value as? [[Any]]) ?? []).map { $0.map { keys($0) } } }
 
+    func testSwiftFieldLimitsMatchTheWorkers() throws {
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Engine/sdf_build.py"), encoding: .utf8)
+        func constant(_ name: String) -> Int? {
+            source.split(separator: "\n").first { $0.hasPrefix("\(name) = ") }
+                .flatMap { Int($0.dropFirst(name.count + 3).trimmingCharacters(in: .whitespaces)) }
+        }
+        XCTAssertEqual(constant("MAX_SUMMARY_FIELDS"), CADCustomField.maximumSummaryFields)
+        XCTAssertEqual(constant("MAX_VERIFIED_FIELDS"), EngineService.FieldVerification.maximumFields)
+    }
+
     func testRawWorkerResultsCarryExactlyTheProtocolFields() async throws {
         try requireRuntime()
         let python = try await CADRuntimeManager.resolvePython(EngineService.defaultPython)
@@ -317,7 +328,7 @@ final class EngineProtocolTests: XCTestCase {
                                    "meshBuffers"]
         XCTAssertEqual(keys(result), common.union(["assemblyMotion", "printVersion", "printDown"]))
         XCTAssertEqual(keys(first(result["partStats"])),
-                       ["solid", "volume", "area", "bounds", "centroid", "triangles", "components"])
+                       ["solid", "volume", "area", "bounds", "centroid", "triangles", "components", "cavities"])
         XCTAssertEqual(keys(result["mesh"]), ["cellSize", "boundaryEdges", "nonmanifoldEdges"])
         XCTAssertEqual(keys(result["runtime"]), ["python", "numpy", "kernel"])
         XCTAssertEqual(keys(first(result["printDown"])), ["solid", "direction"])
@@ -338,6 +349,23 @@ final class EngineProtocolTests: XCTestCase {
             """), python: python)
         XCTAssertEqual(keys(referenced), common.union(["referenceSolids"]))
         XCTAssertEqual(referenced["referenceSolids"] as? [Int], [1])
+        let field = """
+            ball = implicit(length(x, y, z) - 4, bounds=((-5, -5, -5), (5, 5, 5)))
+            result = [box(10, center=(20, 0, 0)), ball]
+            """
+        let custom = try runWorker(build(field), python: python)
+        XCTAssertEqual(keys(custom), common.union(["customFields"]))
+        XCTAssertEqual(keys(first(custom["customFields"])), ["solids", "line", "bounds", "slopeBound", "quality"])
+        XCTAssertEqual((first(custom["customFields"]) as? [String: Any])?["solids"] as? [Int], [1])
+        let verified = try runWorker(.build(title: "Protocol fields", summary: "Raw worker results.", units: "mm",
+                                            script: field, inputAssets: [], verifyFields: true), python: python)
+        XCTAssertEqual(keys(verified), ["solids", "parts", "fields", "fieldCount", "buildSeconds", "threads", "runtime"])
+        XCTAssertEqual(keys(first(verified["fields"])), ["solids", "bounds", "line", "ok", "slopeBound", "valueRange",
+                                                         "gradient", "quality", "boxes"])
+        let pole = try runWorker(.build(title: "Protocol fields", summary: "Raw worker results.", units: "mm",
+                                        script: "result = implicit(1 / x, ((-1, -1, -1), (1, 1, 1)))", inputAssets: [],
+                                        verifyFields: true), python: python)
+        XCTAssertEqual(keys(first(pole["fields"])), ["solids", "bounds", "line", "ok", "message", "region"])
 
         let artifact = try XCTUnwrap(result["artifactPath"] as? String)
         let source = EngineWorkerRequest.NativeSource(identity: artifact, partRoots: try XCTUnwrap(result["partRoots"] as? [Int]))
@@ -368,7 +396,8 @@ final class EngineProtocolTests: XCTestCase {
         let validation = try native(.validate(source, cellSize: nil))
         XCTAssertEqual(keys(validation), ["ok", "cellSize", "parts", "warnings"])
         XCTAssertEqual(keys(first(validation["parts"])), ["solid", "closed", "boundaryEdges", "nonmanifoldEdges",
-                                                          "components", "volume", "previewVolume", "volumeChange"])
+                                                          "components", "cavities", "previewCavities", "volume",
+                                                          "previewVolume", "volumeChange"])
         let probe = try native(.probe(source, solids: nil, points: [[0, 0, 3]], directions: nil, maxDistance: nil))
         XCTAssertEqual(keys(probe), ["solids", "samples"])
         XCTAssertEqual(keys(first(first(probe["samples"]))), ["distance", "normal"])
@@ -389,5 +418,6 @@ final class EngineProtocolTests: XCTestCase {
 }
 
 private extension EngineWorkerRequest {
-    var isBuild: Bool { if case .build = self { true } else { false } }
+    /// A program build, whose result is a preview (custom field verification reports fields instead).
+    var isBuild: Bool { if case let .build(_, _, _, _, _, _, verifyFields) = self { !verifyFields } else { false } }
 }

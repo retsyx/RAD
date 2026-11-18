@@ -232,6 +232,7 @@ Every Codex design task has these RAD tools available by default, with instructi
 | `rad_set_part_colors` | Stage atomic part/folder color assignments or neutral defaults for the current design or a candidate |
 | `rad_measure` | Measure parts and surface points: coordinates, normals, distances, angles and minimum distances to parts |
 | `rad_validate` | Re-mesh every part finer than its preview and report open, non-manifold, split or vanishing surfaces and volume changes |
+| `rad_verify` | Prove the slope bound of every custom field (`implicit()` shape) of a design or unbuilt program, with its value range, distance quality, and the region of any field without a bound |
 | `rad_render` | Return a PNG image to Codex from a chosen standard view, projection, shading and optional part subset |
 | `rad_check_motion` | Sweep a mechanism joint and report clearance, contact and interference between moving parts |
 | `rad_screenshot` | Return an image of the current live RAD viewport; disclose an offscreen fallback if no view is attached |

@@ -240,6 +240,7 @@ void eval_polygon(const Polygon &polygon, int n, const double *x, const double *
 
     const double *vx = polygon.x.data(), *vy = polygon.y.data();
     const double *ex = polygon.ex.data(), *ey = polygon.ey.data(), *inv = polygon.inv_len2.data();
+    const PolygonTree &box = polygon.tree.front();  // the root covers every edge
     for (int i = 0; i < n; ++i) {
         const double px = x[i], py = y[i];
         Nearest best;
@@ -260,9 +261,12 @@ void eval_polygon(const Polygon &polygon, int n, const double *x, const double *
             out[i] = best.d2 == 0 ? 0.0 : best.d2;  // on the boundary (or NaN input)
             continue;
         }
-        bool inside;
+        bool inside = false;
         const uint32_t edge = best.edge;
-        if (best.t > 0 && best.t < 1) {
+        if (px < box.lo[0] || px > box.hi[0] || py < box.lo[1] || py > box.hi[1]) {
+            // outside the vertices' box: outside, however rounding ties the
+            // features of a polygon far smaller than |p|
+        } else if (best.t > 0 && best.t < 1) {
             inside = ex[edge] * (py - vy[edge]) - ey[edge] * (px - vx[edge]) > 0;
         } else {
             const uint32_t vertex = best.t <= 0 ? edge : (edge + 1 == count ? 0 : edge + 1);

@@ -49,8 +49,9 @@ class MeshOptions(ctypes.Structure):
 class MeshStats(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint64) for name in (
         "vertex_count", "triangle_count", "crease_segment_count", "active_cells", "boundary_edges",
-        "nonmanifold_edges", "components")] + [
-        ("volume", ctypes.c_double), ("area", ctypes.c_double), ("centroid", ctypes.c_double * 3),
+        "nonmanifold_edges", "components", "cavities")] + [
+        ("volume", ctypes.c_double), ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double),
+        ("centroid", ctypes.c_double * 3),
         ("bounds_lo", ctypes.c_double * 3), ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
         ("seconds", ctypes.c_double)]
 
@@ -302,7 +303,7 @@ class KernelCase(unittest.TestCase):
 
 class EvaluationTests(KernelCase):
     def test_abi_and_version(self):
-        self.assertEqual(self.k.lib.rsdf_abi_version(), 1)
+        self.assertEqual(self.k.lib.rsdf_abi_version(), 2)
         self.assertTrue(self.k.lib.rsdf_kernel_version())
 
     def test_3d_primitives_match_analytic_values(self):
@@ -1046,6 +1047,8 @@ class MeshTests(KernelCase):
         shading = mesh.normals[mesh.triangles].astype(float).sum(axis=1)
         self.assertGreater(np.mean(np.sum(facet * shading, axis=1) > 0), 0.99)
         self.assertEqual(mesh.stats.components, 2)  # outer shell and inner cavity
+        self.assertEqual(mesh.stats.cavities, 1)  # the sphere's void, enclosing negative volume
+        self.assertAlmostEqual(mesh.stats.cavity_volume, 4 / 3 * math.pi * 4 ** 3, delta=3.0)
 
     def test_sharp_box_corners(self):
         g = Graph()

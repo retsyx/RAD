@@ -236,7 +236,13 @@ enum ProjectStore {
               mesh.partRoots.map({ $0.count == mesh.solids && $0.allSatisfy { (0..<4_000_000).contains($0) } }) ?? true,
               mesh.runtime.map(validRuntime) ?? true,
               mesh.warnings.map({ $0.count <= 64 && $0.allSatisfy { !$0.isEmpty && $0.utf8.count <= 4_096 } }) ?? true,
-              mesh.meshStatistics.map({ $0.cellSize.isFinite && $0.cellSize > 0 && $0.boundaryEdges >= 0 && $0.nonmanifoldEdges >= 0 }) ?? true
+              mesh.meshStatistics.map({ $0.cellSize.isFinite && $0.cellSize > 0 && $0.boundaryEdges >= 0 && $0.nonmanifoldEdges >= 0 }) ?? true,
+              mesh.customFields.map({ fields in fields.count <= CADCustomField.maximumSummaryFields && fields.allSatisfy { field in
+                  !field.solids.isEmpty && field.solids.allSatisfy { (0..<mesh.solids).contains($0) } &&
+                  field.bounds.count == 6 && field.bounds.allSatisfy(\.isFinite) &&
+                  field.slopeBound.isFinite && field.slopeBound >= 0 && field.quality.isFinite && field.quality >= 0 &&
+                  (field.line ?? 1) > 0
+              } }) ?? true
         else { throw invalid("Embedded preview metadata is invalid.") }
         if let stats = mesh.partStats {
             guard stats.map(\.solidIndex) == Array(0..<mesh.solids), stats.allSatisfy({ part in
@@ -244,7 +250,7 @@ enum ProjectStore {
                 part.bounds.count == 6 && part.bounds.allSatisfy(validCoordinate) &&
                 (0..<3).allSatisfy({ part.bounds[$0] <= part.bounds[$0 + 3] }) &&
                 part.centroid.count == 3 && part.centroid.allSatisfy(validCoordinate) &&
-                part.triangles > 0 && part.components > 0
+                part.triangles > 0 && part.components > 0 && (part.cavities ?? 0) >= 0
             }) else { throw invalid("Embedded preview part statistics are invalid.") }
         }
         let span = (0..<3).map { mesh.bounds[$0 + 3] - mesh.bounds[$0] }.max() ?? 0

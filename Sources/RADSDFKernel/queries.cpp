@@ -32,6 +32,16 @@ const Node &checked_3d(const rsdf_graph &graph, uint32_t node, const char *what)
     return n;
 }
 
+// Fields evaluate only from their root (read by no field) or IMPLICIT, whose
+// compiled tapes run each node once per batch.
+const Node &checked_queryable(const rsdf_graph &graph, uint32_t node) {
+    const Node &n = checked_node(graph, node);
+    if (n.field && !n.tape)
+        throw Error(format("node %u (%s) is a field read by other fields; query its root field or its IMPLICIT node",
+                           node, op_name(n.op)));
+    return n;
+}
+
 // Requests of at least this many points are visited in Morton order, so
 // batches of scattered points still stay compact (outputs keep their order).
 constexpr uint64_t kSortMinimum = 4 * kBatch;
@@ -58,7 +68,7 @@ int rsdf_evaluate(const rsdf_graph *graph, uint32_t node, const double *points, 
                   int32_t threads) {
     return guarded([&] {
                const rsdf_graph &g = checked_graph(graph);
-               const Node &target = checked_node(g, node);
+               const Node &target = checked_queryable(g, node);
                const int dim = static_cast<int>(target.dim);
                if (count == 0) return;
                require_buffers(points && distances);
@@ -93,6 +103,7 @@ int rsdf_gradient(const rsdf_graph *graph, uint32_t node, const double *points, 
     return guarded([&] {
                const rsdf_graph &g = checked_graph(graph);
                const Node &target = checked_3d(g, node, "gradient");
+               checked_queryable(g, node);
                if (!std::isfinite(eps)) throw Error("gradient step eps must be finite");
                const double step = eps > 0 ? eps : 1e-5;
                if (count == 0) return;
@@ -144,6 +155,9 @@ int rsdf_raycast(const rsdf_graph *graph, uint32_t node, const double *origins, 
     return guarded([&] {
                const rsdf_graph &g = checked_graph(graph);
                const Node &n = checked_3d(g, node, "raycast");
+               if (n.field)
+                   throw Error(format("raycast needs a shape; node %u (%s) is a field, which has no slope bound "
+                                      "(IMPLICIT makes it a shape)", node, op_name(n.op)));
                if (!(max_distance > 0)) throw Error("raycast max_distance must be positive");
                if (std::isnan(tolerance)) throw Error("raycast tolerance must not be NaN");
                const double tol = tolerance > 0 ? tolerance : 1e-4;

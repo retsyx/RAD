@@ -109,7 +109,7 @@
   },
   {
     "name": "rad_build",
-    "description": "Build a workspace radsdf Python program for review in RAD's sandboxed worker. The native kernel meshes every part at the preview resolution and returns an artifact ID with solids, volume, surface area, bounds, triangles, meshCellSize, warnings, assembly motion, printing facts and per-part statistics (partID, name, volume, area, bounds, centroid, triangles, pieces, and reference for reference parts, which are not printed). Program errors and empty, open or unbounded parts fail with a message to repair. Values are numeric at the mesh resolution. Does not commit the design.",
+    "description": "Build a workspace radsdf Python program for review in RAD's sandboxed worker. The native kernel meshes every part at the preview resolution and returns an artifact ID with solids, volume, surface area, bounds, triangles, meshCellSize, warnings, assembly motion, printing facts and per-part statistics (partID, name, volume, area, bounds, centroid, triangles, pieces, cavities (sealed internal voids, which trap print material; not pieces), and reference for reference parts, which are not printed), and customFields (slopeBound and distanceQuality per implicit() shape). Program errors and empty, open or unbounded parts fail with a message to repair. Values are numeric at the mesh resolution. Does not commit the design.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -490,7 +490,7 @@
   },
   {
     "name": "rad_validate",
-    "description": "Validate an artifact's surfaces finer than its preview: re-mesh every part (half the preview cell size by default) and report per-part closed surfaces, boundary and non-manifold edges, pieces and volume change. Open or non-manifold surfaces, parts that split or vanish and volume changes above 2% reveal features thinner than the preview resolution. valid is true when no problem is found; run it before acceptance.",
+    "description": "Validate an artifact's surfaces finer than its preview: re-mesh every part (half the preview cell size by default) and report per-part closed surfaces, boundary and non-manifold edges, pieces, cavities (sealed internal voids, with previewCavities) and volume change. Open or non-manifold surfaces, parts that split or vanish, cavities that open or close and volume changes above 2% reveal features thinner than the preview resolution. valid is true when no problem is found; run it before acceptance.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -515,6 +515,48 @@
     },
     "host": {
       "capability": "read"
+    }
+  },
+  {
+    "name": "rad_verify",
+    "description": "Verify the custom fields of a design without meshing it: run the program of an artifact (default current) or of programPath and, for every implicit() shape, prove an upper bound of |grad f| over its bounds by interval arithmetic, the same proof its build makes (a design with very many distinct fields shares a fixed proof budget among them when it builds, so its slopeBound there can be larger; rad_build's customFields lists the bounds in use). Reports per field the parts that use it, its program line and bounds, slopeBound (the bound the solid divides its field by), valueRange, the sampled gradient length (min, median, max), distanceQuality (median gradient length / slopeBound: 1 for a true distance; below 1 the solid's offsets, shells, smooth blends and clearances come out larger than requested, by up to about 1/distanceQuality, and its probed distances smaller) and, for a field without a finite slope bound (which fails rad_build), the problem and the region where it occurs. Use it after writing or changing a custom field.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by rad_build, or current for the existing design (the default)."
+        },
+        "programPath": {
+          "type": "string",
+          "description": "A workspace program to verify instead of an artifact, before or without building it."
+        },
+        "assetIDs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "When verifying a program instead of an artifact: input asset IDs the program reads as imported_assets[assetID]. Default: the current design's inputs."
+        },
+        "print": {
+          "type": "boolean",
+          "default": false,
+          "description": "When verifying a program instead of an artifact: run its 3D printing version, with rad.print true."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "programs": [
+        "programPath"
+      ]
     }
   },
   {
