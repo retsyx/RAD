@@ -971,13 +971,23 @@ def involute_gear(teeth, module, pressure_angle=20.0, clearance=0.25, backlash=0
 
     inv_pitch = involute(pitch)
     radii = np.linspace(max(base, root), outer, flank_points)
+    # A tooth narrows outward and the space between teeth widens outward, so
+    # the outline is simple when the tooth is still thick at the tip circle
+    # and the space still open where the flanks start.
+    if half_tooth + inv_pitch - involute(outer) <= 0:
+        raise SDFError("involute_gear: the teeth come to a point inside the tip circle; use more teeth, a smaller "
+                       "pressure_angle or less backlash.")
+    if math.pi / teeth - (half_tooth + inv_pitch - involute(radii[0])) <= 0:
+        raise SDFError("involute_gear: neighbouring teeth meet above the root circle; use a smaller clearance or "
+                       "pressure_angle.")
     profile = []
     for tooth in range(teeth):
         center_angle = 2 * math.pi * tooth / teeth
         right = [(r, center_angle - (half_tooth + inv_pitch - involute(r))) for r in radii]
         left = [(r, center_angle + (half_tooth + inv_pitch - involute(r))) for r in radii[::-1]]
-        gap_start = center_angle + (half_tooth + inv_pitch)
-        gap_end = center_angle + 2 * math.pi / teeth - (half_tooth + inv_pitch)
+        # The root arc joins the flanks where they start.
+        gap_start = center_angle + (half_tooth + inv_pitch - involute(radii[0]))
+        gap_end = center_angle + 2 * math.pi / teeth - (half_tooth + inv_pitch - involute(radii[0]))
         root_arc = [(root, a) for a in np.linspace(gap_start, gap_end, 4)]
         if radii[0] > root:
             right.insert(0, (root, right[0][1]))

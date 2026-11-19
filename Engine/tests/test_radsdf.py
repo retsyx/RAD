@@ -840,6 +840,20 @@ class NativeKernelTests(unittest.TestCase):
         self.assertEqual(radsdf.polygon([(0, 0), (4, 0), (4, 4), (2, 1e-12), (0, 4)]).opcode, radsdf.Opcode.POLYGON)
         self.assertEqual(radsdf.involute_gear(40, 1).opcode, radsdf.Opcode.POLYGON)
 
+    def test_involute_gears_are_simple_or_explain_their_parameters(self):
+        # Root circles above the base circle (many teeth, larger pressure
+        # angles): the root arcs join the flanks where they start.
+        for teeth, pressure_angle in ((150, 20), (60, 25), (40, 30), (400, 14.5), (6, 20)):
+            with self.subTest(teeth=teeth, pressure_angle=pressure_angle):
+                gear = radsdf.involute_gear(teeth, 1.5, pressure_angle=pressure_angle, backlash=0.05)
+                radii = np.linalg.norm(np.reshape(gear.params, (-1, 2)), axis=1)
+                self.assertAlmostEqual(radii.min(), 0.75 * teeth - 1.875, places=9)
+                self.assertLess(gear.evaluate([(0.75 * teeth - 1, 0.0)]), 0)  # inside a tooth on +X
+        with self.assertRaisesRegex(SDFError, "involute_gear: the teeth come to a point inside the tip circle"):
+            radsdf.involute_gear(8, 1, pressure_angle=40)
+        with self.assertRaisesRegex(SDFError, "involute_gear: neighbouring teeth meet above the root circle"):
+            radsdf.involute_gear(60, 2.5, pressure_angle=30, clearance=1)
+
     def test_booleans_and_modifiers(self):
         a, b = radsdf.sphere(2), radsdf.box(3, center=(1, 0, 0))
 
