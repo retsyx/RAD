@@ -87,6 +87,12 @@ publishes its outputs, each written to a temporary name and renamed:
   positions), and `triangleSolids` and `edgeSolids` (Int32 part owners).
   Float32 matches the attributes the app uploads to the GPU, and the app copies
   each section straight into its packed array.
+- `field.bin`: the GPU field program of every part (`sdf_field.py`,
+  SDF-DESIGN.md "GPU field programs"): little-endian 32-bit words that the
+  app uploads as one Metal buffer and evaluates per pixel. Top bricks are 8
+  preview cells (refined down to half a cell where tapes are long), tapes
+  are exact 0.1 cell beyond their bricks. A part over the program's limits
+  is left to mesh rendering; a compile failure never fails the build.
 - `result.json`, written last: `buildID` (a random UUID), `artifactPath`
   (absolute path of `model.rsdf`), `partRoots` (RSDF node of each part),
   `bounds`, `volume`, `area`, `solids`, `parts`, `partStats`
@@ -97,7 +103,10 @@ publishes its outputs, each written to a temporary name and renamed:
   maxDeviation}`: the base cell and the parts' largest bound), optional
   `assemblyMotion`,
   `printVersion`, `printDown`, `referenceSolids` and `customFields`,
-  `validatedHash`, `buildSeconds`, `threads`,
+  `validatedHash`, `fieldProgram` (`{path: "field.bin", version, words,
+  brickSize, margin, buildSeconds, parts: [{solid, status: "field" |
+  "meshOnly", reason?, bandBricks?, tapes?, words?, maxInstructions?}]}`, or
+  `{error}` when the kernel could not compile it), `buildSeconds`, `threads`,
   `runtime` (`{python, numpy, kernel}`), `warnings` and `meshBuffers` (the
   section offsets and value counts of `mesh.bin`). `customFields` lists the
   first 32 `implicit()` shapes (custom fields) as `{solids, line?, bounds,
@@ -525,6 +534,14 @@ these outside another sandbox:
 ```sh
 RAD_RUN_SANDBOX_TESTS=1 .build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 ```
+
+`test_gpu_program.py` checks GPU field programs against the kernel: unpruned
+tapes and every brick's pruned tape bitwise, far values as signed distance
+bounds, determinism, limits and the build's `field.bin` (with
+`RAD_RUN_SANITIZER_FUZZ=1` also under AddressSanitizer, UBSan and TSan).
+`Scripts/field_gpu_validate.py` builds designs and compares the app's Metal
+evaluator (`Scripts/field-gpu-check`) with the kernel: distances, signs,
+normals, ray hits, and the cost of a frame.
 
 The Swift suite's opt-in engine tests (`RAD_RUN_ENGINE_TESTS=1`) run real builds
 and every native operation through the app's `EngineService`;

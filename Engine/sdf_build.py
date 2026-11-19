@@ -1061,6 +1061,7 @@ def build(spec, directory, output, threads, started=None):
     display arrays. A request with verifyFields analyses its custom fields
     instead (verify_fields)."""
     import radsdf
+    import sdf_field
     started = time.perf_counter() if started is None else started
     validate_spec(spec)
     output = Path(output)
@@ -1083,12 +1084,14 @@ def build(spec, directory, output, threads, started=None):
         boxes = part_bounds(graph, normalized)
         meshes, cell, default = mesh_parts(graph, normalized, boxes, threads)
         fields, field_warnings = custom_fields(graph, order, normalized)
+        field_program = sdf_field.build(graph, cell, threads)
     artifact = (output / "model.rsdf").resolve()
     preview = assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerprint,
                                build_mode.printing_read)
     if fields:
         preview["customFields"] = fields
     write_artifact(data, output)
+    preview["fieldProgram"] = sdf_field.publish(*field_program, output)
     preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime)
     # Keep the protocol's key order: warnings follow the runtime facts.
     warnings = preview.pop("warnings")

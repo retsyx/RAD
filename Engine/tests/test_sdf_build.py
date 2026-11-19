@@ -554,8 +554,8 @@ SECTION_TYPES = {"positions": ("<f4", 3), "normals": ("<f4", 3), "triangles": ("
                  "triangleSolids": ("<i4", 1), "edgeSolids": ("<i4", 1)}
 
 RESULT_KEYS = ["buildID", "artifactPath", "partRoots", "bounds", "volume", "area", "solids", "parts", "partStats",
-               "mesh", "assemblyMotion", "printVersion", "printDown", "validatedHash", "buildSeconds", "threads",
-               "runtime", "warnings", "meshBuffers"]
+               "mesh", "assemblyMotion", "printVersion", "printDown", "validatedHash", "fieldProgram", "buildSeconds",
+               "threads", "runtime", "warnings", "meshBuffers"]
 
 ARM = '''
 result = Assembly("Hinged arm")
@@ -677,7 +677,8 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(result["threads"], 4)
         self.assertGreater(result["buildSeconds"], 0)
         self.assertEqual(result["warnings"], [])
-        self.assertEqual(sorted(path.name for path in output.iterdir()), ["mesh.bin", "model.rsdf", "result.json"])
+        self.assertEqual(sorted(path.name for path in output.iterdir()),
+                         ["field.bin", "mesh.bin", "model.rsdf", "result.json"])
         self.assert_mesh_contract(result, arrays)
         base, arm = result["partStats"]
         self.assertAlmostEqual(base["volume"], 42 * 32 * 6 - math.pi * 16 * 6, delta=0.002 * base["volume"])

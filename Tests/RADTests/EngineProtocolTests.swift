@@ -324,8 +324,8 @@ final class EngineProtocolTests: XCTestCase {
         }
         let result = try runWorker(build(Self.program), python: python)
         let common: Set<String> = ["buildID", "artifactPath", "partRoots", "bounds", "volume", "area", "solids", "parts",
-                                   "partStats", "mesh", "validatedHash", "buildSeconds", "threads", "runtime", "warnings",
-                                   "meshBuffers"]
+                                   "partStats", "mesh", "validatedHash", "fieldProgram", "buildSeconds", "threads", "runtime",
+                                   "warnings", "meshBuffers"]
         XCTAssertEqual(keys(result), common.union(["assemblyMotion", "printVersion", "printDown"]))
         XCTAssertEqual(keys(first(result["partStats"])),
                        ["solid", "volume", "area", "bounds", "centroid", "triangles", "components", "cavities",
@@ -335,6 +335,9 @@ final class EngineProtocolTests: XCTestCase {
         XCTAssertEqual(keys(first(result["printDown"])), ["solid", "direction"])
         XCTAssertEqual(keys(result["assemblyMotion"]), ["grounded", "connectors", "joints", "couplings"])
         XCTAssertEqual(keys(result["meshBuffers"]), ["path", "sections"])
+        XCTAssertEqual(keys(result["fieldProgram"]), ["path", "version", "words", "brickSize", "margin", "buildSeconds", "parts"])
+        XCTAssertEqual(keys(first((result["fieldProgram"] as? [String: Any])?["parts"])),
+                       ["solid", "status", "bandBricks", "tapes", "words", "maxInstructions"])
         XCTAssertEqual(keys((result["meshBuffers"] as? [String: Any])?["sections"]), PreviewMeshBuffers.sectionNames)
         let root = first(result["parts"]) as? [String: Any]
         XCTAssertEqual(keys(root), ["id", "name", "solidIndices", "children"])

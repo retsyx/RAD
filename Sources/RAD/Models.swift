@@ -153,6 +153,10 @@ struct PreviewMesh: Codable, Sendable {
     /// The build's implicit() shapes (custom fields), at most 32.
     var customFields: [CADCustomField]? = nil
 
+    /// The build's GPU field program (field.bin), validated; nil when the
+    /// build has none. Session data like the display buffers.
+    var fieldProgram: FieldProgram? = nil
+
     /// Keeps private native files alive across copies and history navigation.
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.
     var buildArtifacts: EngineBuildArtifacts? = nil

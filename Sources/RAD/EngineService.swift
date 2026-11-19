@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 
 enum EngineExportError: LocalizedError {
@@ -128,6 +129,7 @@ enum EngineFailureDiagnostic {
 /// Generated CAD programs run under a restricted macOS sandbox.
 @MainActor
 final class EngineService {
+    nonisolated static let log = Logger(subsystem: "studio.rad.cad", category: "EngineService")
     private var job: EngineProcessJob?
     private var generation = UUID()
     private let temporaryDirectory: URL
@@ -886,6 +888,13 @@ final class EngineService {
                                                       headerBytes: EngineService.artifactMarker.count)
             guard graph.header == EngineService.artifactMarker else {
                 throw RADError.message("CAD engine did not return native SDF geometry.")
+            }
+            // A missing or invalid field program leaves the parts to mesh
+            // rendering; an invalid one is logged.
+            do {
+                result.fieldProgram = try FieldProgram.read(resultJSON: data, in: folder, solids: result.solids)
+            } catch {
+                EngineService.log.error("Ignoring the build's field program: \(error.localizedDescription, privacy: .public)")
             }
             artifacts.discardAll(except: ["model.rsdf"])
             return result
