@@ -203,7 +203,7 @@ class KernelMeshTests(unittest.TestCase):
             self.load(vertices, triangles)
         return str(caught.exception)
 
-    def test_preview_resolves_close_facets_on_blended_meshes(self):
+    def test_refinement_resolves_close_facets_on_blended_meshes(self):
         def shell(stations, segments, clustering=0):
             uniform = np.linspace(0, 2 * np.pi, segments, endpoint=False)
             angle = uniform + clustering * np.cos(uniform)
@@ -231,7 +231,11 @@ class KernelMeshTests(unittest.TestCase):
         data, (root,) = radsdf.serialize(radsdf.union(flange, tube, smooth=1.35))
         graph = radsdf.Graph.from_bytes(data, [root])
         cell = 0.47
-        mesh = graph.native_mesh(root, cell_size=cell, threads=4, _preview=True, _facet_detail=True).mesh()
+        # Cells split where triangles stray from the facets' panels, here
+        # within a fiftieth of the cell; a uniform grid misses about 11% of
+        # the visible area by more than 4 degrees.
+        mesh = graph.native_mesh(root, cell_size=cell, threads=4, tolerance=0.02 * cell).mesh()
+        self.assertLess(mesh.stats["max_deviation"], 0.05 * cell)
 
         self.assertEqual(mesh.stats["boundary_edges"], 0)
         self.assertEqual(mesh.stats["nonmanifold_edges"], 0)
@@ -254,6 +258,10 @@ class KernelMeshTests(unittest.TestCase):
         weights = np.repeat(areas, len(barycentric))
         self.assertGreater(weights[front].sum(), 200)
         self.assertLess(weights[front & error].sum() / weights[front].sum(), 0.045)
+        # The triangles themselves lie on the panels: flat shading agrees too.
+        facets = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]) / areas[:, None]
+        flat = np.einsum("ij,ij->i", np.repeat(facets, len(barycentric), axis=0), exact) < math.cos(math.radians(4))
+        self.assertLess(weights[front & flat].sum() / weights[front].sum(), 0.045)
 
 
     def test_distances_match_brute_force_and_inward_meshes_turn_outward(self):
@@ -374,7 +382,7 @@ class KernelMeshTests(unittest.TestCase):
         np.testing.assert_allclose(self.kernel.evaluate(handle, 0, points),
                                    np.minimum(field((0, 0, 0), (1, 1, 1)), field((0.5, 0.5, 0.5), (1.2, 1.2, 1.2))),
                                    rtol=0, atol=1e-12)
-        self.assertAlmostEqual(self.kernel.mesh(handle, 0, 0.02).stats.volume, 1.218, delta=1e-9)
+        self.assertAlmostEqual(self.kernel.mesh(handle, 0, 0.02).stats.volume, 1.218, delta=1e-8)
         # A cavity belongs to the body whose solid holds it, not to a smaller
         # body that pokes into it.
         vertices, triangles = combined(box((-3, -3, -3), (3, 3, 3)), reverse(box((-2, -2, -2), (2, 2, 2))),

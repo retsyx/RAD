@@ -381,10 +381,11 @@ class SimplifyTests(unittest.TestCase):
         self.assertLessEqual(float(deviation(graph, node, coarse).max()),
                              max(0.05, float(deviation(graph, node, full).max())) * 1.001)
 
-    def test_non_manifold_regions_stay_as_they_are(self):
-        # A wall thinner than a cell pinches into non-manifold edges and pieces.
-        graph, node, full, simple = self.meshes(box((10, 0.06, 10)).rotate(33, (1, 2, 3)), 0.1)
-        self.assertGreater(full.stats["nonmanifold_edges"], 100)
+    def test_pinched_regions_stay_as_they_are(self):
+        # On a uniform grid a wall thinner than a cell pinches into pieces
+        # whose sheets touch at coincident vertices.
+        graph, node, full, simple = self.meshes(box((10, 0.06, 10)).rotate(33, (1, 2, 3)), 0.1, max_depth=0)
+        self.assertGreater(full.stats["components"], 100)
         for key in ("nonmanifold_edges", "boundary_edges", "components"):
             self.assertEqual(simple.stats[key], full.stats[key], key)
         self.assertLess(len(simple.triangles), len(full.triangles))
@@ -547,7 +548,7 @@ result = [box((40, 30, 4)) - union(*[cylinder(2, 10, center=(x, y, 0)) for x in 
             return copy(native, simplify)
 
         with (mock.patch.object(sdf_ops, "EXPORT_TRIANGLE_BUDGET", budget),
-              mock.patch.object(sdf_ops, "budget_cell", side_effect=lambda source, solids, cell, *rest: cell),
+              mock.patch.object(sdf_ops, "budget_cell", side_effect=lambda source, solids, cell, *rest: (cell, None)),
               mock.patch.object(radsdf.NativeMesh, "mesh", counted)):
             limited, _ = self.export()
         self.assertLessEqual(limited["meshedTriangles"], budget)

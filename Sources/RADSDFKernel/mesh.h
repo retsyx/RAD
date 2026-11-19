@@ -1,5 +1,5 @@
 // Internal interface between surface extraction (mesh_extract.cpp), surface
-// projection and refinement (refine.cpp) and mesh finishing (mesh.cpp).
+// projection and measurement (refine.cpp) and mesh finishing (mesh.cpp).
 #pragma once
 
 #include "kernel.h"
@@ -21,63 +21,50 @@ struct MeshField {
 };
 
 struct MeshSettings {
-    double cell_size;
+    double cell_size;     // base cell (octree level 0)
     double lipschitz;     // stepping Lipschitz bound of the meshed field (>= 1)
     double gradient_step; // finite-difference step for normals
-    uint64_t max_cells;
+    double tolerance;     // largest estimated deviation refinement aims for (model units)
+    double crease_angle;  // degrees; display creases (mesh.cpp) away from sharp features are refined away
+    uint64_t max_cells;   // narrow-band base cells (fails beyond) and octree leaves (refinement stops)
+    uint64_t max_triangles;  // refinement stops before its estimate exceeds this (0: no limit)
+    int max_depth;        // octree levels below cell_size (0: a uniform grid)
     int threads;
     int refine_steps;
     bool spatial_order;   // evaluate crossings and normals in Morton order (costly fields, see Node::sorts_queries)
 };
 
-// Vertex marks from extraction (Surface::marks).
+// Vertex marks from extraction.
 enum : uint8_t {
     kSharpVertex = 1,   // a QEF point on a sharp edge or corner
     kSpreadVertex = 2,  // not sharp, but its cell's crossing normals spread (a curved or blended region)
+    kJumpVertex = 4,    // a crossing of its cell is a discontinuity of the field (never refined)
 };
 
-struct CreaseSample {
-    std::array<double, 3> point;
-    std::array<double, 3> normals[2];
-};
-
-// Dual contouring output before shading: one vertex per referenced active
-// cell, plus the vertices refinement adds.
+// Dual contouring output before shading: one vertex per surface component
+// of each active octree leaf.
 struct Surface {
     std::vector<double> positions;    // 3 per vertex
     std::vector<uint32_t> triangles;  // 3 per triangle, outward counter-clockwise
-    std::vector<uint8_t> marks;       // 1 per vertex from extraction; empty for other surfaces
+    std::vector<uint8_t> marks;       // 1 per vertex from extraction (kSharpVertex, ...); empty for others
+    // 3 per triangle: the unit field normal at its centroid, and 3 per
+    // vertex: the unit field normal there, as measured by extraction; empty
+    // when the finisher computes them.
+    std::vector<double> interior_normals, vertex_normals;
     uint64_t active_cells = 0;
-    // One exact surface sample for each appended preview crease vertex. Its
-    // mesh position may stay on the chord to keep the adjacent faces flat.
-    uint32_t first_crease_vertex = UINT32_MAX;
-    std::vector<CreaseSample> crease_samples;
+    // Refinement report (extraction only).
+    double max_deviation = 0;        // largest sampled estimated deviation (|f| / |grad f|)
+    uint64_t flagged_triangles = 0;  // triangles still outside the tolerance or the normal angle
+    uint64_t refined_cells = 0;      // leaves split by the criteria
+    uint64_t balanced_cells = 0;     // leaves split to keep the octree balanced
+    uint32_t max_level = 0;          // deepest leaf level
+    uint32_t passes = 0;             // extraction passes
+    bool budget_limited = false;     // the triangle budget or max_cells stopped refinement
 };
 
 inline uint64_t surface_edge_key(uint32_t a, uint32_t b) {
     return a < b ? uint64_t(a) << 32 | b : uint64_t(b) << 32 | a;
 }
-
-// Final display vertices use Float32 coordinates.
-inline bool same_preview_position(const double *a, const double *b) {
-    for (int axis = 0; axis < 3; ++axis)
-        if (static_cast<float>(a[axis]) != static_cast<float>(b[axis])) return false;
-    return true;
-}
-
-// Splits both triangles incident to each edge, using the already appended
-// vertices in sorted edge-key order. If chord positions are supplied, use
-// them for any projected cuts that would fold an adjacent face.
-void subdivide_surface(Surface &surface, const std::vector<uint64_t> &edges, uint32_t first_vertex,
-                       const std::vector<std::array<double, 3>> &chord_points = {});
-
-// Resolves panels whose field normals vary too quickly to interpolate across
-// the preview triangles. Updates the exact normals for newly split vertices.
-void refine_mesh_facets(const MeshField &field, Surface &surface, const MeshSettings &settings,
-                        std::vector<double> &normals);
-
-void align_surface_creases(const MeshField &field, Surface &surface, const MeshSettings &settings,
-                           const std::vector<double> &normals);
 
 Surface extract_surface(const MeshField &field, const MeshSettings &settings);
 
@@ -90,7 +77,8 @@ inline size_t chunks_of(size_t count, size_t size) { return (count + size - 1) /
 // batches are long strips that defeat culling).
 template <class PointAt>
 std::vector<double> gradients(const MeshField &field, size_t count, double eps, int threads, bool spatial,
-                              const PointAt &point) {
+                              const PointAt &point, std::vector<double> *magnitudes = nullptr) {
+    if (magnitudes) magnitudes->assign(count, 0.0);
     constexpr size_t kChunk = 4096;
     std::vector<double> normals(3 * count);
     const BatchField batch = field.batch();
@@ -103,7 +91,7 @@ std::vector<double> gradients(const MeshField &field, size_t count, double eps, 
     }
     constexpr int kPoints = kBatch / 4;
     parallel_chunks(chunks_of(count, kChunk), threads, [&](size_t chunk) {
-        double x[kPoints], y[kPoints], z[kPoints], nx[kPoints], ny[kPoints], nz[kPoints];
+        double x[kPoints], y[kPoints], z[kPoints], nx[kPoints], ny[kPoints], nz[kPoints], m[kPoints];
         const size_t end = std::min(count, (chunk + 1) * kChunk);
         for (size_t first = chunk * kChunk; first < end; first += kPoints) {
             const int n = static_cast<int>(std::min<size_t>(kPoints, end - first));
@@ -114,12 +102,13 @@ std::vector<double> gradients(const MeshField &field, size_t count, double eps, 
                 y[i] = xyz[1];
                 z[i] = xyz[2];
             }
-            batch_gradients(batch, n, x, y, z, eps, nx, ny, nz);
+            batch_gradients(batch, n, x, y, z, eps, nx, ny, nz, magnitudes ? m : nullptr);
             for (int i = 0; i < n; ++i) {
                 double *normal = &normals[3 * size_t(order[first + i])];
                 normal[0] = nx[i];
                 normal[1] = ny[i];
                 normal[2] = nz[i];
+                if (magnitudes) (*magnitudes)[order[first + i]] = m[i];
             }
         }
     });
@@ -136,18 +125,35 @@ void project_points(const MeshField &field, const MeshSettings &settings, double
                     std::vector<double> &positions, const std::vector<double> &guides,
                     const std::vector<double> &boxes, const std::vector<uint8_t> &fixed);
 
-// Cosines of the angle between the gradients a distance `side` either side of
-// each point, along directions[3 i ...] (any length; a zero direction gives
-// 1). Near 1 where the field is smooth; on a sharp edge between the two
-// samples, the cosine of the angle between its faces.
+// Cosines of the angle between the gradients a distance sides[i] either side
+// of each point, along directions[3 i ...] (any length; a zero direction
+// gives 1). Near 1 where the field is smooth; on a sharp edge between the
+// two samples, the cosine of the angle between its faces.
 std::vector<double> side_cosines(const MeshField &field, const MeshSettings &settings,
                                  const std::vector<double> &points, const std::vector<double> &directions,
-                                 double side);
+                                 const std::vector<double> &sides);
 
-// Refines the surface where a smooth feature is narrower than a cell (step 7):
-// splits edges along which the surface turns by more than 20 degrees, away
-// from sharp features, with new vertices on the surface. Needs marks.
-void refine_surface(const MeshField &field, Surface &surface, const MeshSettings &settings);
+// Field values at points (3 per point), visited in Morton order when `spatial`.
+std::vector<double> field_values(const MeshField &field, int threads, bool spatial, const std::vector<double> &points);
+
+// How far a triangle strays from the surface (SDF-DESIGN.md, "Meshing").
+struct TriangleResult {
+    double deviation;  // largest estimated distance |f| / |grad f| at its samples
+    double cosine;     // its facet normal . the unit field normal at its centroid
+    double normal[3];  // the unit field normal at its centroid (zero where the gradient vanishes)
+};
+
+// Measures triangles `which` (indices into triangles, 3 vertex indices each):
+// the largest |f| at their corners (corner_values, per vertex), edge
+// midpoints, centroid and three interior points (barycentric 2/3, 1/6, 1/6
+// and permutations), or the peak of the quadratic through the corner and
+// midpoint values plus its largest miss at the interior points if larger,
+// divided by the smallest |grad f| at the centroid and the corners
+// (corner_slopes, per vertex; at least 1/4); and the field normal at the
+// centroid (tetrahedral differences, step eps). Writes results[t].
+void measure_triangles(const MeshField &field, int threads, bool spatial, double eps, const double *positions,
+                       const uint32_t *triangles, const double *corner_values, const double *corner_slopes,
+                       const std::vector<uint32_t> &which, std::vector<TriangleResult> &results);
 
 // What a finished mesh keeps for simplification (simplify.cpp): its surface
 // before vertex splitting, its crease edges and the interior shading normal

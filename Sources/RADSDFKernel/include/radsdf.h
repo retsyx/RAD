@@ -17,29 +17,27 @@
 extern "C" {
 #endif
 
-#define RSDF_ABI_VERSION 2
+#define RSDF_ABI_VERSION 3
 
 typedef struct rsdf_graph rsdf_graph;
 typedef struct rsdf_mesh rsdf_mesh;
 
 typedef struct {
-    double cell_size;       /* grid spacing in model units (mm), > 0 */
+    double cell_size;       /* base grid spacing in model units (mm), > 0 */
     double crease_angle;    /* degrees; sharper creases keep split normals (default 35) */
-    uint64_t max_cells;     /* fail beyond this many narrow-band cells (0 = 16 million) */
+    uint64_t max_cells;     /* fail beyond this many narrow-band cells, stop refining beyond this many
+                               octree cells (0 = 16 million) */
     int32_t threads;        /* worker threads (0 = all cores) */
     int32_t refine_steps;   /* surface crossing refinement iterations (default 6) */
     double bounds_lo[3];    /* explicit meshing bounds, used when bounds_valid != 0 */
     double bounds_hi[3];
     int32_t bounds_valid;
-    uint32_t flags;         /* RSDF_MESH_* flags, or zero */
+    int32_t max_depth;      /* octree levels refinement may add below cell_size (0 = 3, negative = none,
+                               at most 6) */
+    double tolerance;       /* estimated surface deviation refinement aims for, model units
+                               (<= 0: cell_size / 20) */
+    uint64_t max_triangles; /* refinement stops before its triangle estimate exceeds this (0 = no limit) */
 } rsdf_mesh_options;
-
-enum {
-    /* Trace shallow shading creases through the extracted preview surface. */
-    RSDF_MESH_PREVIEW_CREASES = 1u,
-    /* Refine under-resolved facets of triangle-mesh inputs in previews. */
-    RSDF_MESH_PREVIEW_FACETS = 2u
-};
 
 typedef struct {
     uint64_t vertex_count;
@@ -59,6 +57,14 @@ typedef struct {
     double bounds_hi[3];
     double cell_size;
     double seconds;
+    double max_deviation;        /* bound of the distance from the triangles to the surface: 1.5 x the largest
+                                    estimate |f| / |grad f| sampled on them (see SDF-DESIGN.md, "Meshing") */
+    double tolerance;            /* the deviation refinement (or simplification) aimed for */
+    uint64_t refined_cells;      /* octree cells split because their triangles exceeded the tolerance or angle */
+    uint64_t balanced_cells;     /* octree cells split to keep touching cells within one level */
+    uint64_t flagged_triangles;  /* triangles still beyond the tolerance or angle (depth or budget reached) */
+    uint32_t max_level;          /* deepest octree level */
+    uint32_t passes;             /* extraction passes */
 } rsdf_mesh_stats;
 
 uint32_t rsdf_abi_version(void);
@@ -91,9 +97,11 @@ int rsdf_raycast(const rsdf_graph *graph, uint32_t node, const double *origins, 
                  uint64_t count, double max_distance, double tolerance, int32_t max_steps,
                  uint8_t *hits, double *distances, int32_t threads);
 
-/* Watertight surface extraction (sharp-feature dual contouring) of the node
- * intersected with the meshing bounds. Returns NULL on failure; an empty solid
- * gives an empty mesh. Array accessors may return NULL when their count is 0. */
+/* Watertight surface extraction (adaptive sharp-feature dual contouring on an
+ * octree refined until sampled deviations meet the tolerance) of the node
+ * intersected with the meshing bounds. Deterministic for any thread count.
+ * Returns NULL on failure; an empty solid gives an empty mesh. Array
+ * accessors may return NULL when their count is 0. */
 rsdf_mesh *rsdf_mesh_build(const rsdf_graph *graph, uint32_t node, const rsdf_mesh_options *options);
 void rsdf_mesh_free(rsdf_mesh *mesh);
 void rsdf_mesh_get_stats(const rsdf_mesh *mesh, rsdf_mesh_stats *stats);

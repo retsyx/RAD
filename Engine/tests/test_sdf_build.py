@@ -11,6 +11,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import uuid
 
@@ -817,52 +818,30 @@ m.couple("geneva", drive, index, **geneva(N))
         self.assertEqual(result["partStats"][0]["components"], 512)
 
     def test_the_preview_budget_counts_the_surface_before_refinement(self):
-        # The mesher refines features narrower than a cell, which these beads
-        # are at the probe's cells but not at the preview's: counting the
-        # probe's refined triangles would coarsen a preview that fits.
+        # The base cell comes from a uniform probe: refinement uses the room
+        # the base mesh leaves in the budget instead of coarsening the cell.
         post = radsdf.union(radsdf.cylinder(4, 2, center=(0, 0, 1)), radsdf.cylinder(4, 2, center=(0, 0, 3)), smooth=0.6)
         shape = post.grid_array((3, 3, 1), (10, 10, 1))
         graph = radsdf.Graph([shape])
         self.addCleanup(graph.close)
         box = (shape.bounds.lo, shape.bounds.hi)
-        default = float(np.max(box[1] - box[0])) / sdf_build.PREVIEW_CELLS_ACROSS
-        probe = graph.mesh(graph.roots[0], cell_size=default * sdf_build.PREVIEW_PROBE_FACTOR,
-                           crease_angle=sdf_build.PREVIEW_CREASE_ANGLE)
-        self.assertGreater(len(probe.triangles), 1.5 * sdf_build.unrefined_triangles(probe))
         from unittest import mock
         with mock.patch.object(sdf_build, "MAX_TRIANGLES", 500_000):
-            cell, expected = sdf_build.preview_cell_size(graph, [box], 2)
+            cell, expected, estimates = sdf_build.preview_cell_size(graph, [box], 2)
             self.assertEqual(cell, expected)
-            preview = graph.mesh(graph.roots[0], cell_size=cell, crease_angle=sdf_build.PREVIEW_CREASE_ANGLE)
-            self.assertLess(len(preview.triangles), sdf_build.MAX_TRIANGLES)
-
-    def test_optional_facet_detail_yields_to_the_preview_budget(self):
-        from types import SimpleNamespace
-        from unittest import mock
-
-        graph = SimpleNamespace(roots=[0])
-        assembly = SimpleNamespace(labels=["part"])
-        calls = []
-
-        def part(graph, node, label, cell, threads, *, facets=False):
-            calls.append((cell, facets))
-            return SimpleNamespace(positions=[], creases=[], triangles=range(12 if facets else 8))
-
-        with mock.patch.object(sdf_build, "MAX_TRIANGLES", 10), \
-                mock.patch.object(sdf_build, "preview_cell_size", return_value=(0.5, 0.5)), \
-                mock.patch.object(sdf_build, "_mesh_part", part):
-            meshes, cell, default = sdf_build.mesh_parts(graph, assembly, [], 1, facets=True)
-
-        self.assertEqual(calls, [(0.5, True), (0.5, False)])
-        self.assertEqual((cell, default, len(meshes[0].triangles)), (0.5, 0.5, 8))
+            self.assertLess(estimates[0], sdf_build.PREVIEW_BASE_SHARE * sdf_build.MAX_TRIANGLES)
+            meshes, cell, _ = sdf_build.mesh_parts(graph, SimpleNamespace(labels=["posts"]), [box], 2)
+            self.assertEqual(cell, expected)
+            self.assertLessEqual(len(meshes[0].triangles), sdf_build.MAX_TRIANGLES)
+            self.assertGreater(meshes[0].stats["refined_cells"], 0)
 
     def test_too_detailed_designs_fail_after_two_remeshes(self):
         calls = []
         real = sdf_build._mesh_part
 
-        def dense(graph, shape, label, cell, threads):
+        def dense(graph, shape, label, cell, threads, budget=None):
             calls.append(cell)
-            mesh = real(graph, shape, label, cell, threads)
+            mesh = real(graph, shape, label, cell, threads, budget)
             return radsdf.Mesh(np.zeros((sdf_build.MAX_VERTICES + 1, 3)), np.tile([0.0, 0.0, 1.0], (
                 sdf_build.MAX_VERTICES + 1, 1)), mesh.triangles, mesh.creases, mesh.stats)
         from unittest import mock

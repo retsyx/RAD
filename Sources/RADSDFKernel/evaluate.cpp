@@ -26,7 +26,6 @@ struct Frame {
     double *tmp;               // a child's values awaiting combination
     size_t mark;               // pool position to release when the frame ends
     double box_lo[3], box_hi[3];
-    double feature_scale;     // model units per local unit (preview detail probes only)
     double current;            // largest value (union) or interior depth (difference)
     size_t candidate_mark;     // Scratch::candidates size to restore when the frame ends
     size_t next_candidate, candidates_end;  // this frame's candidate children (ChildTree nodes)
@@ -75,10 +74,6 @@ public:
         }
     }
 
-    // Optional preview probe. Track the narrowest nearby input facet at
-    // each query while leaving CSG distances and branch choices unchanged.
-    double *facet_sizes = nullptr;
-    double facet_radius = 0;
     std::vector<Frame> frames;
     std::vector<uint32_t> candidates;  // child positions per boolean frame, stacked like the frames
 
@@ -102,7 +97,7 @@ private:
 
 thread_local Scratch scratch;
 
-void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, const double *z, double *out, double scale = 1) {
+void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, const double *z, double *out) {
     Frame frame;
     frame.node = node;
     frame.stage = 0;
@@ -114,7 +109,6 @@ void push(Scratch &s, uint32_t node, int n, const double *x, const double *y, co
     frame.tmp = nullptr;
     frame.mark = s.top();
     frame.current = 0;
-    frame.feature_scale = s.facet_sizes && !s.frames.empty() ? s.frames.back().feature_scale * scale : 1;
     frame.candidate_mark = s.candidates.size();
     frame.next_candidate = frame.candidates_end = 0;
     frame.has_box = frame.has_current = frame.pending = frame.has_candidates = false;
@@ -708,22 +702,13 @@ bool step(const rsdf_graph &graph, Scratch &s, Frame &f) {
             f.stage = 1;
             const double *cx, *cy, *cz;
             map_points(s, node, p, n, x, y, z, cx, cy, cz);
-            double scale = 1;
-            if (s.facet_sizes) {
-                if (node.op == OP_TRANSFORM) scale = p[12];
-                if (node.op == OP_STRETCH) scale = std::min({p[0], p[1], p[2]});
-                if (node.op == OP_TWIST) scale = node.c0;
-            }
-            push(s, graph.child_ids(node)[0], n, cx, cy, cz, out, scale);
+            push(s, graph.child_ids(node)[0], n, cx, cy, cz, out);
             return false;
         }
         finish_unary(node, p, n, z, out);
         return true;
     default:
-        if (node.op == OP_MESH && s.facet_sizes)
-            eval_triangle_mesh(graph.meshes[node.mesh], n, x, y, z, out, s.facet_sizes, s.facet_radius, f.feature_scale);
-        else
-            eval_leaf(graph, node, p, n, x, y, z, out);
+        eval_leaf(graph, node, p, n, x, y, z, out);
         return true;
     }
 }
@@ -731,13 +716,10 @@ bool step(const rsdf_graph &graph, Scratch &s, Frame &f) {
 }  // namespace
 
 void eval_batch(const rsdf_graph &graph, uint32_t node, int n, const double *x, const double *y, const double *z,
-                double *out, double *facet_sizes, double facet_radius) {
+                double *out) {
     if (n <= 0) return;
     Scratch &s = scratch;
     s.reset();
-    s.facet_sizes = facet_sizes;
-    s.facet_radius = facet_radius;
-    if (facet_sizes) std::fill_n(facet_sizes, n, INFINITY);
     push(s, node, n, x, y, z, out);
     while (!s.frames.empty()) {
         Frame &frame = s.frames.back();
@@ -752,7 +734,7 @@ void eval_batch(const rsdf_graph &graph, uint32_t node, int n, const double *x, 
 }
 
 void batch_gradients(const BatchField &field, int n, const double *x, const double *y, const double *z, double eps,
-                     double *nx, double *ny, double *nz) {
+                     double *nx, double *ny, double *nz, double *magnitude) {
     // Tetrahedral differences: g = sum_k f(p + eps v_k) v_k for the four
     // vertices v_k of a regular tetrahedron.
     static const double kTetra[4][3] = {{1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {1, 1, 1}};
@@ -772,6 +754,7 @@ void batch_gradients(const BatchField &field, int n, const double *x, const doub
             gz += values[4 * i + k] * kTetra[k][2];
         }
         const double length = std::sqrt(gx * gx + gy * gy + gz * gz);
+        if (magnitude) magnitude[i] = std::isfinite(length) ? length / (4 * eps) : 0;
         if (length > 0 && std::isfinite(length)) {
             nx[i] = gx / length;
             ny[i] = gy / length;

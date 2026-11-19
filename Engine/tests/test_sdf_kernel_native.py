@@ -43,7 +43,8 @@ class MeshOptions(ctypes.Structure):
     _fields_ = [("cell_size", ctypes.c_double), ("crease_angle", ctypes.c_double), ("max_cells", ctypes.c_uint64),
                 ("threads", ctypes.c_int32), ("refine_steps", ctypes.c_int32),
                 ("bounds_lo", ctypes.c_double * 3), ("bounds_hi", ctypes.c_double * 3),
-                ("bounds_valid", ctypes.c_int32), ("flags", ctypes.c_uint32)]
+                ("bounds_valid", ctypes.c_int32), ("max_depth", ctypes.c_int32), ("tolerance", ctypes.c_double),
+                ("max_triangles", ctypes.c_uint64)]
 
 
 class MeshStats(ctypes.Structure):
@@ -53,7 +54,9 @@ class MeshStats(ctypes.Structure):
         ("volume", ctypes.c_double), ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double),
         ("centroid", ctypes.c_double * 3),
         ("bounds_lo", ctypes.c_double * 3), ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
-        ("seconds", ctypes.c_double)]
+        ("seconds", ctypes.c_double), ("max_deviation", ctypes.c_double), ("tolerance", ctypes.c_double),
+        ("refined_cells", ctypes.c_uint64), ("balanced_cells", ctypes.c_uint64),
+        ("flagged_triangles", ctypes.c_uint64), ("max_level", ctypes.c_uint32), ("passes", ctypes.c_uint32)]
 
 
 class KernelError(Exception):
@@ -128,9 +131,10 @@ class Kernel:
         dimension = self.lib.rsdf_node_dimension(handle, node)
         return lo[:dimension], hi[:dimension], lipschitz.value
 
-    def mesh(self, handle, node, cell_size, threads=0, bounds=None, max_cells=0, crease_angle=0.0, preview=False):
+    def mesh(self, handle, node, cell_size, threads=0, bounds=None, max_cells=0, crease_angle=0.0, max_depth=0,
+             tolerance=0.0, max_triangles=0):
         options = MeshOptions(cell_size=cell_size, crease_angle=crease_angle, max_cells=max_cells, threads=threads,
-                              flags=1 if preview else 0)
+                              max_depth=max_depth, tolerance=tolerance, max_triangles=max_triangles)
         if bounds is not None:
             options.bounds_lo[:] = bounds[0]
             options.bounds_hi[:] = bounds[1]
@@ -304,7 +308,7 @@ class KernelCase(unittest.TestCase):
 
 class EvaluationTests(KernelCase):
     def test_abi_and_version(self):
-        self.assertEqual(self.k.lib.rsdf_abi_version(), 2)
+        self.assertEqual(self.k.lib.rsdf_abi_version(), 3)
         self.assertTrue(self.k.lib.rsdf_kernel_version())
 
     def test_3d_primitives_match_analytic_values(self):
@@ -1076,7 +1080,7 @@ class MeshTests(KernelCase):
         offset = np.array([0.137, -0.159, 0.213])
         node = g.move(roof, offset, rotation)
         cell = 0.43
-        mesh = self.mesh(g, node, cell, preview=True)
+        mesh = self.mesh(g, node, cell)
 
         points = (mesh.positions.astype(float) - offset) @ rotation
         local = points[mesh.triangles]
@@ -1112,8 +1116,8 @@ class MeshTests(KernelCase):
         offset = np.array([0.137, -0.159, 0.213])
         node = g.move(clipped, offset, rotation)
         cell = 0.3
-        mesh = self.mesh(g, node, cell, threads=1, preview=True)
-        parallel = self.mesh(g, node, cell, threads=4, preview=True)
+        mesh = self.mesh(g, node, cell, threads=1)
+        parallel = self.mesh(g, node, cell, threads=4)
         for key in ("positions", "normals", "triangles", "creases"):
             np.testing.assert_array_equal(getattr(mesh, key), getattr(parallel, key))
 
@@ -1150,13 +1154,15 @@ class MeshTests(KernelCase):
         axis, up = rotation[:, 2], np.array([0.0, 0.0, 1.0])
         cases = [(cylinder, 0.3, axis, 0.5), (cylinder, 0.37, axis, 0.5), (slotted, 0.72, up, 20)]
         for node, cell, normal, tolerance in cases:
-            mesh = self.mesh(g, node, cell, preview=True)
+            mesh = self.mesh(g, node, cell)
             corners = mesh.positions[mesh.triangles].astype(float)
             facet = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-            facet /= length(facet)[:, None]
+            area = length(facet)
+            facet /= np.maximum(area, 1e-300)[:, None]
             for face in (normal, -normal):
                 with self.subTest(cell=cell, face=face.tolist()):
-                    flat = facet @ face > math.cos(math.radians(1))
+                    # Faces, not degenerate slivers along the edges (whose facets point anywhere).
+                    flat = (facet @ face > math.cos(math.radians(1))) & (area > 1e-3 * cell * cell)
                     self.assertGreater(np.count_nonzero(flat), 50)
                     shading = mesh.normals[mesh.triangles[flat]].reshape(-1, 3).astype(float) @ face
                     self.assertGreater(shading.min(), math.cos(math.radians(tolerance)))
@@ -1338,6 +1344,162 @@ class MeshTests(KernelCase):
         with self.assertRaisesRegex(KernelError, "single-precision"):
             self.k.mesh(self.build(g), far, 0.05)
         self.mesh(g, far, 1.0)
+
+
+class AdaptiveMeshTests(KernelCase):
+    """Octree refinement: fidelity set by the tolerance, not the cell."""
+    mesh = MeshTests.mesh
+    assertMeasures = MeshTests.assertMeasures
+
+    def dense_deviation(self, handle, node, mesh, divisions=8):
+        """The largest |f| / |grad f| (gradient at least 1/4) on a barycentric
+        grid of every triangle, per triangle."""
+        n = divisions
+        weights = np.array([(i / n, j / n, 1 - (i + j) / n) for i in range(n + 1) for j in range(n + 1 - i)])
+        corners = mesh.positions[mesh.triangles].astype(float)
+        points = np.einsum("kj,tjd->tkd", weights, corners).reshape(-1, 3)
+        values = self.k.evaluate(handle, node, points)
+        step = 1e-4 * mesh.stats.cell_size
+        slopes = np.zeros(len(points))
+        gradient = np.zeros((len(points), 3))
+        for axis in range(3):
+            d = np.zeros(3)
+            d[axis] = step
+            gradient[:, axis] = (self.k.evaluate(handle, node, points + d) -
+                                 self.k.evaluate(handle, node, points - d)) / (2 * step)
+        slopes = np.maximum(length(gradient), 0.25)
+        return (np.abs(values) / slopes).reshape(len(corners), -1).max(axis=1)
+
+    def inverted_away_from_creases(self, handle, node, mesh, margin):
+        """Triangles whose facet faces against the field normal at their
+        centroid, farther than `margin` from every crease segment."""
+        corners = mesh.positions[mesh.triangles].astype(float)
+        facet = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        centroids = corners.mean(axis=1)
+        inverted = np.flatnonzero(np.sum(facet * self.k.gradient(handle, node, centroids), axis=1) < 0)
+        segments = mesh.creases.reshape(-1, 2, 3).astype(float)
+        far = []
+        for t in inverted:
+            if len(segments):
+                a, b = segments[:, 0], segments[:, 1]
+                along = np.clip(np.sum((centroids[t] - a) * (b - a), axis=1) /
+                                np.maximum(np.sum((b - a) ** 2, axis=1), 1e-30), 0, 1)
+                if np.min(length(a + along[:, None] * (b - a) - centroids[t])) < margin:
+                    continue
+            far.append(t)
+        return far
+
+    def check(self, g, node, cell, **options):
+        """A refined mesh that is closed, manifold, deterministic for 1, 3 and
+        14 threads, bounded by its reported deviation on a dense grid, and
+        without inverted triangles away from creases."""
+        handle = self.build(g)
+        mesh = self.mesh(g, node, cell, threads=1, **options)
+        for threads in (3, 14):
+            other = self.k.mesh(handle, node, cell, threads=threads, **options)
+            for key in ("positions", "normals", "triangles", "creases"):
+                np.testing.assert_array_equal(getattr(mesh, key), getattr(other, key), err_msg=f"{key} threads={threads}")
+        dense = self.dense_deviation(handle, node, mesh)
+        self.assertLessEqual(dense.max(), mesh.stats.max_deviation)
+        self.assertEqual(self.inverted_away_from_creases(handle, node, mesh, 0.5 * cell), [])
+        return handle, mesh, dense
+
+    def test_a_sharp_pocket_shallower_than_a_cell(self):
+        # The Minotaur's strap pocket: 0.6 mm deep under 0.72 mm cells puts
+        # the rim and the floor in one cell, where one vertex dips into the
+        # pocket. Refinement separates them within the tolerance.
+        g = Graph()
+        rotation = rotation_matrix([1, 2, 5], 13)
+        body = g.add(BOX, [], [10, 10, 5, 0])
+        strap = g.move(g.add(BOX, [], [2.6, 20, 0.6, 0]), [0.31, 0, 5])
+        node = g.move(g.add(DIFFERENCE, [body, strap], [0]), [0.17, -0.23, 0.11], rotation)
+        cell = 0.72
+        handle, mesh, dense = self.check(g, node, cell)
+        uniform = self.k.mesh(handle, node, cell, max_depth=-1)
+        tolerance = mesh.stats.tolerance
+        self.assertAlmostEqual(tolerance, 0.05 * cell)
+        self.assertGreater(self.dense_deviation(handle, node, uniform).max(), 4 * tolerance)
+        self.assertLess(np.percentile(dense, 99.9), tolerance)
+        self.assertLess(dense.max(), 2 * tolerance)
+        self.assertEqual(mesh.stats.max_level, 3)
+        self.assertMeasures(mesh, 20 * 20 * 10 - 5.2 * 20 * 0.6, volume_tolerance=0.001)
+
+    def test_a_wall_thinner_than_a_cell(self):
+        g = Graph()
+        node = g.move(g.add(BOX, [], [6, 4, 0.25, 0]), [0.1, 0.2, 0.3], rotation_matrix([1, 1, 4], 17))
+        cell = 0.72
+        handle, mesh, dense = self.check(g, node, cell)
+        self.assertEqual(mesh.stats.components, 1)
+        self.assertMeasures(mesh, 12 * 8 * 0.5, volume_tolerance=0.02)
+        self.assertLess(dense.max(), 2 * mesh.stats.tolerance)
+
+    def test_a_rotated_box_keeps_its_edges(self):
+        g = Graph()
+        node = g.move(g.add(BOX, [], [3, 2, 1.5, 0]), [0.13, -0.27, 0.31], rotation_matrix([1, 2, 3], 29))
+        cell = 0.4
+        handle, mesh, dense = self.check(g, node, cell)
+        self.assertMeasures(mesh, 6 * 4 * 3, volume_tolerance=0.001)
+        self.assertLess(dense.max(), 2 * mesh.stats.tolerance)
+        # The edges are drawn as crease lines of the full length.
+        total = np.sum(length(mesh.creases[:, 3:] - mesh.creases[:, :3]))
+        self.assertAlmostEqual(total / (4 * (6 + 4 + 3)), 1, delta=0.05)
+
+    def test_a_blend_narrower_than_a_cell(self):
+        g = Graph()
+        center = np.array([0.13, -0.27, 0.31])
+        low = g.move(g.add(CYLINDER, [], [8, 2]), center + [0, 0, -2])
+        high = g.move(g.add(CYLINDER, [], [8, 3]), center + [0, 0, 3])
+        node = g.add(UNION, [low, high], [0.6])
+        handle, mesh, dense = self.check(g, node, 0.5)
+        uniform = self.k.mesh(handle, node, 0.5, max_depth=-1)
+        self.assertGreater(self.dense_deviation(handle, node, uniform).max(), 1.5 * mesh.stats.tolerance)
+        self.assertLess(dense.max(), 1.2 * mesh.stats.tolerance)
+
+    def test_a_shallow_crease_fading_into_a_blend(self):
+        # Mirrored pecs: an exact union of two ellipsoids meeting in a valley,
+        # fed into a smooth union, so the valley's angle fades from about 40
+        # degrees to nothing. Triangles beside it lie on its faces.
+        g = Graph()
+        pec = g.add(ELLIPSOID, [], [4.6, 2.75, 3.5])
+        pecs = g.add(UNION, [g.move(pec, [4.7, -1.2, 0]), g.move(pec, [-4.7, -1.2, 0])], [0])
+        core = g.move(g.add(ELLIPSOID, [], [9.75, 7, 7]), [0, 2.5, -3])
+        node = g.move(g.add(UNION, [core, pecs], [1.5]), [0.07, 0.11, -0.05])
+        cell = 0.36
+        handle, mesh, dense = self.check(g, node, cell)
+        corners = mesh.positions[mesh.triangles].astype(float)
+        centroids = corners.mean(axis=1)
+        valley = (np.abs(centroids[:, 0] - 0.07) < 1.0) & (centroids[:, 1] < -2)
+        self.assertGreater(np.count_nonzero(valley), 100)
+        facet = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        facet /= np.maximum(length(facet), 1e-300)[:, None]
+        field = self.k.gradient(handle, node, centroids[valley])
+        cosine = np.sum(facet[valley] * field, axis=1)
+        self.assertGreater(np.percentile(cosine, 2), math.cos(math.radians(10)))
+        self.assertLess(dense.max(), 2 * mesh.stats.tolerance)
+
+    def test_touching_parts_share_their_surface_away_from_the_junction(self):
+        # A body with a pocket cut by an inlay, and the inlay: the pocket's
+        # floor and the inlay's bottom are one surface, meshed on one lattice.
+        g = Graph()
+        rotation = rotation_matrix([2, 1, 7], 11)
+        body = g.add(BOX, [], [10, 8, 4, 0])
+        inlay_local = g.move(g.add(BOX, [], [4, 3, 1.5, 0]), [0.3, -0.2, 4])
+        inlay = g.add(INTERSECTION, [inlay_local, g.add(BOX, [], [20, 20, 20, 0])], [0])
+        pocketed = g.add(DIFFERENCE, [body, inlay_local], [0])
+        offset = [0.21, -0.14, 0.33]
+        parts = [g.move(pocketed, offset, rotation), g.move(inlay, offset, rotation)]
+        handle = self.build(g)
+        cell = 0.5
+        meshes = [self.mesh(g, node, cell) for node in parts]
+        floor = []
+        for mesh in meshes:
+            local = (mesh.positions.astype(float) - offset) @ rotation
+            # The pocket floor (z = 2.5) more than two cells from the walls.
+            keep = (np.abs(local[:, 2] - 2.5) < 1e-3) & (np.abs(local[:, 0] - 0.3) < 4 - 2 * cell) & \
+                (np.abs(local[:, 1] + 0.2) < 3 - 2 * cell)
+            floor.append({tuple(p) for p in mesh.positions[keep].tolist()})
+        self.assertGreater(len(floor[0]), 50)
+        self.assertEqual(floor[0], floor[1])
 
 
 class BenchmarkTests(KernelCase):

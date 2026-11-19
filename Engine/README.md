@@ -91,8 +91,11 @@ publishes its outputs, each written to a temporary name and renamed:
   (absolute path of `model.rsdf`), `partRoots` (RSDF node of each part),
   `bounds`, `volume`, `area`, `solids`, `parts`, `partStats`
   (`[{solid, volume, area, bounds, centroid, triangles, components,
-  cavities}]`: separate pieces and sealed internal voids), `mesh`
-  (`{cellSize, boundaryEdges, nonmanifoldEdges}`), optional `assemblyMotion`,
+  cavities, maxDeviation}]`: separate pieces, sealed internal voids and a
+  bound of the distance in mm from the part's triangles to its exact
+  surface), `mesh` (`{cellSize, boundaryEdges, nonmanifoldEdges,
+  maxDeviation}`: the base cell and the parts' largest bound), optional
+  `assemblyMotion`,
   `printVersion`, `printDown`, `referenceSolids` and `customFields`,
   `validatedHash`, `buildSeconds`, `threads`,
   `runtime` (`{python, numpy, kernel}`), `warnings` and `meshBuffers` (the
@@ -105,9 +108,13 @@ publishes its outputs, each written to a temporary name and renamed:
 
 Bounds are the exact extremes of the Float32 vertex positions; volumes, areas,
 centroids and piece counts come from the kernel's mesh statistics. The preview
-cell size is the design's largest extent over 256, coarsened (with a warning)
-until the predicted mesh fits one million triangles, one million vertices and
-250,000 crease segments. A part whose mesh is empty, open or encloses no volume
+base cell size is the design's largest extent over 256, coarsened (with a
+warning) until the predicted unrefined mesh fits three quarters of one million
+triangles, one million vertices and 250,000 crease segments; cells then halve
+up to three times where triangles stray from the surface by more than a
+twentieth of the cell, within the rest of the triangle budget (each part gets
+the room earlier parts left, shared with later ones by their predicted
+sizes). A part whose mesh is empty, open or encloses no volume
 is a design error naming the part and suggesting thicker features. Non-manifold
 edges and parts with several disconnected pieces add warnings (sealed cavities
 are voids inside a piece, not pieces). Failed builds
@@ -340,19 +347,24 @@ built coordinates; pair results are posed.
 - `export`: optional `solidIndices`, `individualParts` (groups of solids, one
   file each), `partPresentation` (names and sRGB colors by solid index),
   `solidTransforms`, `cellSize` and `tolerance` → `model.3mf` or `part-%04d.3mf`
-  and `{solids, triangles, cellSize, tolerance, meshedTriangles, partFiles?}`.
-  The 3MF stores separate closed meshes in millimeters, each with an sRGB
-  color from the 3MF Materials and Properties Extension. Parts are re-meshed
-  at half the design's default preview cell size (its largest extent over 256),
-  clamped to 0.05–0.5 mm, or at `cellSize`, coarsened to fit 4,000,000 meshed triangles,
-  then simplified within `tolerance` mm (default 0.01; at most a quarter of
-  the cell; 0 keeps the full mesh), keeping sharp edges and corners
+  and `{solids, triangles, cellSize, tolerance, meshedTriangles, maxDeviation,
+  partFiles?}`. The 3MF stores separate closed meshes in millimeters, each
+  with an sRGB color from the 3MF Materials and Properties Extension. Parts
+  are re-meshed from a base cell of half the design's default preview cell
+  size (its largest extent over 256), clamped to 0.05–0.5 mm, or `cellSize`,
+  coarsened so the unrefined mesh fits three quarters of 4,000,000 meshed
+  triangles; cells then halve up to three times until the triangles lie
+  within 0.02 mm of the surface (within the budget), and the meshes are
+  simplified within `tolerance` mm (default 0.01; at most a quarter of the
+  cell; 0 keeps the full mesh), keeping sharp edges and corners
   (SDF-DESIGN.md, "Mesh simplification"). Every part is meshed before any is
-  simplified.
+  simplified. `maxDeviation` is the largest bound (mm) of the exported
+  triangles' distance from the surface.
 - `validate`: optional `cellSize` → `{ok, cellSize, parts: [{solid, closed,
   boundaryEdges, nonmanifoldEdges, components, cavities, previewCavities,
-  volume, previewVolume, volumeChange}], warnings}`. Every part is re-meshed at
-  half the preview cell size (or `cellSize`); open or non-manifold surfaces,
+  volume, previewVolume, volumeChange}], warnings}`. Every part is re-meshed
+  from half the preview cell size (or `cellSize`), refined as the preview is;
+  open or non-manifold surfaces,
   parts that split or vanish (pieces compared without sealed cavities), sealed
   cavities that open or close, and volume changes above 2% are problems and
   clear `ok`.

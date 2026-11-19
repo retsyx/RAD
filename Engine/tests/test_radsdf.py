@@ -706,12 +706,15 @@ class LibraryTests(unittest.TestCase):
 
     def test_option_and_stats_layouts_match_the_header(self):
         options, stats = radsdf._MeshOptions, radsdf._MeshStats
-        self.assertEqual(ctypes.sizeof(options), 88)
-        self.assertEqual((options.max_cells.offset, options.bounds_lo.offset, options.bounds_valid.offset),
-                         (16, 32, 80))
-        self.assertEqual(ctypes.sizeof(stats), 176)
+        self.assertEqual(ctypes.sizeof(options), 104)
+        self.assertEqual((options.max_cells.offset, options.bounds_lo.offset, options.bounds_valid.offset,
+                          options.max_depth.offset, options.tolerance.offset, options.max_triangles.offset),
+                         (16, 32, 80, 84, 88, 96))
+        self.assertEqual(ctypes.sizeof(stats), 224)
         self.assertEqual((stats.cavities.offset, stats.volume.offset, stats.cavity_volume.offset,
-                          stats.centroid.offset, stats.cell_size.offset), (56, 64, 80, 88, 160))
+                          stats.centroid.offset, stats.cell_size.offset, stats.max_deviation.offset,
+                          stats.refined_cells.offset, stats.max_level.offset, stats.passes.offset),
+                         (56, 64, 80, 88, 160, 176, 192, 216, 220))
 
     def test_library_search_order(self):
         with tempfile.TemporaryDirectory() as folder:

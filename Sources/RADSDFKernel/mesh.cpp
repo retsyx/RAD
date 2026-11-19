@@ -32,10 +32,19 @@ namespace rsdf {
 namespace {
 
 constexpr size_t kChunk = 4096;
-const double kNormalAgreement = std::cos(20 * M_PI / 180);
 // Meshing needs about 330 bytes per narrow-band cell, so the default limit
 // keeps peak memory near 5 GB.
 constexpr uint64_t kDefaultMaxCells = 16000000;
+constexpr int kDefaultDepth = 3;           // octree levels refinement may add below the cell
+// Faces meeting along a sharp feature that turn by more than this shade with
+// their own normals (degrees; the shallowest crease extraction resolves).
+const double kCosShadingTurn = std::cos(4 * M_PI / 180), kCosHalfShadingTurn = std::cos(2 * M_PI / 180);
+constexpr int kMaxDepth = 6;
+constexpr double kDefaultTolerance = 0.05;  // cells
+// The reported deviation bound: the largest sampled estimate times this
+// margin, which covers the estimate between samples where |grad f| varies
+// (a dense check of the Minotaur preview found at most 1.42 times it).
+constexpr double kDeviationMargin = 1.5;
 
 inline double dot(const double *a, const double *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
@@ -66,25 +75,13 @@ public:
     Finisher(const Surface &surface, const MeshField &field, double eps, double crease_degrees, int threads,
              bool spatial)
         : surface_(surface), field_(field), eps_(eps), cos_crease_(std::cos(crease_degrees * M_PI / 180)),
-          cos_half_crease_(std::cos(crease_degrees * M_PI / 360)), threads_(threads), spatial_(spatial), vertex_count_(surface.positions.size() / 3),
-          triangle_count_(surface.triangles.size() / 3) {}
+          cos_half_crease_(std::cos(crease_degrees * M_PI / 360)), threads_(threads), spatial_(spatial),
+          vertex_count_(surface.positions.size() / 3), triangle_count_(surface.triangles.size() / 3) {}
 
-    void run(rsdf_mesh &mesh, std::vector<double> vertex_normals = {}) {
-        vertex_normals_ = std::move(vertex_normals);
-        const size_t existing = vertex_normals_.size() / 3;
-        if (existing == 0) {
-            vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *p) {
-                std::copy_n(&surface_.positions[3 * v], 3, p);
-            });
-        } else if (existing < vertex_count_) {
-            const auto extra = gradients(field_, vertex_count_ - existing, eps_, threads_, spatial_, [&](size_t v, double *p) {
-                std::copy_n(&surface_.positions[3 * (existing + v)], 3, p);
-            });
-            vertex_normals_.insert(vertex_normals_.end(), extra.begin(), extra.end());
-        }
-        triangle_normals(mesh.stats.cell_size);
+    void run(rsdf_mesh &mesh) {
+        triangle_normals();
         build_adjacency();
-        assign_crease_sides(mesh.stats.cell_size);
+        vertex_normals();
         split_vertices(mesh);
         analyse_edges(mesh);
         prune_spurs(mesh);
@@ -94,90 +91,26 @@ public:
     }
 
 private:
-    // Find the nearest sampled sign change along the outward guide and
-    // return the exterior end of its bracket, within one gradient step.
-    bool surface_offset(const double *point, const double *guide, double cell, double &outside) const {
-        double value;
-        field_.evaluate(1, point, point + 1, point + 2, &value);
-        outside = 0;
-        if (value == 0) return true;
-        // Probe from the sample towards the expected side, nearest first.
-        // A local sign bracket also works for fields scaled away from a
-        // true distance. Search from 1/1024 to 1/4 of a cell.
-        constexpr int probes = 9;
-        double offsets[probes], xyz[3][probes], values[probes];
-        double step = std::copysign(cell / 1024, -value);
-        for (int i = 0; i < probes; ++i, step *= 2) {
-            offsets[i] = step;
-            for (int a = 0; a < 3; ++a) xyz[a][i] = point[a] + step * guide[a];
+    // Interior normal of each triangle: the gradient at its centroid (as
+    // extraction measured it, when it did).
+    void triangle_normals() {
+        if (surface_.interior_normals.size() == 3 * triangle_count_) {
+            tri_normals_ = surface_.interior_normals;
+        } else {
+            tri_normals_ = gradients(field_, triangle_count_, eps_, threads_, spatial_, [&](size_t t, double *centroid) {
+                for (int a = 0; a < 3; ++a) {
+                    double sum = 0;
+                    for (int k = 0; k < 3; ++k) sum += surface_.positions[3 * size_t(surface_.triangles[3 * t + k]) + a];
+                    centroid[a] = sum / 3;
+                }
+            });
         }
-        field_.evaluate(probes, xyz[0], xyz[1], xyz[2], values);
-        for (int i = 0; i < probes; ++i) {
-            if ((value < 0 && values[i] < 0) || (value > 0 && values[i] > 0)) continue;
-            double near = i ? offsets[i - 1] : 0, far = offsets[i], sample[3];
-            // A buried cap can make the field nearly constant across part of
-            // the bracket. Resolve the crossing to the gradient stencil size.
-            while (std::fabs(far - near) > eps_) {
-                const double mid = 0.5 * (near + far);
-                for (int a = 0; a < 3; ++a) sample[a] = point[a] + mid * guide[a];
-                double f;
-                field_.evaluate(1, sample, sample + 1, sample + 2, &f);
-                if ((f < 0) == (value < 0)) near = mid;
-                else far = mid;
-            }
-            outside = value < 0 ? far : near;
-            return true;
+        for (size_t t = 0; t < triangle_count_; ++t) {
+            double *n = &tri_normals_[3 * t];
+            if (!is_zero(n)) continue;
+            face_vector(surface_, t, n);  // a vanishing gradient falls back to the facet normal
+            normalize(n);
         }
-        return false;
-    }
-
-    // A triangle centroid or refined vertex can sit inside a union where the
-    // field gradient points to a buried cap. If the gradient disagrees with
-    // the local mesh, resample at the surface. The mesh guides the search
-    // while field normals continue to define lighting and creases.
-    void surface_normal(const double *point, double *guide, double cell, double *normal) const {
-        normalize(guide);
-        if (is_zero(guide)) return;
-        const double agreement = dot(guide, normal);
-        if (agreement >= kNormalAgreement) return;
-        if (is_zero(normal)) std::copy_n(guide, 3, normal);
-
-        double outside;
-        if (!surface_offset(point, guide, cell, outside)) return;
-        // Keep the tetrahedral gradient stencil on the exterior side of a seam.
-        double sample[3], corrected[3];
-        for (int a = 0; a < 3; ++a) sample[a] = point[a] + (outside + 2 * eps_) * guide[a];
-        batch_gradients(field_.batch(), 1, sample, sample + 1, sample + 2, eps_,
-                        corrected, corrected + 1, corrected + 2);
-        if (!is_zero(corrected) && dot(corrected, guide) > agreement)
-            std::copy_n(corrected, 3, normal);
-    }
-
-    void triangle_normals(double cell) {
-        auto centroid = [&](size_t t, double *point) {
-            for (int a = 0; a < 3; ++a) {
-                double sum = 0;
-                for (int k = 0; k < 3; ++k) sum += surface_.positions[3 * size_t(surface_.triangles[3 * t + k]) + a];
-                point[a] = sum / 3;
-            }
-        };
-        tri_normals_ = gradients(field_, triangle_count_, eps_, threads_, spatial_, centroid);
-        parallel_chunks(chunks_of(triangle_count_, kChunk), threads_, [&](size_t chunk) {
-            const size_t end = std::min(triangle_count_, (chunk + 1) * kChunk);
-            for (size_t t = chunk * kChunk; t < end; ++t) {
-                // The surface samples at the corners take precedence over a
-                // poorly conditioned facet of a sliver or thin wall.
-                double *normal = &tri_normals_[3 * t];
-                const uint32_t *corners = &surface_.triangles[3 * t];
-                if (std::all_of(corners, corners + 3, [&](uint32_t v) {
-                        return dot(normal, &vertex_normals_[3 * size_t(v)]) >= kNormalAgreement;
-                    })) continue;
-                double facet[3], point[3];
-                face_vector(surface_, t, facet);
-                centroid(t, point);
-                surface_normal(point, facet, cell, normal);
-            }
-        });
     }
 
     // Triangle corners (3 t + k) around each vertex, in triangle order.
@@ -190,48 +123,28 @@ private:
         for (size_t c = 0; c < surface_.triangles.size(); ++c) corners_[fill[surface_.triangles[c]]++] = uint32_t(c);
     }
 
-    // Probe just inside each incident triangle at the located surface crease.
-    // Its two one-sided normals are shared by every corner on each face.
-    void assign_crease_sides(double cell) {
-        if (surface_.crease_samples.empty()) return;
-        const size_t start = first_corner_[surface_.first_crease_vertex];
-        const auto side_normals = gradients(field_, corners_.size() - start, eps_ / 16, threads_, spatial_,
-            [&](size_t i, double *sample) {
-                const uint32_t corner = corners_[start + i];
-                const uint32_t *v = &surface_.triangles[3 * (corner / 3)];
-                const uint32_t at = corner % 3;
-                const double *p = &surface_.positions[3 * size_t(v[at])];
-                const double *a = &surface_.positions[3 * size_t(v[(at + 1) % 3])];
-                const double *b = &surface_.positions[3 * size_t(v[(at + 2) % 3])];
-                double direction[3];
-                for (int axis = 0; axis < 3; ++axis) direction[axis] = a[axis] + b[axis] - 2 * p[axis];
-                normalize(direction);
-                const auto &origin = surface_.crease_samples[v[at] - surface_.first_crease_vertex].point;
-                for (int axis = 0; axis < 3; ++axis) sample[axis] = origin[axis] + 0.006 * cell * direction[axis];
+    // The gradient at each vertex (as extraction measured it, when it did);
+    // a vanishing gradient falls back to the area-weighted facet normals
+    // around the vertex.
+    void vertex_normals() {
+        if (surface_.vertex_normals.size() == 3 * vertex_count_) {
+            vertex_normals_ = surface_.vertex_normals;
+        } else {
+            vertex_normals_ = gradients(field_, vertex_count_, eps_, threads_, spatial_, [&](size_t v, double *position) {
+                std::copy_n(&surface_.positions[3 * v], 3, position);
             });
-        crease_sides_.resize(side_normals.size() / 3);
-        for (size_t i = 0; i < crease_sides_.size(); ++i) {
-            const uint32_t v = surface_.triangles[corners_[start + i]];
-            const auto &sides = surface_.crease_samples[v - surface_.first_crease_vertex].normals;
-            const double *normal = &side_normals[3 * i];
-            crease_sides_[i] = dot(normal, sides[1].data()) > dot(normal, sides[0].data());
         }
-    }
-
-    // Most surface vertex gradients already agree with their incident
-    // triangles. Use the area vector of the fan to guide ambiguous samples.
-    void vertex_normal(size_t v, double cell, double *normal) const {
-        std::copy_n(&vertex_normals_[3 * v], 3, normal);
-        for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i)
-            if (dot(normal, &tri_normals_[3 * size_t(corners_[i] / 3)]) >= kNormalAgreement) return;
-        double guide[3] = {};
-        for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i) {
-            double facet[3];
-            face_vector(surface_, corners_[i] / 3, facet);
-            for (int a = 0; a < 3; ++a) guide[a] += facet[a];
+        for (size_t v = 0; v < vertex_count_; ++v) {
+            double *n = &vertex_normals_[3 * v];
+            if (!is_zero(n)) continue;
+            for (uint32_t i = first_corner_[v]; i < first_corner_[v + 1]; ++i) {
+                double facet[3];
+                face_vector(surface_, corners_[i] / 3, facet);
+                for (int a = 0; a < 3; ++a) n[a] += facet[a];
+            }
+            normalize(n);
+            if (is_zero(n)) n[2] = 1;
         }
-        surface_normal(&surface_.positions[3 * v], guide, cell, normal);
-        if (is_zero(normal)) normal[2] = 1;
     }
 
     // Whether the edge two triangles share is a crease (step 9): both have
@@ -241,30 +154,27 @@ private:
         return !is_zero(a) && !is_zero(b) && dot(a, b) < cos_crease_;
     }
 
+    bool sharp(uint32_t v) const { return !surface_.marks.empty() && (surface_.marks[v] & kSharpVertex); }
+
     // Smoothing groups of the corners of vertex v: two corners share a group
-    // when their triangles share an edge at v that is not a crease, so the
-    // groups are the parts of the fan that crease edges separate. Writes each
+    // when their triangles share an edge at v that is neither a crease nor
+    // an edge between two vertices extraction placed on a sharp feature
+    // whose triangles turn by more than kShadingTurn, so the groups are the
+    // parts of the fan those edges separate (a crease shallower than the
+    // crease angle still shades with its faces' normals). Writes each
     // corner's group (numbered from 0 in corner order) to `groups`; returns
     // the group count.
     uint32_t group_corners(size_t v, std::vector<uint32_t> &groups, std::vector<uint32_t> &parent) const {
         const uint32_t begin = first_corner_[v], count = first_corner_[v + 1] - begin;
         groups.assign(count, 0);
-        if (v >= surface_.first_crease_vertex) {
-            const size_t start = begin - first_corner_[surface_.first_crease_vertex];
-            const uint8_t first_side = crease_sides_[start];
-            uint32_t last_group = 0;
-            for (uint32_t i = 1; i < count; ++i) {
-                groups[i] = crease_sides_[start + i] != first_side;
-                last_group |= groups[i];
-            }
-            return last_group + 1;
-        }
-        // Normals within half the crease angle of one of them pairwise differ
-        // by less than the crease angle: no crease edge, one group.
+        // Normals within half the threshold of one of them pairwise differ
+        // by less than the threshold: no separating edge, one group.
+        const bool on_feature = sharp(static_cast<uint32_t>(v));
         const double *first = count ? &tri_normals_[3 * size_t(corners_[begin] / 3)] : nullptr;
         bool smooth = true;
         for (uint32_t i = 1; i < count && smooth; ++i)
-            smooth = dot(first, &tri_normals_[3 * size_t(corners_[begin + i] / 3)]) >= cos_half_crease_;
+            smooth = dot(first, &tri_normals_[3 * size_t(corners_[begin + i] / 3)]) >=
+                     (on_feature ? kCosHalfShadingTurn : cos_half_crease_);
         if (smooth) return count ? 1 : 0;
         parent.resize(count);
         for (uint32_t i = 0; i < count; ++i) parent[i] = i;
@@ -284,8 +194,13 @@ private:
             for (uint32_t j = i + 1; j < count; ++j) {
                 uint32_t b[2];
                 ends(corners_[begin + j], b);
-                const bool adjacent = a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1];
-                if (!adjacent || crease_between(corners_[begin + i] / 3, corners_[begin + j] / 3)) continue;
+                // The vertex the two triangles share besides v, if any.
+                const uint32_t shared = a[0] == b[0] || a[0] == b[1] ? a[0] : a[1] == b[0] || a[1] == b[1] ? a[1] : UINT32_MAX;
+                if (shared == UINT32_MAX) continue;
+                const size_t ti = corners_[begin + i] / 3, tj = corners_[begin + j] / 3;
+                if (crease_between(ti, tj)) continue;
+                if (on_feature && sharp(shared) && dot(&tri_normals_[3 * ti], &tri_normals_[3 * tj]) < kCosShadingTurn)
+                    continue;
                 const uint32_t ri = root(i), rj = root(j);
                 if (ri != rj) parent[std::max(ri, rj)] = std::min(ri, rj);
             }
@@ -311,9 +226,11 @@ private:
     }
 
     // Splits vertices at creases so each side shades with its own normal. A
-    // vertex whose fan is one smoothing group uses its surface gradient.
-    // A crease vertex lies where faces meet and its gradient blends them,
-    // so each group takes the angle-weighted mean of its interior normals.
+    // vertex whose fan is one smoothing group keeps the SDF gradient at the
+    // vertex. A vertex on a crease, or one extraction placed on a sharp
+    // feature, is where the field's faces meet, so its gradient is an
+    // arbitrary blend of them; every group there takes the angle-weighted
+    // mean of its triangles' interior normals instead.
     void split_vertices(rsdf_mesh &mesh) {
         std::vector<uint32_t> extra(vertex_count_ + 1, 0);
         parallel_chunks(chunks_of(vertex_count_, kChunk), threads_, [&](size_t chunk) {
@@ -331,47 +248,59 @@ private:
         mesh.normals.resize(3 * total);
         mesh.triangles.resize(surface_.triangles.size());
         mesh.split_origin.resize(total - vertex_count_);
+        // A triangle whose facet turns from its interior normal by more than
+        // the crease angle lies across a crease (a sliver along a sharp edge
+        // whose centroid falls past the edge): its interior normal does not
+        // describe its corners, so it counts in a group's mean only when
+        // nothing else does.
+        std::vector<uint8_t> faithful(triangle_count_);
+        parallel_chunks(chunks_of(triangle_count_, kChunk), threads_, [&](size_t chunk) {
+            const size_t end = std::min(triangle_count_, (chunk + 1) * kChunk);
+            for (size_t t = chunk * kChunk; t < end; ++t) {
+                double facet[3];
+                face_vector(surface_, t, facet);
+                normalize(facet);
+                faithful[t] = dot(facet, &tri_normals_[3 * t]) >= cos_crease_;
+            }
+        });
         parallel_chunks(chunks_of(vertex_count_, kChunk), threads_, [&](size_t chunk) {
             std::vector<uint32_t> groups, parent;
-            std::vector<double> weighted, plain;
+            std::vector<double> sums;  // per group: weighted and plain sums of faithful, then of all interior normals
             const size_t end = std::min(vertex_count_, (chunk + 1) * kChunk);
             for (size_t v = chunk * kChunk; v < end; ++v) {
                 const uint32_t count = std::max(group_corners(v, groups, parent), 1u);
+                const bool on_feature = sharp(static_cast<uint32_t>(v));
                 // Output vertex of each group: the original index first, then new ones.
                 auto output = [&](uint32_t group) -> size_t {
                     return group == 0 ? v : vertex_count_ + extra[v] + group - 1;
                 };
-                weighted.assign(3 * count, 0.0);
-                plain.assign(3 * count, 0.0);
+                sums.assign(12 * count, 0.0);
                 const uint32_t begin = first_corner_[v];
                 for (size_t i = 0; i < groups.size(); ++i) {
                     const uint32_t corner = corners_[begin + i];
                     mesh.triangles[corner] = static_cast<uint32_t>(output(groups[i]));
-                    if (count == 1 || v >= surface_.first_crease_vertex) continue;
+                    if (count == 1 && !on_feature) continue;
                     const double *nt = &tri_normals_[3 * size_t(corner / 3)];
                     const double angle = corner_angle(corner);
-                    for (int a = 0; a < 3; ++a) {
-                        weighted[3 * groups[i] + a] += angle * nt[a];
-                        plain[3 * groups[i] + a] += nt[a];
-                    }
+                    double *sum = &sums[12 * groups[i]];
+                    for (int pass = faithful[corner / 3] ? 0 : 1; pass < 2; ++pass)
+                        for (int a = 0; a < 3; ++a) {
+                            sum[6 * pass + a] += angle * nt[a];
+                            sum[6 * pass + 3 + a] += nt[a];
+                        }
                 }
                 for (uint32_t group = 0; group < count; ++group) {
-                    double normal[3];
-                    if (v >= surface_.first_crease_vertex) {
-                        const size_t start = begin - first_corner_[surface_.first_crease_vertex];
-                        const auto &sides = surface_.crease_samples[v - surface_.first_crease_vertex].normals;
-                        const auto &side = sides[crease_sides_[start] ^ group];
-                        std::copy(side.begin(), side.end(), normal);
-                    } else if (count == 1) {
-                        vertex_normal(v, mesh.stats.cell_size, normal);
+                    double normal[3] = {0, 0, 0};
+                    const double *gradient = &vertex_normals_[3 * v];
+                    if (count == 1 && !on_feature) {
+                        std::copy(gradient, gradient + 3, normal);
                     } else {
-                        std::copy(&weighted[3 * group], &weighted[3 * group] + 3, normal);
-                        normalize(normal);
-                        if (is_zero(normal)) {  // only degenerate corners
-                            std::copy(&plain[3 * group], &plain[3 * group] + 3, normal);
+                        // Angle-weighted, then plain (only degenerate corners), faithful triangles first.
+                        for (int k = 0; k < 4 && is_zero(normal); ++k) {
+                            std::copy_n(&sums[12 * group + 3 * k], 3, normal);
                             normalize(normal);
                         }
-                        if (is_zero(normal)) vertex_normal(v, mesh.stats.cell_size, normal);
+                        if (is_zero(normal)) std::copy(gradient, gradient + 3, normal);
                     }
                     const size_t out = output(group);
                     if (out >= vertex_count_) mesh.split_origin[out - vertex_count_] = static_cast<uint32_t>(v);
@@ -706,8 +635,29 @@ private:
     const size_t vertex_count_, triangle_count_;
     std::vector<double> tri_normals_, vertex_normals_;
     std::vector<uint32_t> first_corner_, corners_;
-    std::vector<uint8_t> crease_sides_;
 };
+
+// The largest estimated deviation sampled on a surface's triangles
+// (measure_triangles); keeps their centroid normals for the finisher.
+double measure_surface(const MeshField &field, Surface &surface, double eps, int threads, bool spatial) {
+    const size_t triangles = surface.triangles.size() / 3;
+    const std::vector<double> values = field_values(field, threads, spatial, surface.positions);
+    std::vector<double> slopes;
+    surface.vertex_normals = gradients(field, surface.positions.size() / 3, eps, threads, spatial,
+                                       [&](size_t v, double *p) { std::copy_n(&surface.positions[3 * v], 3, p); }, &slopes);
+    std::vector<uint32_t> all(triangles);
+    std::iota(all.begin(), all.end(), 0u);
+    std::vector<TriangleResult> results(triangles);
+    measure_triangles(field, threads, spatial, eps, surface.positions.data(), surface.triangles.data(), values.data(),
+                      slopes.data(), all, results);
+    double largest = 0;
+    surface.interior_normals.resize(3 * triangles);
+    for (size_t t = 0; t < triangles; ++t) {
+        largest = std::fmax(largest, results[t].deviation);
+        std::copy_n(results[t].normal, 3, &surface.interior_normals[3 * t]);
+    }
+    return largest;
+}
 
 std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, const rsdf_mesh_options *options) {
     const auto start = std::chrono::steady_clock::now();
@@ -721,6 +671,9 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
     if (!(h > 0) || !std::isfinite(h)) throw Error("cell_size must be positive and finite");
     const double crease = std::isnan(options->crease_angle) || options->crease_angle <= 0 ? 35.0
                           : std::min(options->crease_angle, 180.0);
+    if (std::isnan(options->tolerance) || std::isinf(options->tolerance)) throw Error("tolerance must be finite");
+    const double tolerance = options->tolerance > 0 ? options->tolerance : kDefaultTolerance * h;
+    int depth = options->max_depth == 0 ? kDefaultDepth : std::clamp(options->max_depth, 0, kMaxDepth);
 
     MeshField field{&graph, node, {}, {}};
     const double *lo = options->bounds_valid ? options->bounds_lo : n.lo;
@@ -753,11 +706,14 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
             throw Error(format("single-precision vertex positions cannot resolve cell size %g mm at coordinates up to "
                                "%g mm; use a cell size of at least %g mm or model closer to the origin",
                                h, extent, extent * 0x1p-20));
+        // Refinement stops at the finest cells they resolve.
+        while (depth > 0 && extent * 0x1p-24 > std::ldexp(h, -depth) / 16) --depth;
     }
 
     auto mesh = std::make_unique<rsdf_mesh>();
     std::memset(&mesh->stats, 0, sizeof mesh->stats);
     mesh->stats.cell_size = h;
+    mesh->stats.tolerance = tolerance;
     mesh->graph = graph.identity;
     mesh->node = node;
     std::copy(field.lo, field.lo + 3, mesh->box_lo);
@@ -770,24 +726,23 @@ std::unique_ptr<rsdf_mesh> build_mesh(const rsdf_graph &graph, uint32_t node, co
         settings.cell_size = h;
         settings.lipschitz = std::max(n.step_lipschitz, 1.0);  // the box clip is 1-Lipschitz
         settings.gradient_step = 1e-4 * h;
+        settings.tolerance = tolerance;
+        settings.crease_angle = crease;
         settings.max_cells = options->max_cells ? options->max_cells : kDefaultMaxCells;
+        settings.max_triangles = options->max_triangles;
+        settings.max_depth = depth;
         settings.threads = evaluation_threads(n, options->threads);
         settings.refine_steps = options->refine_steps > 0 ? std::min(options->refine_steps, 64) : 6;
         settings.spatial_order = n.sorts_queries;
-        Surface surface = extract_surface(field, settings);
-        refine_surface(field, surface, settings);
-        std::vector<double> normals;
-        if (options->flags & RSDF_MESH_PREVIEW_CREASES) {
-            normals = gradients(field, surface.positions.size() / 3, settings.gradient_step, settings.threads,
-                                settings.spatial_order, [&](size_t v, double *p) {
-                                    std::copy_n(&surface.positions[3 * v], 3, p);
-                                });
-            if (n.has_mesh && (options->flags & RSDF_MESH_PREVIEW_FACETS))
-                refine_mesh_facets(field, surface, settings, normals);
-            align_surface_creases(field, surface, settings, normals);
-        }
-        Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order)
-            .run(*mesh, std::move(normals));
+        const Surface surface = extract_surface(field, settings);
+        Finisher(surface, field, settings.gradient_step, crease, settings.threads, settings.spatial_order).run(*mesh);
+        rsdf_mesh_stats &stats = mesh->stats;
+        stats.max_deviation = kDeviationMargin * surface.max_deviation;
+        stats.refined_cells = surface.refined_cells;
+        stats.balanced_cells = surface.balanced_cells;
+        stats.flagged_triangles = surface.flagged_triangles;
+        stats.max_level = surface.max_level;
+        stats.passes = surface.passes;
     }
     mesh->stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return mesh;
@@ -810,6 +765,7 @@ std::unique_ptr<rsdf_mesh> simplify_mesh(const rsdf_graph &graph, uint32_t node,
     auto mesh = std::make_unique<rsdf_mesh>();
     std::memset(&mesh->stats, 0, sizeof mesh->stats);
     mesh->stats.cell_size = source->stats.cell_size;
+    mesh->stats.tolerance = tolerance;
     mesh->graph = graph.identity;
     mesh->node = node;
     std::copy(source->box_lo, source->box_lo + 3, mesh->box_lo);
@@ -836,6 +792,8 @@ std::unique_ptr<rsdf_mesh> simplify_mesh(const rsdf_graph &graph, uint32_t node,
                                         source->spatial_order};
         Surface surface = simplify_surface(field, std::move(input), settings);
         surface.active_cells = source->stats.active_cells;
+        mesh->stats.max_deviation =
+            kDeviationMargin * measure_surface(field, surface, source->gradient_step, threads, source->spatial_order);
         Finisher(surface, field, source->gradient_step, source->crease_angle, threads, source->spatial_order)
             .run(*mesh);
     }

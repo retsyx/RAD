@@ -1,5 +1,5 @@
-// Moving points onto the surface and refining smooth features narrower than
-// a cell (SDF-DESIGN.md, "Meshing" steps 5 and 7).
+// Moving points onto the surface and measuring how far triangles stray from
+// it (SDF-DESIGN.md, "Meshing").
 #include "mesh.h"
 
 #include <algorithm>
@@ -8,46 +8,66 @@ namespace rsdf {
 namespace {
 
 constexpr size_t kChunk = 4096;
-constexpr int kRefineLevels = 2;           // each edge splits into at most four
-constexpr double kRefineTurn = 15;         // degrees the surface may turn along an edge
-constexpr double kShortestEdge = 1.0 / 8;  // cells; shorter edges never split
-constexpr double kSide = 0.05;             // cells either side of a point for side_cosines
-constexpr double kBulge = 0.01;            // cells the surface may bulge from a triangle's centroid
+constexpr double kMinimumSlope = 0.25;  // |grad f| floor when estimating distances from |f|
 static const double kTetra[4][3] = {{1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {1, 1, 1}};
 
 inline double dot3(const double *a, const double *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
 // The order to visit `count` points in: Morton order for costly fields.
 template <class PointAt>
-std::vector<uint32_t> visiting_order(size_t count, const MeshSettings &s, const PointAt &point) {
-    if (s.spatial_order) return morton_order(count, s.threads, point);
+std::vector<uint32_t> visiting_order(size_t count, int threads, bool spatial, const PointAt &point) {
+    if (spatial) return morton_order(count, threads, point);
     std::vector<uint32_t> order(count);
     for (size_t i = 0; i < count; ++i) order[i] = static_cast<uint32_t>(i);
     return order;
 }
 
-// Field values at points (3 per point).
-std::vector<double> values(const MeshField &field, const MeshSettings &s, const std::vector<double> &points) {
-    const size_t count = points.size() / 3;
-    std::vector<double> out(count);
-    const std::vector<uint32_t> order = visiting_order(count, s, [&](size_t i, double *xyz) {
-        std::copy(&points[3 * i], &points[3 * i] + 3, xyz);
-    });
-    parallel_chunks(chunks_of(count, kChunk), s.threads, [&](size_t chunk) {
-        double x[kBatch], y[kBatch], z[kBatch], f[kBatch];
-        const size_t end = std::min(count, (chunk + 1) * kChunk);
-        for (size_t first = chunk * kChunk; first < end; first += kBatch) {
-            const int n = static_cast<int>(std::min<size_t>(kBatch, end - first));
-            for (int i = 0; i < n; ++i) {
-                x[i] = points[3 * size_t(order[first + i])];
-                y[i] = points[3 * size_t(order[first + i]) + 1];
-                z[i] = points[3 * size_t(order[first + i]) + 2];
-            }
-            field.evaluate(n, x, y, z, f);
-            for (int i = 0; i < n; ++i) out[order[first + i]] = f[i];
+// The largest |f| on a triangle between its samples: the quadratic through
+// f at its corners (values[0..2] at corners a, b, c) and edge midpoints
+// (samples[0..2]: ab, bc, ca) peaks inside it or along an edge (a chord's
+// sagitta is quadratic), plus the most the quadratic misses f by at the
+// centroid and the three interior points (samples[3..6]), which bounds
+// what it cannot follow (a crease or blend inside the triangle). Writes the
+// weights of b and c where the quadratic peaks to peak_at.
+double interpolated_bound(const double corner[3], const double *samples, double *peak_at) {
+    // P(s, t) = A s^2 + B t^2 + C s t + D s + E t + F, with s, t the weights of b and c.
+    const double v0 = corner[0], v1 = corner[1], v2 = corner[2];
+    const double m01 = samples[0], m12 = samples[1], m20 = samples[2];
+    const double F = v0, A = 2 * v1 + 2 * v0 - 4 * m01, D = 4 * m01 - 3 * v0 - v1;
+    const double B = 2 * v2 + 2 * v0 - 4 * m20, E = 4 * m20 - 3 * v0 - v2;
+    const double C = 4 * (m12 - F - 0.5 * D - 0.5 * E) - A - B;
+    auto P = [&](double u, double w) { return A * u * u + B * w * w + C * u * w + D * u + E * w + F; };
+    double peak = -1;
+    auto consider = [&](double u, double w) {
+        const double value = std::fabs(P(u, w));
+        if (!(value > peak)) return;
+        peak = value;
+        peak_at[0] = u;
+        peak_at[1] = w;
+    };
+    consider(0, 0);
+    consider(1, 0);
+    consider(0, 1);
+    // Edges: P(start + x (end - start)) = a x^2 + b x + c on [0, 1].
+    const double ends[3][4] = {{0, 0, 1, 0}, {1, 0, 0, 1}, {0, 1, 0, 0}};
+    for (const auto &e : ends) {
+        const double c0 = P(e[0], e[1]), half = P(0.5 * (e[0] + e[2]), 0.5 * (e[1] + e[3])), c1 = P(e[2], e[3]);
+        const double a = 2 * c0 + 2 * c1 - 4 * half, b = 4 * half - 3 * c0 - c1;
+        if (a != 0) {
+            const double x = -b / (2 * a);
+            if (x > 0 && x < 1) consider(e[0] + x * (e[2] - e[0]), e[1] + x * (e[3] - e[1]));
         }
-    });
-    return out;
+    }
+    const double det = 4 * A * B - C * C;
+    if (det != 0) {
+        const double u = (C * E - 2 * B * D) / det, w = (C * D - 2 * A * E) / det;
+        if (u >= 0 && w >= 0 && u + w <= 1) consider(u, w);
+    }
+    static const double kInterior[4][2] = {{1 / 3.0, 1 / 3.0}, {1 / 6.0, 1 / 6.0}, {2 / 3.0, 1 / 6.0}, {1 / 6.0, 2 / 3.0}};
+    double miss = 0;
+    for (int k = 0; k < 4; ++k) miss = std::fmax(miss, std::fabs(samples[3 + k] - P(kInterior[k][0], kInterior[k][1])));
+    const double bound = peak + miss;
+    return std::isfinite(bound) ? bound : INFINITY;
 }
 
 }  // namespace
@@ -59,7 +79,7 @@ void project_points(const MeshField &field, const MeshSettings &s, double settle
     constexpr int kPoints = kBatch / 5;
     const size_t count = positions.size() / 3;
     const double eps = s.gradient_step;
-    const std::vector<uint32_t> order = visiting_order(count, s, [&](size_t i, double *xyz) {
+    const std::vector<uint32_t> order = visiting_order(count, s.threads, s.spatial_order, [&](size_t i, double *xyz) {
         std::copy(&positions[3 * i], &positions[3 * i] + 3, xyz);
     });
     parallel_chunks(chunks_of(count, kChunk), s.threads, [&](size_t chunk) {
@@ -124,11 +144,11 @@ void project_points(const MeshField &field, const MeshSettings &s, double settle
 }
 
 std::vector<double> side_cosines(const MeshField &field, const MeshSettings &s, const std::vector<double> &points,
-                                 const std::vector<double> &directions, double side) {
+                                 const std::vector<double> &directions, const std::vector<double> &sides) {
     constexpr int kPairs = kBatch / 8;  // two gradients of four samples each
     const size_t count = points.size() / 3;
     std::vector<double> cosines(count, 1.0);
-    const std::vector<uint32_t> order = visiting_order(count, s, [&](size_t i, double *xyz) {
+    const std::vector<uint32_t> order = visiting_order(count, s.threads, s.spatial_order, [&](size_t i, double *xyz) {
         std::copy(&points[3 * i], &points[3 * i] + 3, xyz);
     });
     const BatchField batch = field.batch();
@@ -144,7 +164,7 @@ std::vector<double> side_cosines(const MeshField &field, const MeshSettings &s, 
                 const double length = std::sqrt(dot3(d, d));
                 if (!(length > 0) || !std::isfinite(length)) continue;
                 for (int k = 0; k < 2; ++k) {
-                    const double offset = (k ? -side : side) / length;
+                    const double offset = (k ? -sides[p] : sides[p]) / length;
                     x[2 * m + k] = points[3 * p] + offset * d[0];
                     y[2 * m + k] = points[3 * p + 1] + offset * d[1];
                     z[2 * m + k] = points[3 * p + 2] + offset * d[2];
@@ -160,261 +180,127 @@ std::vector<double> side_cosines(const MeshField &field, const MeshSettings &s, 
     return cosines;
 }
 
-// Splits edges along which the surface turns by more than kRefineTurn: the
-// angle from one end's gradient to the gradient at the midpoint and on to
-// the other end's (the ends alone miss a bead whose flank tilts between
-// them). The first level tests the edges of triangles with a kSpreadVertex
-// or whose centroid lies more than kBulge cells off the surface; a blend can
-// pass through cells without crossing their grid edges, which then see only
-// the faces beside it, but the triangles between their vertices span it.
-// Later levels test the triangles with a vertex the previous level added.
-// Triangles with a kSharpVertex, edges shorter than kShortestEdge cells and
-// edges whose midpoint lies on a sharp edge (the gradients kSide cells either
-// side along the edge differ by more than kRefineTurn and half its turn)
-// stay. New vertices are the midpoints moved onto the surface. A triangle
-// with one, two or three split edges becomes two, three or four (two split
-// edges leave a quad, cut along its shorter diagonal), so the mesh stays
-// conforming and keeps its orientation. Deterministic for any thread count.
-void refine_surface(const MeshField &field, Surface &surface, const MeshSettings &s) {
-    if (surface.marks.size() != surface.positions.size() / 3) return;
-    const double h = s.cell_size, cos_turn = std::cos(kRefineTurn * M_PI / 180);
-    std::vector<double> centroids(surface.triangles.size());
-    for (size_t t = 0; t < surface.triangles.size() / 3; ++t)
-        for (int a = 0; a < 3; ++a) {
-            double sum = 0;
-            for (int k = 0; k < 3; ++k) sum += surface.positions[3 * size_t(surface.triangles[3 * t + k]) + a];
-            centroids[3 * t + a] = sum / 3;
+std::vector<double> field_values(const MeshField &field, int threads, bool spatial, const std::vector<double> &points) {
+    const size_t count = points.size() / 3;
+    std::vector<double> out(count);
+    const std::vector<uint32_t> order = visiting_order(count, threads, spatial, [&](size_t i, double *xyz) {
+        std::copy_n(&points[3 * i], 3, xyz);
+    });
+    parallel_chunks(chunks_of(count, kChunk), threads, [&](size_t chunk) {
+        double x[kBatch], y[kBatch], z[kBatch], f[kBatch];
+        const size_t end = std::min(count, (chunk + 1) * kChunk);
+        for (size_t first = chunk * kChunk; first < end; first += kBatch) {
+            const int n = static_cast<int>(std::min<size_t>(kBatch, end - first));
+            for (int i = 0; i < n; ++i) {
+                const size_t p = order[first + i];
+                x[i] = points[3 * p];
+                y[i] = points[3 * p + 1];
+                z[i] = points[3 * p + 2];
+            }
+            field.evaluate(n, x, y, z, f);
+            for (int i = 0; i < n; ++i) out[order[first + i]] = f[i];
         }
-    const std::vector<double> bulges = values(field, s, centroids);
-    size_t fresh = 0;  // the first vertex the last level added: later levels test only triangles with one
-    for (int level = 0; level < kRefineLevels; ++level) {
-        const size_t vertices = surface.positions.size() / 3, triangles = surface.triangles.size() / 3;
-        const uint32_t *tri = surface.triangles.data();
-        const double *pos = surface.positions.data();
-        std::vector<uint64_t> keys;
-        for (size_t t = 0; t < triangles; ++t) {
-            const uint32_t *v = &tri[3 * t];
-            const uint8_t marks = surface.marks[v[0]] | surface.marks[v[1]] | surface.marks[v[2]];
-            if (marks & kSharpVertex) continue;
-            if (level == 0 ? !(marks & kSpreadVertex) && !(std::fabs(bulges[t]) > kBulge * h)
-                           : std::max({v[0], v[1], v[2]}) < fresh)
-                continue;
-            for (int k = 0; k < 3; ++k) keys.push_back(surface_edge_key(v[k], v[(k + 1) % 3]));
-        }
-        std::sort(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        // Long enough edges, their ends and midpoints.
-        keys.erase(std::remove_if(keys.begin(), keys.end(), [&](uint64_t key) {
-                       const double *a = &pos[3 * size_t(key >> 32)], *b = &pos[3 * size_t(uint32_t(key))];
-                       const double d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-                       return !(dot3(d, d) > kShortestEdge * kShortestEdge * h * h);
-                   }),
-                   keys.end());
-        if (keys.empty()) break;
-        std::vector<uint32_t> ends;
-        ends.reserve(2 * keys.size());
-        for (uint64_t key : keys) ends.insert(ends.end(), {uint32_t(key >> 32), uint32_t(key)});
-        std::sort(ends.begin(), ends.end());
-        ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-        const std::vector<double> end_normals = gradients(field, ends.size(), s.gradient_step, s.threads,
-                                                          s.spatial_order, [&](size_t i, double *xyz) {
-                                                              std::copy(&pos[3 * size_t(ends[i])], &pos[3 * size_t(ends[i])] + 3, xyz);
-                                                          });
-        auto end_normal = [&](uint32_t v) {
-            return &end_normals[3 * size_t(std::lower_bound(ends.begin(), ends.end(), v) - ends.begin())];
-        };
-        std::vector<double> mids(3 * keys.size()), along(3 * keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const double *a = &pos[3 * size_t(keys[i] >> 32)], *b = &pos[3 * size_t(uint32_t(keys[i]))];
-            for (int c = 0; c < 3; ++c) {
-                mids[3 * i + c] = 0.5 * (a[c] + b[c]);
-                along[3 * i + c] = b[c] - a[c];
+    });
+    return out;
+}
+
+void measure_triangles(const MeshField &field, int threads, bool spatial, double eps, const double *positions,
+                       const uint32_t *triangles, const double *corner_values, const double *corner_slopes,
+                       const std::vector<uint32_t> &which, std::vector<TriangleResult> &results) {
+    // Samples per triangle: three edge midpoints, the centroid and three
+    // interior points, then the four points of the centroid's gradient
+    // stencil; then the point where the quadratic through the corner and
+    // midpoint values peaks, with its stencil.
+    constexpr int kSamples = 7, kStencil = 4, kPerTriangle = kSamples + kStencil;
+    constexpr int kTriangles = kBatch / kPerTriangle;
+    static const double kWeights[kSamples][3] = {{0.5, 0.5, 0}, {0, 0.5, 0.5}, {0.5, 0, 0.5}, {1 / 3.0, 1 / 3.0, 1 / 3.0},
+                                                {2 / 3.0, 1 / 6.0, 1 / 6.0}, {1 / 6.0, 2 / 3.0, 1 / 6.0},
+                                                {1 / 6.0, 1 / 6.0, 2 / 3.0}};
+    const size_t count = which.size();
+    auto corner = [&](uint32_t t, int k) { return &positions[3 * size_t(triangles[3 * size_t(t) + k])]; };
+    auto centroid = [&](size_t i, double *xyz) {
+        for (int a = 0; a < 3; ++a) xyz[a] = (corner(which[i], 0)[a] + corner(which[i], 1)[a] + corner(which[i], 2)[a]) / 3;
+    };
+    const std::vector<uint32_t> order = visiting_order(count, threads, spatial, centroid);
+    parallel_chunks(chunks_of(count, kChunk), threads, [&](size_t chunk) {
+        double x[kBatch], y[kBatch], z[kBatch], f[kBatch];
+        const size_t end = std::min(count, (chunk + 1) * kChunk);
+        for (size_t first = chunk * kChunk; first < end; first += kTriangles) {
+            const int n = static_cast<int>(std::min<size_t>(kTriangles, end - first));
+            for (int i = 0; i < n; ++i) {
+                const uint32_t t = which[order[first + i]];
+                const double *a = corner(t, 0), *b = corner(t, 1), *c = corner(t, 2);
+                double centre[3];
+                for (int k = 0; k < kSamples; ++k) {
+                    const double *w = kWeights[k];
+                    const int j = kPerTriangle * i + k;
+                    x[j] = w[0] * a[0] + w[1] * b[0] + w[2] * c[0];
+                    y[j] = w[0] * a[1] + w[1] * b[1] + w[2] * c[1];
+                    z[j] = w[0] * a[2] + w[1] * b[2] + w[2] * c[2];
+                }
+                for (int axis = 0; axis < 3; ++axis) centre[axis] = (a[axis] + b[axis] + c[axis]) / 3;
+                for (int k = 0; k < kStencil; ++k) {
+                    const int j = kPerTriangle * i + kSamples + k;
+                    x[j] = centre[0] + eps * kTetra[k][0];
+                    y[j] = centre[1] + eps * kTetra[k][1];
+                    z[j] = centre[2] + eps * kTetra[k][2];
+                }
+            }
+            field.evaluate(kPerTriangle * n, x, y, z, f);
+            double bound[kTriangles], peak[kTriangles][2], px[kBatch], py[kBatch], pz[kBatch], pf[kBatch];
+            for (int i = 0; i < n; ++i) {
+                const uint32_t t = which[order[first + i]];
+                const double corner_value[3] = {corner_values[triangles[3 * size_t(t)]],
+                                                corner_values[triangles[3 * size_t(t) + 1]],
+                                                corner_values[triangles[3 * size_t(t) + 2]]};
+                bound[i] = interpolated_bound(corner_value, &f[kPerTriangle * i], peak[i]);
+                const double *a = corner(t, 0), *b = corner(t, 1), *c = corner(t, 2);
+                const double wa = 1 - peak[i][0] - peak[i][1], wb = peak[i][0], wc = peak[i][1];
+                const double p[3] = {wa * a[0] + wb * b[0] + wc * c[0], wa * a[1] + wb * b[1] + wc * c[1],
+                                     wa * a[2] + wb * b[2] + wc * c[2]};
+                for (int k = 0; k <= kStencil; ++k) {
+                    const int j = (kStencil + 1) * i + k;
+                    const double step = k < kStencil ? eps : 0;
+                    px[j] = p[0] + step * kTetra[k % kStencil][0];
+                    py[j] = p[1] + step * kTetra[k % kStencil][1];
+                    pz[j] = p[2] + step * kTetra[k % kStencil][2];
+                }
+            }
+            field.evaluate((kStencil + 1) * n, px, py, pz, pf);
+            for (int i = 0; i < n; ++i) {
+                const uint32_t t = which[order[first + i]];
+                const double *values = &f[kPerTriangle * i];
+                double g[3] = {0, 0, 0}, h[3] = {0, 0, 0};
+                for (int k = 0; k < kStencil; ++k)
+                    for (int axis = 0; axis < 3; ++axis) {
+                        g[axis] += values[kSamples + k] * kTetra[k][axis];
+                        h[axis] += pf[(kStencil + 1) * i + k] * kTetra[k][axis];
+                    }
+                const double length = std::sqrt(dot3(g, g)), peak_length = std::sqrt(dot3(h, h));
+                // The smallest slope at the centroid, the corners and the peak.
+                double slope = std::isfinite(length) ? length / (4 * eps) : 0;
+                slope = std::fmin(slope, std::isfinite(peak_length) ? peak_length / (4 * eps) : 0);
+                for (int k = 0; k < 3; ++k) slope = std::fmin(slope, corner_slopes[triangles[3 * size_t(t) + k]]);
+                slope = std::fmax(slope, kMinimumSlope);
+                double deviation = std::fmax(bound[i], std::fabs(pf[(kStencil + 1) * i + kStencil]));
+                for (int k = 0; k < 3; ++k)
+                    deviation = std::fmax(deviation, std::fabs(corner_values[triangles[3 * size_t(t) + k]]));
+                for (int k = 0; k < kSamples; ++k) deviation = std::fmax(deviation, std::fabs(values[k]));
+                TriangleResult &r = results[t];
+                r.deviation = deviation / slope;
+                const double *a = corner(t, 0), *b = corner(t, 1), *c = corner(t, 2);
+                const double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const double facet[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+                const double area = std::sqrt(dot3(facet, facet));
+                if (length > 0 && std::isfinite(length)) {
+                    for (int axis = 0; axis < 3; ++axis) r.normal[axis] = g[axis] / length;
+                } else {
+                    r.normal[0] = r.normal[1] = r.normal[2] = 0;
+                }
+                r.cosine = area > 0 && length > 0 && std::isfinite(area * length) ? dot3(facet, r.normal) / area : 1;
             }
         }
-        const std::vector<double> mid_normals = gradients(field, keys.size(), s.gradient_step, s.threads,
-                                                          s.spatial_order, [&](size_t i, double *xyz) {
-                                                              std::copy(&mids[3 * i], &mids[3 * i] + 3, xyz);
-                                                          });
-        // Edges along which the surface turns: their turn's half-angle cosine.
-        std::vector<uint8_t> turning(keys.size(), 0);
-        std::vector<double> half(keys.size(), 1.0);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const double *na = end_normal(uint32_t(keys[i] >> 32)), *nb = end_normal(uint32_t(keys[i]));
-            const double *nm = &mid_normals[3 * i];
-            const double ca = dot3(na, nm), cb = dot3(nm, nb);
-            if (dot3(na, na) == 0 || dot3(nb, nb) == 0 || dot3(nm, nm) == 0) continue;
-            const double turn = std::acos(std::fmax(-1.0, std::fmin(1.0, ca))) + std::acos(std::fmax(-1.0, std::fmin(1.0, cb)));
-            if (!(std::cos(std::fmin(turn, M_PI)) < cos_turn)) continue;
-            turning[i] = 1;
-            half[i] = std::cos(0.5 * std::fmin(turn, M_PI));
-        }
-        std::vector<double> probe_points, probe_along;
-        std::vector<size_t> probed;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (!turning[i]) continue;
-            probed.push_back(i);
-            probe_points.insert(probe_points.end(), &mids[3 * i], &mids[3 * i] + 3);
-            probe_along.insert(probe_along.end(), &along[3 * i], &along[3 * i] + 3);
-        }
-        const std::vector<double> gaps = side_cosines(field, s, probe_points, probe_along, kSide * h);
-        std::vector<uint64_t> split;
-        std::vector<double> points, guides, boxes;
-        for (size_t j = 0; j < probed.size(); ++j) {
-            const size_t i = probed[j];
-            if (gaps[j] < std::fmin(half[i], cos_turn)) continue;  // a sharp edge between the samples
-            split.push_back(keys[i]);
-            const double *na = end_normal(uint32_t(keys[i] >> 32)), *nb = end_normal(uint32_t(keys[i]));
-            const double reach = 0.5 * std::sqrt(dot3(&along[3 * i], &along[3 * i]));
-            points.insert(points.end(), &mids[3 * i], &mids[3 * i] + 3);
-            guides.insert(guides.end(), {na[0] + nb[0], na[1] + nb[1], na[2] + nb[2]});
-            for (int side = 0; side < 2; ++side)
-                for (int c = 0; c < 3; ++c) boxes.push_back(mids[3 * i + c] + (side ? reach : -reach));
-        }
-        if (split.empty()) break;
-        fresh = vertices;
-        project_points(field, s, 1e-6 * h, points, guides, boxes, {});
-        if (vertices + split.size() >= UINT32_MAX) throw Error("the mesh has too many vertices");
-        surface.positions.insert(surface.positions.end(), points.begin(), points.end());
-        surface.marks.resize(vertices + split.size(), kSpreadVertex);
-
-        subdivide_surface(surface, split, static_cast<uint32_t>(vertices));
-    }
-}
-
-namespace {
-
-constexpr uint32_t kNoCut = UINT32_MAX;
-
-// Emits triangles in the original winding. With two cuts, either diagonal
-// connects the two split points and leaves the crease as a shared edge.
-template <class Emit>
-void divide_triangle(const uint32_t *v, const uint32_t *m, bool first_diagonal, const Emit &emit) {
-    const int count = (m[0] != kNoCut) + (m[1] != kNoCut) + (m[2] != kNoCut);
-    switch (count) {
-    case 0:
-        emit(v[0], v[1], v[2]);
-        break;
-    case 1: {
-        const int k = m[0] != kNoCut ? 0 : m[1] != kNoCut ? 1 : 2;
-        const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
-        emit(a, m[k], c);
-        emit(m[k], b, c);
-        break;
-    }
-    case 2: {
-        const int k = m[0] == kNoCut ? 0 : m[1] == kNoCut ? 1 : 2;
-        const uint32_t a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
-        const uint32_t p = m[(k + 1) % 3], q = m[(k + 2) % 3];
-        emit(p, c, q);
-        if (first_diagonal) {
-            emit(a, b, p);
-            emit(a, p, q);
-        } else {
-            emit(a, b, q);
-            emit(b, p, q);
-        }
-        break;
-    }
-    case 3:
-        emit(v[0], m[0], m[2]);
-        emit(m[0], v[1], m[1]);
-        emit(m[2], m[1], v[2]);
-        emit(m[0], m[1], m[2]);
-        break;
-    }
-}
-
-std::array<double, 3> area_vector(const double *a, const double *b, const double *c) {
-    const double u[] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-    const double v[] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-    return {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
-}
-
-// A projected cut can fold a child of a very thin triangle. Keep its chord
-// position anywhere a projection would make a child turn away from its
-// parent. Test each combination of chord and projected positions because
-// an adjacent triangle can also cause a shared cut to stay on the chord.
-bool safe_projection(const double *positions, const uint32_t *v, const uint32_t *m,
-                     uint32_t first, const std::vector<std::array<double, 3>> &chord_points) {
-    constexpr uint32_t v_local[3] = {0, 1, 2};
-    uint32_t m_local[3];
-    int bits = 0;
-    for (int k = 0; k < 3; ++k) {
-        m_local[k] = m[k] == kNoCut ? kNoCut : 3u + k;
-        if (m[k] != kNoCut) bits |= 1 << k;
-    }
-    if (bits == 0) return true;
-    const double *points[6] = {&positions[3 * size_t(v[0])], &positions[3 * size_t(v[1])],
-                               &positions[3 * size_t(v[2])], nullptr, nullptr, nullptr};
-    const auto parent = area_vector(points[0], points[1], points[2]);
-    const double parent_area = std::sqrt(dot3(parent.data(), parent.data()));
-    // A collapsed parent gives no reliable guide to shifting its children.
-    if (!(parent_area > 0)) return false;
-    for (int mask = bits; mask != 0; mask = (mask - 1) & bits) {
-        for (int k = 0; k < 3; ++k) {
-            if (m[k] == kNoCut) continue;
-            points[3 + k] = mask & (1 << k) ? &positions[3 * size_t(m[k])] : chord_points[m[k] - first].data();
-        }
-        bool safe = true;
-        auto check = [&](uint32_t a, uint32_t b, uint32_t c) {
-            const auto child = area_vector(points[a], points[b], points[c]);
-            const double child_area = std::sqrt(dot3(child.data(), child.data()));
-            safe &= dot3(parent.data(), child.data()) > 0.5 * parent_area * child_area;
-        };
-        divide_triangle(v_local, m_local, true, check);
-        if (bits == 3 || bits == 5 || bits == 6) divide_triangle(v_local, m_local, false, check);
-        if (!safe) return false;
-    }
-    return true;
-}
-
-}  // namespace
-
-void subdivide_surface(Surface &surface, const std::vector<uint64_t> &edges, uint32_t first_vertex,
-                       const std::vector<std::array<double, 3>> &chord_points) {
-    std::vector<uint8_t> touched(first_vertex, 0);
-    for (uint64_t key : edges) touched[key >> 32] = touched[uint32_t(key)] = 1;
-    auto middle = [&](uint32_t a, uint32_t b) -> uint32_t {
-        if (!touched[a] || !touched[b]) return kNoCut;
-        const uint64_t key = surface_edge_key(a, b);
-        const auto it = std::lower_bound(edges.begin(), edges.end(), key);
-        return it != edges.end() && *it == key ? first_vertex + static_cast<uint32_t>(it - edges.begin()) : kNoCut;
-    };
-    auto distance2 = [&](uint32_t a, uint32_t b) {
-        const double *p = &surface.positions[3 * size_t(a)], *q = &surface.positions[3 * size_t(b)];
-        const double d[3] = {q[0] - p[0], q[1] - p[1], q[2] - p[2]};
-        return dot3(d, d);
-    };
-    if (!chord_points.empty()) {
-        std::vector<uint8_t> keep_projection(edges.size(), 1);
-        for (size_t i = 0; i < surface.triangles.size(); i += 3) {
-            const uint32_t *v = &surface.triangles[i];
-            const uint32_t m[] = {middle(v[0], v[1]), middle(v[1], v[2]), middle(v[2], v[0])};
-            if (safe_projection(surface.positions.data(), v, m, first_vertex, chord_points)) continue;
-            for (uint32_t index : m)
-                if (index != kNoCut) keep_projection[index - first_vertex] = 0;
-        }
-        for (size_t i = 0; i < edges.size(); ++i)
-            if (!keep_projection[i])
-                std::copy(chord_points[i].begin(), chord_points[i].end(), &surface.positions[3 * (first_vertex + i)]);
-    }
-
-    std::vector<uint32_t> out;
-    out.reserve(surface.triangles.size() + 6 * edges.size());
-    for (size_t i = 0; i < surface.triangles.size(); i += 3) {
-        const uint32_t *v = &surface.triangles[i];
-        const uint32_t m[] = {middle(v[0], v[1]), middle(v[1], v[2]), middle(v[2], v[0])};
-        bool first_diagonal = true;
-        const int count = (m[0] != kNoCut) + (m[1] != kNoCut) + (m[2] != kNoCut);
-        if (count == 2) {
-            const int k = m[0] == kNoCut ? 0 : m[1] == kNoCut ? 1 : 2;
-            first_diagonal = distance2(v[k], m[(k + 1) % 3]) <= distance2(v[(k + 1) % 3], m[(k + 2) % 3]);
-        }
-        divide_triangle(v, m, first_diagonal, [&](uint32_t a, uint32_t b, uint32_t c) {
-            out.insert(out.end(), {a, b, c});
-        });
-    }
-    surface.triangles.swap(out);
+    });
 }
 
 }  // namespace rsdf

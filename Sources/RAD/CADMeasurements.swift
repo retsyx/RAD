@@ -33,9 +33,11 @@ struct CADPart: Codable, Sendable, Equatable {
     var components: Int
     /// Sealed internal voids (surfaces enclosing negative volume).
     var cavities: Int? = nil
+    /// Bound of the distance from the preview triangles to the exact surface, in millimeters.
+    var maxDeviation: Double? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case solidIndex = "solid", area, volume, bounds, centroid, triangles, components, cavities
+        case solidIndex = "solid", area, volume, bounds, centroid, triangles, components, cavities, maxDeviation
     }
 }
 

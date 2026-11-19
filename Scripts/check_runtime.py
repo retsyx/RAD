@@ -31,7 +31,7 @@ class MeshOptions(ctypes.Structure):
                 ("max_cells", ctypes.c_uint64), ("threads", ctypes.c_int32),
                 ("refine_steps", ctypes.c_int32), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("bounds_valid", ctypes.c_int32),
-                ("reserved", ctypes.c_int32)]
+                ("max_depth", ctypes.c_int32), ("tolerance", ctypes.c_double), ("max_triangles", ctypes.c_uint64)]
 
 
 class MeshStats(ctypes.Structure):
@@ -41,7 +41,9 @@ class MeshStats(ctypes.Structure):
                 ("components", ctypes.c_uint64), ("cavities", ctypes.c_uint64), ("volume", ctypes.c_double),
                 ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double), ("centroid", ctypes.c_double * 3), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
-                ("seconds", ctypes.c_double)]
+                ("seconds", ctypes.c_double), ("max_deviation", ctypes.c_double), ("tolerance", ctypes.c_double),
+                ("refined_cells", ctypes.c_uint64), ("balanced_cells", ctypes.c_uint64),
+                ("flagged_triangles", ctypes.c_uint64), ("max_level", ctypes.c_uint32), ("passes", ctypes.c_uint32)]
 
 
 def check_kernel(path):
@@ -60,7 +62,7 @@ def check_kernel(path):
             ("rsdf_mesh_free", None, [ctypes.c_void_p])]:
         function = getattr(kernel, name)
         function.restype, function.argtypes = restype, argtypes
-    assert kernel.rsdf_abi_version() == 2, kernel.rsdf_abi_version()
+    assert kernel.rsdf_abi_version() == 3, kernel.rsdf_abi_version()
     # RSDF version 1: one SPHERE node (opcode 1, no children, radius 5).
     graph_bytes = b"RSDF" + struct.pack("<III", 1, 1, 0) + struct.pack("<IIIId", 1, 0, 1, 0, 5.0)
     graph = kernel.rsdf_graph_create(graph_bytes, len(graph_bytes))
@@ -87,7 +89,7 @@ def check_kernel(path):
     finally:
         kernel.rsdf_graph_free(graph)
     version = (kernel.rsdf_kernel_version() or b"").decode("utf-8", "replace")
-    return f"SDF kernel {version or 'unknown version'} (ABI 2, evaluation, meshing)"
+    return f"SDF kernel {version or 'unknown version'} (ABI 3, evaluation, meshing)"
 
 
 library = os.environ.get("RAD_SDF_LIBRARY")

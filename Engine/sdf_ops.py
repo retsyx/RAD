@@ -29,8 +29,9 @@ import numpy as np
 
 import radsdf
 from assembly_motion import AssemblyMotionError, validate_pose_records
-from sdf_build import (MAX_GEOMETRY_BYTES, MAX_PARTS, PREVIEW_CELLS_ACROSS, PREVIEW_CREASE_ANGLE,
-                       PREVIEW_MINIMUM_CELL, HostError, ModelError, mesh_parts, mesh_pieces, unrefined_triangles)
+from sdf_build import (MAX_GEOMETRY_BYTES, MAX_PARTS, PREVIEW_CELLS_ACROSS, PREVIEW_CREASE_ANGLE, PREVIEW_DEPTH,
+                       PREVIEW_MINIMUM_CELL, PREVIEW_TOLERANCE_CELLS, HostError, ModelError, mesh_parts, mesh_pieces,
+                       part_budget, unrefined_triangles)
 
 SOURCE_NAME = "source.rsdf"
 SOURCE_FIELDS = frozenset({"operation", "artifact", "artifactIdentity", "partRoots"})
@@ -74,6 +75,12 @@ EXPORT_MAXIMUM_CELL = 0.5
 EXPORT_PROBE_FACTOR = 4
 EXPORT_MARGIN = 1.05
 MAX_EXPORT_REMESHES = 2
+# Export meshes refine (cells halving up to EXPORT_DEPTH times) until their
+# triangles lie within EXPORT_DEVIATION mm of the surface; the base cell
+# keeps its estimate within EXPORT_BASE_SHARE of the budget.
+EXPORT_DEVIATION = 0.02
+EXPORT_DEPTH = 3
+EXPORT_BASE_SHARE = 0.75
 # Export meshes are simplified within this tolerance (mm) or the request's
 # "tolerance" (0 disables), at most this fraction of the export cell: walls
 # that mesh (at least two cells thick) keep their two sides apart.
@@ -241,14 +248,17 @@ class Source:
     def lipschitz(self, solid):
         return max(1.0, float(self.graph.lipschitz(self.roots[solid])))
 
-    def mesh(self, solid, cell, threads):
-        return self.copied(solid, self.native_mesh(solid, cell, threads), cell)
+    def mesh(self, solid, cell, threads, **refinement):
+        return self.copied(solid, self.native_mesh(solid, cell, threads, **refinement), cell)
 
-    def native_mesh(self, solid, cell, threads):
-        """The part's mesh kept native (radsdf.NativeMesh), to count first."""
+    def native_mesh(self, solid, cell, threads, *, tolerance=None, max_depth=0, max_triangles=None):
+        """The part's mesh kept native (radsdf.NativeMesh), to count first:
+        uniform unless `max_depth` lets cells split to meet `tolerance` mm
+        within `max_triangles`."""
         try:
             return self.graph.native_mesh(self.roots[solid], cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE,
-                                          threads=threads)
+                                          threads=threads, tolerance=tolerance, max_depth=max_depth,
+                                          max_triangles=max_triangles)
         except radsdf.SDFError as error:
             raise self.meshing_error(solid, cell, error) from error
 
@@ -1192,23 +1202,29 @@ def default_cell(source):
 
 
 def budget_cell(source, solids, cell, budget, threads):
-    """`cell`, coarsened so a probe mesh at EXPORT_PROBE_FACTOR times it
-    predicts at most `budget` triangles for the solids (counted before
-    refinement, as in preview_cell_size)."""
+    """(cell, per-solid triangle estimates at it): `cell`, coarsened so a
+    uniform probe mesh at EXPORT_PROBE_FACTOR times it predicts at most
+    `budget` triangles for the solids (counted before refinement, as in
+    preview_cell_size)."""
     probe = cell * EXPORT_PROBE_FACTOR
-    triangles = 0.0
+    estimates = []
     for solid in solids:
         try:
             mesh = source.graph.mesh(source.roots[solid], cell_size=probe, crease_angle=PREVIEW_CREASE_ANGLE,
-                                     threads=threads)
-            triangles += unrefined_triangles(mesh) * EXPORT_PROBE_FACTOR ** 2
+                                     threads=threads, max_depth=0)
+            if not len(mesh.triangles):  # a part smaller than the probe's cells
+                raise radsdf.SDFError("no surface at the probe's cell size")
+            estimates.append(unrefined_triangles(mesh) * EXPORT_PROBE_FACTOR ** 2)
         except radsdf.SDFError:
             lo, hi = source.bounds(solid)
             a, b, c = (float(value) for value in hi - lo)
-            triangles += 4.0 * (a * b + b * c + c * a) / (cell * cell)
+            estimates.append(4.0 * (a * b + b * c + c * a) / (cell * cell))
+    triangles = sum(estimates)
     if triangles > budget:
-        cell *= math.sqrt(triangles / budget) * EXPORT_MARGIN
-    return cell
+        coarser = cell * math.sqrt(triangles / budget) * EXPORT_MARGIN
+        estimates = [estimate * (cell / coarser) ** 2 for estimate in estimates]
+        cell = coarser
+    return cell, estimates
 
 
 def export_tolerance(spec, cell):
@@ -1223,18 +1239,23 @@ def export_tolerance(spec, cell):
     return min(float(value), EXPORT_TOLERANCE_CELLS * cell)
 
 
-def closed_meshes(source, solids, cell, budget, threads, purpose, tolerance=None):
-    """Closed meshes of the solids at `cell` within `budget` triangles in
-    total, coarsening (at most MAX_EXPORT_REMESHES times) when a pass
-    exceeds it. Every part is meshed and counted (kept native) before any is
-    simplified within `tolerance(cell)` (0: none), so the budget bounds the
-    meshing work and a pass that exceeds it simplifies nothing. Returns
-    (meshes, cell)."""
+def closed_meshes(source, solids, cell, budget, threads, purpose, tolerance=None, refinement=None, estimates=None):
+    """Closed meshes of the solids at base cell `cell` within `budget`
+    triangles in total, coarsening (at most MAX_EXPORT_REMESHES times) when
+    a pass exceeds it. `refinement(cell)` gives the meshes' (deviation
+    tolerance mm, depth), whose refinement shares the budget in proportion
+    to `estimates` (base triangles per solid at `cell`). Every part is meshed
+    and counted (kept native) before any is simplified within
+    `tolerance(cell)` (0: none), so the budget bounds the meshing work and a
+    pass that exceeds it simplifies nothing. Returns (meshes, cell)."""
     for attempt in range(MAX_EXPORT_REMESHES + 1):
         natives, triangles = [], 0
+        deviation, depth = refinement(cell) if refinement else (None, 0)
         try:
-            for solid in solids:
-                natives.append(source.native_mesh(solid, cell, threads))
+            for index, solid in enumerate(solids):
+                room = part_budget(estimates, index, triangles, budget) if estimates else max(1, budget - triangles)
+                natives.append(source.native_mesh(solid, cell, threads, tolerance=deviation, max_depth=depth,
+                                                  max_triangles=room if depth else None))
                 stats = natives[-1].stats
                 if not stats["triangle_count"] or stats["boundary_edges"] or stats["nonmanifold_edges"]:
                     raise ModelError(f"{source.label(solid)} has no closed manifold surface at the {purpose} cell size of "
@@ -1251,7 +1272,10 @@ def closed_meshes(source, solids, cell, budget, threads, purpose, tolerance=None
                 native.close()
         if attempt == MAX_EXPORT_REMESHES:
             break
-        cell *= math.sqrt(triangles / budget) * EXPORT_MARGIN * (len(solids) / len(natives)) ** 0.5
+        coarser = cell * math.sqrt(triangles / budget) * EXPORT_MARGIN * (len(solids) / len(natives)) ** 0.5
+        if estimates:
+            estimates = [estimate * (cell / coarser) ** 2 for estimate in estimates]
+        cell = coarser
     raise ModelError(f"The {purpose} exceeds {budget:,} triangles even at a cell size of {cell:.4g} mm.")
 
 
@@ -1370,14 +1394,16 @@ def export(spec, source, output, threads):
     if cell is None:
         cell = min(max(default_cell(source) / 2, EXPORT_MINIMUM_CELL), EXPORT_MAXIMUM_CELL)
     export_tolerance(spec, 1.0)  # refuses a malformed tolerance before meshing
-    cell = budget_cell(source, indices, cell, EXPORT_TRIANGLE_BUDGET, threads)
+    cell, estimates = budget_cell(source, indices, cell, EXPORT_BASE_SHARE * EXPORT_TRIANGLE_BUDGET, threads)
     meshes, cell = closed_meshes(source, indices, cell, EXPORT_TRIANGLE_BUDGET, threads, "export",
-                                 tolerance=lambda size: export_tolerance(spec, size))
+                                 tolerance=lambda size: export_tolerance(spec, size),
+                                 refinement=lambda size: (EXPORT_DEVIATION, EXPORT_DEPTH), estimates=estimates)
     by_solid = dict(zip(indices, meshes))
     report = {"solids": len(indices), "triangles": sum(len(mesh.triangles) for mesh in meshes), "cellSize": cell,
               "tolerance": export_tolerance(spec, cell),
               "meshedTriangles": sum(int(mesh.stats.get("unsimplified_triangles", len(mesh.triangles)))
-                                     for mesh in meshes)}
+                                     for mesh in meshes),
+              "maxDeviation": max(float(mesh.stats["max_deviation"]) for mesh in meshes)}
     if parts is None:
         write_3mf(output / "model.3mf", meshes, indices, pose, attributes)
         return report
@@ -1421,9 +1447,12 @@ def validate(spec, source, output, threads):
                         f"within {VALIDATE_TRIANGLE_BUDGET:,} triangles.")
         cell = coarser
     parts, ok = [], True
+    shares, meshed = [len(preview.triangles) for preview in previews], 0
     for solid, preview in enumerate(previews):
         label = source.label(solid)
-        mesh = source.mesh(solid, cell, threads)
+        mesh = source.mesh(solid, cell, threads, tolerance=PREVIEW_TOLERANCE_CELLS * cell, max_depth=PREVIEW_DEPTH,
+                           max_triangles=part_budget(shares, solid, meshed, VALIDATE_TRIANGLE_BUDGET))
+        meshed += len(mesh.triangles)
         stats = mesh.stats
         triangles = len(mesh.triangles)
         boundary = int(stats.get("boundary_edges", 0))

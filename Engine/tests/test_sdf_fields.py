@@ -564,9 +564,9 @@ class ReviewRegressionTests(unittest.TestCase):
             np.testing.assert_allclose(snapped["normal"], np.array(snapped["point"]) / 10, atol=1e-4)
 
     def test_specks_below_a_cell_are_pieces_not_cavities(self):
-        # The mesher folds a speck far below the cell into a closed sliver of
-        # tiny negative volume: a separate piece, not a sealed void.
-        result, _ = build(self, "result = union(box(12), sphere(0.018, center=(12.964, -0.403, 1.910)))")
+        # A speck far below the cell (0.078 mm) around a lattice point at
+        # (phi + k) h meshes as a tiny closed piece, not a sealed void.
+        result, _ = build(self, "result = union(box((20, 12, 12)), sphere(0.018, center=(0.031, 6.515, 0.029)))")
         stats, = result["partStats"]
         self.assertEqual((stats["components"], stats["cavities"]), (2, 0))
         self.assertTrue([warning for warning in result["warnings"] if "2 disconnected pieces" in warning])

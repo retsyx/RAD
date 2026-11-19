@@ -846,7 +846,8 @@ class ImplicitShapeTests(FieldCase):
         handle = self.k.create(data)
         self.handles.append(handle)
         loaded = time.perf_counter()
-        mesh = self.k.mesh(handle, block, 0.25)
+        # The uniform grid: this times the field's evaluation, not refinement.
+        mesh = self.k.mesh(handle, block, 0.25, max_depth=-1)
         meshed = time.perf_counter()
         print(f"\n40 mm gyroid block: load {loaded - start:.3f} s, mesh at 0.25 mm {meshed - loaded:.3f} s, "
               f"{mesh.stats.triangle_count} triangles")

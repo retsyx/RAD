@@ -90,10 +90,12 @@ struct CADCustomField: Codable, Sendable, Equatable {
 struct PreviewMesh: Codable, Sendable {
     /// Mesher statistics of one build's preview resolution.
     struct MeshStatistics: Codable, Sendable, Equatable {
-        /// Edge length of the dual contouring grid, in millimeters.
+        /// Edge length of the dual contouring grid's base cells, in millimeters.
         var cellSize: Double
         var boundaryEdges: Int
         var nonmanifoldEdges: Int
+        /// The largest part's bound of the distance from its triangles to the exact surface, in millimeters.
+        var maxDeviation: Double? = nil
     }
 
     /// Vertex coordinates, xyz per vertex.

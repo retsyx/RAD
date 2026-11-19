@@ -328,8 +328,9 @@ final class EngineProtocolTests: XCTestCase {
                                    "meshBuffers"]
         XCTAssertEqual(keys(result), common.union(["assemblyMotion", "printVersion", "printDown"]))
         XCTAssertEqual(keys(first(result["partStats"])),
-                       ["solid", "volume", "area", "bounds", "centroid", "triangles", "components", "cavities"])
-        XCTAssertEqual(keys(result["mesh"]), ["cellSize", "boundaryEdges", "nonmanifoldEdges"])
+                       ["solid", "volume", "area", "bounds", "centroid", "triangles", "components", "cavities",
+                        "maxDeviation"])
+        XCTAssertEqual(keys(result["mesh"]), ["cellSize", "boundaryEdges", "nonmanifoldEdges", "maxDeviation"])
         XCTAssertEqual(keys(result["runtime"]), ["python", "numpy", "kernel"])
         XCTAssertEqual(keys(first(result["printDown"])), ["solid", "direction"])
         XCTAssertEqual(keys(result["assemblyMotion"]), ["grounded", "connectors", "joints", "couplings"])
@@ -389,9 +390,10 @@ final class EngineProtocolTests: XCTestCase {
         XCTAssertEqual(keys(orientations), ["orientations"])
         XCTAssertEqual(keys(first(orientations["orientations"])), ["solid", "matrix", "bounds"])
         XCTAssertEqual(keys(try native(.export(source, .init(solidIndices: [2])))),
-                       ["solids", "triangles", "cellSize", "tolerance", "meshedTriangles"])
+                       ["solids", "triangles", "cellSize", "tolerance", "meshedTriangles", "maxDeviation"])
         let files = try native(.export(source, .init(solidIndices: nil, individualParts: [[0], [1, 2]])))
-        XCTAssertEqual(keys(files), ["solids", "triangles", "cellSize", "tolerance", "meshedTriangles", "partFiles"])
+        XCTAssertEqual(keys(files), ["solids", "triangles", "cellSize", "tolerance", "meshedTriangles", "maxDeviation",
+                                     "partFiles"])
         XCTAssertEqual(keys(first(files["partFiles"])), ["path", "solidIndices"])
         let validation = try native(.validate(source, cellSize: nil))
         XCTAssertEqual(keys(validation), ["ok", "cellSize", "parts", "warnings"])

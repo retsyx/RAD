@@ -44,6 +44,13 @@ PREVIEW_MINIMUM_CELL = 1e-4
 MAX_PREVIEW_REMESHES = 2
 PREVIEW_MARGIN = 1.05
 PREVIEW_PROBE_FACTOR = 4
+# Adaptive meshing: cells halve up to PREVIEW_DEPTH times where triangles
+# stray from the surface by more than PREVIEW_TOLERANCE_CELLS of the cell
+# (or turn from its normal). The base cell keeps its estimate within
+# PREVIEW_BASE_SHARE of the triangle budget, leaving the rest to refinement.
+PREVIEW_DEPTH = 3
+PREVIEW_TOLERANCE_CELLS = 0.05
+PREVIEW_BASE_SHARE = 0.75
 
 ROOT_KEYS = {"title", "summary", "units", "script"}
 FIELD_TO_SOLID = ("a field becomes a solid only through implicit(field, bounds), for example "
@@ -128,7 +135,8 @@ def validation_rules(kernel):
             f"cells={PREVIEW_CELLS_ACROSS};triangles={PREVIEW_TRIANGLE_BUDGET};vertices={MAX_VERTICES};"
             f"segments={MAX_EDGE_SEGMENTS};crease={PREVIEW_CREASE_ANGLE:g};refine={radsdf._REFINE_STEPS};"
             f"minimum={PREVIEW_MINIMUM_CELL:g};remeshes={MAX_PREVIEW_REMESHES};margin={PREVIEW_MARGIN:g};"
-            f"probe={PREVIEW_PROBE_FACTOR}")
+            f"probe={PREVIEW_PROBE_FACTOR};depth={PREVIEW_DEPTH};tolerance={PREVIEW_TOLERANCE_CELLS:g};"
+            f"base={PREVIEW_BASE_SHARE:g}")
 
 
 def validation_hash(spec, directory, runtime=None):
@@ -575,21 +583,23 @@ def _triangle_estimate(box, cell):
 
 
 def unrefined_triangles(mesh):
-    """A mesh's triangles before the mesher refined features narrower than a
-    cell: two per active cell of the extracted surface."""
+    """A mesh's triangles at its base cell: two per active cell of a uniform
+    (unrefined) extraction."""
     return 2.0 * mesh.stats.get("active_cells", len(mesh.triangles) / 2)
 
 
 def preview_cell_size(graph, boxes, threads):
-    """(cell size, default cell size). The default is the design's largest
-    extent over PREVIEW_CELLS_ACROSS. A probe mesh of every part at
-    PREVIEW_PROBE_FACTOR times that size estimates the preview's triangles,
-    vertices (both scale with 1/cell^2) and crease segments (1/cell); the
-    cell size grows until the estimate fits the preview limits. A part the
-    probe cannot mesh counts with its bounding-box estimate. The mesher's
-    refinement of features narrower than a cell does not scale that way (at
-    the probe's coarse cells more features are that narrow), so the probe
-    counts the extracted surface: two triangles per active cell
+    """(cell size, default cell size, per-part triangle estimates at the
+    returned size). The default is the design's largest extent over
+    PREVIEW_CELLS_ACROSS. A uniform probe mesh of every part at
+    PREVIEW_PROBE_FACTOR times that size estimates the preview's base
+    triangles, vertices (both scale with 1/cell^2) and crease segments
+    (1/cell); the cell size grows until the estimate fits PREVIEW_BASE_SHARE
+    of the preview limits, which leaves the rest of the budget to adaptive
+    refinement. A part the probe cannot mesh counts with its bounding-box
+    estimate, as does a part smaller than the probe's cells. Refinement of
+    features narrower than a cell does not scale that way, so the probe
+    counts its extracted surface: two triangles per active cell
     (unrefined_triangles), and its vertices in proportion."""
     import numpy as np
     import radsdf
@@ -599,33 +609,49 @@ def preview_cell_size(graph, boxes, threads):
     probe = default * PREVIEW_PROBE_FACTOR
     area_factor = PREVIEW_PROBE_FACTOR ** 2
     triangles = vertices = segments = 0.0
+    estimates = []
     for node, box in zip(graph.roots, boxes):
         try:
-            mesh = graph.mesh(node, cell_size=probe, crease_angle=PREVIEW_CREASE_ANGLE, threads=threads)
+            mesh = graph.mesh(node, cell_size=probe, crease_angle=PREVIEW_CREASE_ANGLE, threads=threads, max_depth=0)
         except radsdf.SDFError:
-            triangles += _triangle_estimate(box, default)
-            vertices += _triangle_estimate(box, default) / 2
+            estimates.append(_triangle_estimate(box, default))
+            triangles += estimates[-1]
+            vertices += estimates[-1] / 2
             continue
         unrefined = unrefined_triangles(mesh)
-        triangles += unrefined * area_factor
+        if not unrefined:  # a part smaller than the probe's cells
+            estimates.append(_triangle_estimate(box, default))
+            triangles += estimates[-1]
+            vertices += estimates[-1] / 2
+            continue
+        estimates.append(unrefined * area_factor)
+        triangles += estimates[-1]
         vertices += len(mesh.positions) * (unrefined / len(mesh.triangles) if len(mesh.triangles) else 1) * area_factor
         segments += len(mesh.creases) * PREVIEW_PROBE_FACTOR
-    scale = max(math.sqrt(triangles / MAX_TRIANGLES), math.sqrt(vertices / MAX_VERTICES),
-                segments / MAX_EDGE_SEGMENTS)
-    return (default * scale * PREVIEW_MARGIN if scale > 1 else default), default
+    scale = max(math.sqrt(triangles / (PREVIEW_BASE_SHARE * MAX_TRIANGLES)),
+                math.sqrt(vertices / (PREVIEW_BASE_SHARE * MAX_VERTICES)),
+                segments / (PREVIEW_BASE_SHARE * MAX_EDGE_SEGMENTS))
+    cell = default * scale * PREVIEW_MARGIN if scale > 1 else default
+    return cell, default, [estimate * (default / cell) ** 2 for estimate in estimates]
 
 
-def _mesh_part(graph, node, label, cell, threads, *, facets=False):
+def part_budget(estimates, index, used, limit):
+    """The triangle budget of part `index` for adaptive refinement: the
+    room `limit` leaves after the `used` triangles of the parts before it,
+    shared with the parts after it in proportion to the parts' base
+    estimates, so room earlier parts leave goes to later ones."""
+    remaining = sum(estimates[index:])
+    room = max(0.0, limit - used)
+    return max(1, int(room * estimates[index] / remaining)) if remaining > 0 else max(1, int(room))
+
+
+def _mesh_part(graph, node, label, cell, threads, budget=None):
     import radsdf
     diagnostic = {"stage": "preview_meshing", "cellSize": cell}
-    def make_mesh(facet_detail):
-        return graph.native_mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE,
-                                 threads=threads, _preview=True, _facet_detail=facet_detail).mesh()
-
     try:
-        mesh = make_mesh(facets)
-        if facets and (mesh.stats["boundary_edges"] or mesh.stats["nonmanifold_edges"]):
-            mesh = make_mesh(False)
+        mesh = graph.native_mesh(node, cell_size=cell, crease_angle=PREVIEW_CREASE_ANGLE, threads=threads,
+                                 tolerance=PREVIEW_TOLERANCE_CELLS * cell, max_depth=PREVIEW_DEPTH,
+                                 max_triangles=budget).mesh()
     except radsdf.SDFError as error:
         raise ModelError(f"{label} could not be meshed at the preview cell size of {cell:.4g} mm: {error}",
                          diagnostic=diagnostic) from error
@@ -641,22 +667,24 @@ def _mesh_part(graph, node, label, cell, threads, *, facets=False):
     return mesh
 
 
-def mesh_parts(graph, normalized, boxes, threads, *, facets=False):
-    """Mesh every part at one preview cell size within the preview limits.
+def mesh_parts(graph, normalized, boxes, threads):
+    """Mesh every part at one preview base cell size within the preview limits.
 
-    The first pass uses preview_cell_size; a pass that exceeds the limits
-    stops early and is redone at a coarser cell size predicted from the
-    triangles so far plus the remaining parts' estimates, at most
-    MAX_PREVIEW_REMESHES times. Drop optional facet detail before coarsening.
+    The first pass uses preview_cell_size, with refinement budgets shared by
+    the parts' estimates; a pass that exceeds the limits stops early and is
+    redone, first with less room for refinement when refinement alone pushed
+    the triangles over (at most MAX_PREVIEW_REMESHES times), then at a
+    coarser cell size predicted from the triangles so far plus the remaining
+    parts' estimates, at most MAX_PREVIEW_REMESHES times.
     Returns (meshes, cell size, default cell size).
     """
-    cell, default = preview_cell_size(graph, boxes, threads)
-    remeshes = MAX_PREVIEW_REMESHES + int(facets)
-    for attempt in range(remeshes + 1):
+    cell, default, estimates = preview_cell_size(graph, boxes, threads)
+    room, attempt, recounts = 1.0, 0, 0
+    while True:
         meshes, triangles, vertices, segments, remaining = [], 0, 0, 0, None
         for index, (node, label) in enumerate(zip(graph.roots, normalized.labels)):
-            mesh = (_mesh_part(graph, node, label, cell, threads, facets=True) if facets else
-                    _mesh_part(graph, node, label, cell, threads))
+            mesh = _mesh_part(graph, node, label, cell, threads,
+                              part_budget(estimates, index, triangles, MAX_TRIANGLES * room))
             meshes.append(mesh)
             triangles += len(mesh.triangles)
             vertices += len(mesh.positions)
@@ -666,15 +694,21 @@ def mesh_parts(graph, normalized, boxes, threads, *, facets=False):
                 break
         if remaining is None:
             return meshes, cell, default
-        if facets:
-            facets = False
+        # Refinement that overshot the triangles alone gets less room first.
+        if (recounts < MAX_PREVIEW_REMESHES and vertices <= MAX_VERTICES and segments <= MAX_EDGE_SEGMENTS
+                and any(mesh.stats.get("refined_cells", 0) for mesh in meshes)):
+            recounts += 1
+            room *= 0.9 * MAX_TRIANGLES / (triangles + remaining)
             continue
-        if attempt == remeshes:
+        if attempt == MAX_PREVIEW_REMESHES:
             break
+        attempt += 1
         growth = (triangles + remaining) / triangles
         scale = max(math.sqrt(triangles * growth / MAX_TRIANGLES), math.sqrt(vertices * growth / MAX_VERTICES),
                     segments * growth / MAX_EDGE_SEGMENTS)
-        cell *= max(scale, 1.0) * PREVIEW_MARGIN
+        coarser = cell * max(scale, 1.0) * PREVIEW_MARGIN
+        estimates = [estimate * (cell / coarser) ** 2 for estimate in estimates]
+        cell = coarser
     raise ModelError(f"The design is too detailed to preview within {MAX_TRIANGLES:,} triangles, even at a "
                      f"cell size of {cell:.4g} mm. Simplify fine repeated detail (threads, knurling, "
                      "lattices) or make the design smaller.", diagnostic={"stage": "preview_meshing",
@@ -759,7 +793,8 @@ def assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerp
                       "bounds": [*lo.tolist(), *hi.tolist()],
                       "centroid": [float(value) for value in mesh.stats["centroid"]],
                       "triangles": len(part_triangles), "components": mesh_pieces(mesh.stats),
-                      "cavities": int(mesh.stats.get("cavities", 0))})
+                      "cavities": int(mesh.stats.get("cavities", 0)),
+                      "maxDeviation": float(mesh.stats["max_deviation"])})
     lo = np.min([item["bounds"][:3] for item in stats], axis=0)
     hi = np.max([item["bounds"][3:] for item in stats], axis=0)
     if np.any(np.abs(lo) > COORDINATE_LIMIT) or np.any(np.abs(hi) > COORDINATE_LIMIT):
@@ -777,7 +812,8 @@ def assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerp
         "partStats": stats,
         "mesh": {"cellSize": cell,
                  "boundaryEdges": sum(int(mesh.stats.get("boundary_edges", 0)) for mesh in meshes),
-                 "nonmanifoldEdges": sum(int(mesh.stats.get("nonmanifold_edges", 0)) for mesh in meshes)},
+                 "nonmanifoldEdges": sum(int(mesh.stats.get("nonmanifold_edges", 0)) for mesh in meshes),
+                 "maxDeviation": max(item["maxDeviation"] for item in stats)},
     }
     if normalized.motion is not None:
         preview["assemblyMotion"] = normalized.motion
@@ -1045,8 +1081,7 @@ def build(spec, directory, output, threads, started=None):
         raise ModelError(f"The kernel rejected the design's shape graph: {message}") from error
     with graph:
         boxes = part_bounds(graph, normalized)
-        facets = any(node.opcode == radsdf.Opcode.MESH for node in order)
-        meshes, cell, default = mesh_parts(graph, normalized, boxes, threads, facets=facets)
+        meshes, cell, default = mesh_parts(graph, normalized, boxes, threads)
         fields, field_warnings = custom_fields(graph, order, normalized)
     artifact = (output / "model.rsdf").resolve()
     preview = assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerprint,

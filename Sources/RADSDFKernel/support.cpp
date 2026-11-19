@@ -173,7 +173,7 @@ extern "C" {
 
 uint32_t rsdf_abi_version(void) { return RSDF_ABI_VERSION; }
 
-const char *rsdf_kernel_version(void) { return "1.2.3"; }
+const char *rsdf_kernel_version(void) { return "1.3.0"; }
 
 const char *rsdf_last_error(void) { return rsdf::last_error.c_str(); }
 

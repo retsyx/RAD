@@ -639,12 +639,15 @@ class SDF3(_Shape):
         return _graph_for(self).raycast(self, origins, directions, max_distance, tolerance, max_steps,
                                         threads=threads)
 
-    def mesh(self, cell_size=None, crease_angle=35.0, max_cells=None, threads=0, bounds=None, simplify=None):
-        """A closed triangle mesh of the surface (sharp-feature dual contouring).
+    def mesh(self, cell_size=None, crease_angle=35.0, max_cells=None, threads=0, bounds=None, simplify=None,
+             tolerance=None, max_depth=3, max_triangles=None):
+        """A closed triangle mesh of the surface (adaptive sharp-feature dual
+        contouring: cells split where the mesh strays from the surface).
 
-        cell_size: grid spacing in mm (default: auto_cell_size of the region).
+        cell_size: base grid spacing in mm (default: auto_cell_size of the region).
         crease_angle: degrees between adjacent faces that keep a sharp edge.
-        max_cells: fail beyond this many narrow-band cells (default: kernel limit).
+        max_cells: fail beyond this many narrow-band cells and stop refining
+            beyond this many octree cells (default: kernel limit).
         threads: worker threads (0 = all cores).
         bounds: the region to mesh, a Bounds or (lo, hi); needed for unbounded shapes.
         simplify: a tolerance in mm: merge triangles (keeping sharp edges and
@@ -653,8 +656,16 @@ class SDF3(_Shape):
             full mesh already deviates more, and for fields that are not exact
             distances, the surface can lie somewhat further away. None or 0
             keeps the full mesh.
+        tolerance: the estimated distance (mm) from the surface that cells
+            split to meet at samples of every triangle (default: cell_size / 20).
+        max_depth: how many times a cell may halve (0: a uniform grid).
+        max_triangles: refinement stops before its estimate exceeds this many
+            triangles (default: no limit).
+        The mesh's stats report max_deviation, the largest estimated distance
+        sampled on its triangles.
         """
-        return _graph_for(self).mesh(self, cell_size, crease_angle, max_cells, threads, bounds, simplify)
+        return _graph_for(self).mesh(self, cell_size, crease_angle, max_cells, threads, bounds, simplify,
+                                     tolerance=tolerance, max_depth=max_depth, max_triangles=max_triangles)
 
 
 class SDF2(_Shape):
@@ -1726,13 +1737,12 @@ def serialize(roots):
 
 _LIBRARY_NAME = "libRADSDF.dylib"
 _LIBRARY_VARIABLE = "RAD_SDF_LIBRARY"
-_ABI_VERSION = 2
+_ABI_VERSION = 3
 _REFINE_STEPS = 6  # the kernel's documented default crossing refinement
 _MIN_CREASE_ANGLE = 1e-9  # degrees; a crease angle of 0 creases every edge
 
 
-_MESH_PREVIEW_CREASES = 1  # RSDF_MESH_PREVIEW_CREASES
-_MESH_PREVIEW_FACETS = 2   # RSDF_MESH_PREVIEW_FACETS
+_MAX_DEPTH = 6  # the kernel's deepest octree refinement
 
 
 class _MeshOptions(ctypes.Structure):
@@ -1740,7 +1750,8 @@ class _MeshOptions(ctypes.Structure):
                 ("max_cells", ctypes.c_uint64), ("threads", ctypes.c_int32),
                 ("refine_steps", ctypes.c_int32), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("bounds_valid", ctypes.c_int32),
-                ("flags", ctypes.c_uint32)]
+                ("max_depth", ctypes.c_int32), ("tolerance", ctypes.c_double),
+                ("max_triangles", ctypes.c_uint64)]
 
 
 class _MeshStats(ctypes.Structure):
@@ -1751,7 +1762,10 @@ class _MeshStats(ctypes.Structure):
                 ("area", ctypes.c_double), ("cavity_volume", ctypes.c_double),
                 ("centroid", ctypes.c_double * 3), ("bounds_lo", ctypes.c_double * 3),
                 ("bounds_hi", ctypes.c_double * 3), ("cell_size", ctypes.c_double),
-                ("seconds", ctypes.c_double)]
+                ("seconds", ctypes.c_double), ("max_deviation", ctypes.c_double), ("tolerance", ctypes.c_double),
+                ("refined_cells", ctypes.c_uint64), ("balanced_cells", ctypes.c_uint64),
+                ("flagged_triangles", ctypes.c_uint64), ("max_level", ctypes.c_uint32),
+                ("passes", ctypes.c_uint32)]
 
 
 class _SimplifyOptions(ctypes.Structure):
@@ -2138,14 +2152,15 @@ class Graph:
         return hits.reshape(leading), distances.reshape(leading)
 
     def mesh(self, target, cell_size=None, crease_angle=35.0, max_cells=None, threads=0, bounds=None,
-             simplify=None):
+             simplify=None, *, tolerance=None, max_depth=3, max_triangles=None):
         """A closed triangle mesh of a solid; see SDF3.mesh. A simplified
         mesh's stats add `unsimplified_triangles` and `simplify_tolerance`."""
-        tolerance = None if simplify is None else _nonnegative(simplify, "simplify")
-        return self.native_mesh(target, cell_size, crease_angle, max_cells, threads, bounds).mesh(tolerance)
+        simplify = None if simplify is None else _nonnegative(simplify, "simplify")
+        return self.native_mesh(target, cell_size, crease_angle, max_cells, threads, bounds, tolerance=tolerance,
+                                max_depth=max_depth, max_triangles=max_triangles).mesh(simplify)
 
     def native_mesh(self, target, cell_size=None, crease_angle=35.0, max_cells=None, threads=0, bounds=None,
-                    *, _preview=False, _facet_detail=False):
+                    *, tolerance=None, max_depth=3, max_triangles=None):
         """The kernel's mesh of a solid (options as in SDF3.mesh), kept native
         as a NativeMesh: its stats are known before NativeMesh.mesh()
         simplifies and copies it, so callers can check sizes first."""
@@ -2169,7 +2184,10 @@ class Graph:
             crease_angle=max(crease_angle, _MIN_CREASE_ANGLE),
             max_cells=0 if max_cells is None else _whole(max_cells, "max_cells", 1, 2**63),
             threads=_threads(threads), refine_steps=_REFINE_STEPS,
-            flags=((_MESH_PREVIEW_CREASES | (_MESH_PREVIEW_FACETS if _facet_detail else 0)) if _preview else 0))
+            # The kernel reads 0 as its default depth (3) and a negative depth as none.
+            max_depth=_whole(max_depth, "max_depth", 0, _MAX_DEPTH) or -1,
+            tolerance=0.0 if tolerance is None else _positive(tolerance, "tolerance"),
+            max_triangles=0 if max_triangles is None else _whole(max_triangles, "max_triangles", 1, 2**63))
         if region is not None:
             options.bounds_lo[:] = region.lo.tolist()
             options.bounds_hi[:] = region.hi.tolist()

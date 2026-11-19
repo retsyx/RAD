@@ -92,7 +92,6 @@ struct Node {
     // costs enough (64 node visits per point, or a large polygon) that compact
     // batches, which culling and polygon pruning need, repay the sort.
     bool sorts_queries = false;
-    bool has_mesh = false;
     uint32_t depth = 0;           // nesting levels below the node
     uint32_t live_buffers = 0;    // point buffers held alive along its deepest path (see graph.cpp)
 };
@@ -306,21 +305,21 @@ void parallel_chunks(size_t chunks, int threads, const std::function<void(size_t
 // Evaluates `node` at n <= kBatch points given as structure-of-arrays
 // coordinates. z is ignored (and may be null) for 2D nodes.
 void eval_batch(const rsdf_graph &graph, uint32_t node, int n, const double *x, const double *y,
-                const double *z, double *out, double *facet_sizes = nullptr, double facet_radius = 0);
+                const double *z, double *out);
 
 // Distances to a polygon (signed, negative inside) for one batch.
 void eval_polygon(const Polygon &polygon, int n, const double *x, const double *y, double *out);
 
 // Signed distances to a triangle mesh for one batch.
 void eval_triangle_mesh(const TriangleMesh &mesh, int n, const double *x, const double *y, const double *z,
-                        double *out, double *facet_sizes = nullptr, double facet_radius = 0, double scale = 1);
+                        double *out);
 
 // Tetrahedral finite-difference gradients of a 3D field at n <= kBatch / 4
 // points, normalised; a vanishing gradient yields (0, 0, 0). `field` evaluates
-// one batch of at most kBatch points.
+// one batch of at most kBatch points. `magnitude`, when given, receives |grad f|.
 using BatchField = std::function<void(int n, const double *x, const double *y, const double *z, double *out)>;
 void batch_gradients(const BatchField &field, int n, const double *x, const double *y, const double *z,
-                     double eps, double *nx, double *ny, double *nz);
+                     double eps, double *nx, double *ny, double *nz, double *magnitude = nullptr);
 
 // ---------------------------------------------------------------- spatial order
 
