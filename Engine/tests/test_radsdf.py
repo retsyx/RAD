@@ -826,6 +826,20 @@ class NativeKernelTests(unittest.TestCase):
         self.assertField(radsdf.half_space((0, 0, 1), (0, 0, 2)), lambda p: p[:, 2] - 2)
         self.assertAlmostEqual(radsdf.sphere(1)(p[0]), np.linalg.norm(p[0]) - 1, places=12)
 
+    def test_polygons_that_meet_themselves_fail_at_construction(self):
+        crossing = ("polygon is not simple (its outline must not cross, touch or overlap itself): the edge from "
+                    "point 2 (2, 0) to point 3 (0, 1) crosses the edge from point 4 (2, 1) to point 0 (0, 0) at "
+                    "(1, 0.5). Check the order of the points (numbered from 0 as given).")
+        # Point 1 repeats point 2; the message numbers the points as given.
+        # The bow-tie's lobes cancel its area: the crossing is reported.
+        with self.assertRaises(SDFError) as caught:
+            radsdf.polygon([(0, 0), (2, 0), (2, 0), (0, 1), (2, 1)])
+        self.assertEqual(str(caught.exception), crossing)
+        with self.assertRaisesRegex(SDFError, r"point 3 \(2, 0\) lies on the edge from point 0 \(0, 0\) to point 1"):
+            radsdf.polygon([(0, 0), (4, 0), (4, 4), (2, 0), (0, 4)])
+        self.assertEqual(radsdf.polygon([(0, 0), (4, 0), (4, 4), (2, 1e-12), (0, 4)]).opcode, radsdf.Opcode.POLYGON)
+        self.assertEqual(radsdf.involute_gear(40, 1).opcode, radsdf.Opcode.POLYGON)
+
     def test_booleans_and_modifiers(self):
         a, b = radsdf.sphere(2), radsdf.box(3, center=(1, 0, 0))
 

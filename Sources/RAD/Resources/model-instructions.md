@@ -104,7 +104,7 @@ Conventions
 2D profiles (XY plane)
 - circle(radius, center=(0, 0))
 - rect(size, center=(0, 0), radius=0): side lengths; radius rounds the corners.
-- polygon(points): a simple polygon through [(x, y), ...], closed automatically, either orientation; at least three distinct points, no self-intersections.
+- polygon(points): a simple polygon through [(x, y), ...], closed automatically, either orientation; at least three distinct points. The outline must not cross, touch or overlap itself (no repeated corner, no point on another edge): list the points in order along it, reversing pieces such as arcs that run the other way. Otherwise polygon() fails at its line, naming the points.
 - regular_polygon(sides, radius, center=(0, 0), angle=0): corners on a circle of radius, the first at angle degrees.
 - slot(a, b, radius): a stadium around the segment from a to b.
 - ellipse(radii, center=(0, 0))

@@ -175,6 +175,26 @@ class ValidationTests(unittest.TestCase):
             report = json.loads((Path(directory) / "error.json").read_text())
             self.assertEqual(report["failureKind"], "design")
 
+    def test_self_intersecting_polygons_fail_at_their_program_line(self):
+        script = ("def blade(points):\n"
+                  "    return polygon(points).extrude(2)\n"
+                  "\n"
+                  "result = blade([(0, 0), (4, 0), (0, 3), (4, 3)])\n")
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / "request.json"
+            request.write_text(json.dumps(script_spec(script)))
+            command = [sys.executable, str(ROOT / "Engine" / "worker.py"), "--request", str(request), "--output",
+                       directory]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 1)
+            report = json.loads((Path(directory) / "error.json").read_text())
+            self.assertEqual(report, {
+                "formatVersion": 1, "stage": "worker", "failureKind": "design",
+                "message": "Python design at line 2: SDFError: polygon is not simple (its outline must not cross, "
+                           "touch or overlap itself): the edge from point 1 (4, 0) to point 2 (0, 3) crosses the "
+                           "edge from point 3 (4, 3) to point 0 (0, 0) at (2, 1.5). Check the order of the points "
+                           "(numbered from 0 as given)."})
+
 
 class ErrorReportTests(unittest.TestCase):
     def test_error_report_bounds_multibyte_messages_after_json_encoding(self):

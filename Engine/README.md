@@ -186,6 +186,10 @@ result.add(sphere(3, center=(30, 0, 9)), id="knob", name="Knob")
   attach to physical parts only. `at` is a rigid placement (a 4×4 matrix or
   `Placement(translate=…, rotate=(angle, axis))`) composed from the root down.
 
+- `polygon(points)` checks its outline in the kernel when it is called: one
+  that crosses, touches or overlaps itself raises `SDFError` at that line,
+  naming the points (numbered from 0 as given), and the build fails as a
+  design error.
 - Custom fields: `x`, `y`, `z` are symbolic coordinates; arithmetic, `sin`,
   `cos`, `exp`, `log`, `sqrt`, `atan2`, `minimum`, `maximum` (with
   `smooth=k`, the blends of the booleans), `clamp`, `length`, `triwave`,

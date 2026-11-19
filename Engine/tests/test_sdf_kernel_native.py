@@ -654,6 +654,105 @@ class EvaluationTests(KernelCase):
         np.testing.assert_array_equal(hi, [2, 1])
 
 
+class PolygonSimplicityTests(KernelCase):
+    """POLYGON decoding requires a simple outline once repeated points and
+    spike tips are dropped, decided with exact orientation signs."""
+    PREFIX = "node 0 (POLYGON): polygon is not simple (its outline must not cross, touch or overlap itself): "
+
+    def polygon_bytes(self, points):
+        g = Graph()
+        g.add(POLYGON, [], np.ravel(points))
+        return g.to_bytes()
+
+    def rejection(self, points):
+        with self.assertRaises(KernelError) as caught:
+            self.handles.append(self.k.create(self.polygon_bytes(points)))
+        return str(caught.exception)
+
+    def accept(self, points):
+        handle = self.k.create(self.polygon_bytes(points))
+        self.handles.append(handle)
+        return handle
+
+    def test_outlines_that_meet_themselves_are_rejected(self):
+        cases = {
+            "crossing": ([(0, 0), (2, 0), (0, 1), (2, 1)],
+                         "the edge from point 1 (2, 0) to point 2 (0, 1) crosses the edge from point 3 (2, 1) to "
+                         "point 0 (0, 0) at (1, 0.5)"),
+            "touching at a vertex": ([(0, 0), (2, 0), (1, 1), (2, 2), (0, 2), (1, 1)],
+                                     "point 2 and point 5 are both at (1, 1)"),
+            "T-junction": ([(0, 0), (4, 0), (4, 4), (2, 0), (0, 4)],
+                           "point 3 (2, 0) lies on the edge from point 0 (0, 0) to point 1 (4, 0)"),
+            "collinear overlap": ([(0, 0), (4, 0), (4, 2), (5, 2), (5, -1), (4, -1), (4, 1), (3, 1), (3, 3), (0, 3)],
+                                  "point 1 (4, 0) lies on the edge from point 5 (4, -1) to point 6 (4, 1)"),
+            # Running back along an earlier, non-adjacent edge is no spike:
+            # normalisation keeps it.
+            "fold-back": ([(0, 0), (4, 0), (4, 1), (3, 1), (3, 0), (1, 0), (1, -1), (0, -1)],
+                          "point 5 (1, 0) lies on the edge from point 0 (0, 0) to point 1 (4, 0)"),
+            # Dropping the spike tip (2, 5) leaves an edge ending on another.
+            "fold-back after normalization": ([(0, 0), (4, 0), (4, 3), (2, 3), (2, 5), (2, 0), (0, 3)],
+                                              "point 5 (2, 0) lies on the edge from point 0 (0, 0) to point 1 (4, 0)"),
+            # One ulp below the edge crosses it; on it touches it.
+            "vertex past an edge": ([(0, 0), (10, 1), (10, 10), (5, np.nextafter(0.5, 0)), (0, 10)],
+                                    "the edge from point 0 (0, 0) to point 1 (10, 1) crosses the edge from point 3 "
+                                    "(5, 0.5) to point 4 (0, 10) at (5, 0.5)"),
+            "vertex on an edge": ([(0, 0), (10, 1), (10, 10), (5, 0.5), (0, 10)],
+                                  "point 3 (5, 0.5) lies on the edge from point 0 (0, 0) to point 1 (10, 1)"),
+        }
+        for name, (points, detail) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.rejection(points), self.PREFIX + detail)
+                # Either orientation and a closing point give the same verdict.
+                self.assertIn("not simple", self.rejection([*points, points[0]]))
+                self.assertIn("not simple", self.rejection(points[::-1]))
+
+    def test_messages_are_deterministic(self):
+        gear = gear_points(teeth=5000)
+        gear[[1001, 1002]] = gear[[1002, 1001]]  # a tooth's two tip corners swapped: its flanks cross
+        messages = {self.rejection(gear) for _ in range(3)}
+        self.assertEqual(len(messages), 1)
+        message, = messages
+        self.assertTrue(message.startswith(self.PREFIX + "the edge from point 1000 ("), message)
+        self.assertIn(") crosses the edge from point 1002 (", message)
+
+    def test_thin_valid_outlines_are_accepted(self):
+        x = np.nextafter(50.0, 100.0)  # a slot one ulp wide
+        self.accept([(0, 0), (100, 0), (100, 10), (x, 10), (x, 1), (50, 1), (50, 10), (0, 10)])
+        self.accept([(0, 0), (10, 1), (10, 10), (5, np.nextafter(0.5, 1)), (0, 10)])  # one ulp above an edge
+        handle = self.accept([(0, 0), (10, 0), (10, 10), (5, 5e-324), (0, 10)])  # the smallest double above it
+        np.testing.assert_array_equal(np.sign(self.k.evaluate(handle, 0, [[5, -1e-3], [4, 1e-3], [5, 1]])),
+                                      [1, -1, 1])
+
+    def test_spike_tips_are_dropped_exactly(self):
+        # Exactly collinear on y = 3x, though the rounded cross product of
+        # the edge vectors is -2097152: the tip far out must still be dropped.
+        a, tip, b = (0.001151127740740776, 0.003453383222222328), (67276767232.0, 201830301696.0), \
+            (0.007459700107574463, 0.02237910032272339)
+        handle = self.accept([(0, 0), (1, 0), (1, 1), b, tip, a])
+        lo, hi, _ = self.k.bounds(handle, 0)
+        np.testing.assert_array_equal(lo, [0, 0])
+        np.testing.assert_array_equal(hi, [1, 1])
+        # A spike whose removal exposes another is dropped as a whole.
+        handle = self.accept([(0, 0), (4, 0), (4, 3), (2, 3), (2, 5), (2, 4), (2, 6), (2, 2), (0, 4)])
+        np.testing.assert_allclose(self.k.evaluate(handle, 0, [[2, 5], [2, 2.5]]), [2, 0], atol=1e-12)
+
+    def test_large_simple_polygons_are_accepted(self):
+        angles = np.linspace(0, 40 * np.pi, 50_000)
+        spiral = np.vstack([np.column_stack([(1 + angles) * np.cos(angles), (1 + angles) * np.sin(angles)]),
+                            np.column_stack([(0.5 + angles) * np.cos(angles), (0.5 + angles) * np.sin(angles)])[::-1]])
+        rng = np.random.default_rng(3)
+        angles = np.sort(rng.uniform(0, 2 * np.pi, 100_000))
+        star = np.column_stack([np.cos(angles), np.sin(angles)]) * rng.uniform(5, 20, (100_000, 1))
+        for name, points in (("gear", gear_points(teeth=25_000)), ("spiral", spiral), ("star", star)):
+            with self.subTest(name):
+                start = time.perf_counter()
+                handle = self.accept(points)
+                seconds = time.perf_counter() - start
+                self.assertLess(seconds, 2.0)
+                q = points[::997] * 0.999
+                np.testing.assert_allclose(self.k.evaluate(handle, 0, q), polygon_ref(q, points), rtol=0, atol=1e-9)
+
+
 class BoundsAndQueryTests(KernelCase):
     def assertBounds(self, graph, node, lo, hi, lipschitz=1.0):
         actual_lo, actual_hi, actual_lipschitz = self.k.bounds(self.build(graph), node)
@@ -899,6 +998,7 @@ def malformed_cases():
         (header(2) + record(HALFSPACE, [], [0, 0, 1, 0]) + record(TWIST, [0], [0.1]), "bounded"),
         (header() + record(POLYGON, [], [0, 0, 1, 1, 2, 2]), "zero area"),
         (header() + record(POLYGON, [], [0, 0, 0, 0, 1, 1, 0, 0]), "three distinct"),
+        (header() + record(POLYGON, [], [0, 0, 2, 0, 0, 1, 2, 1]), "not simple"),
         (header() + record(CONE, [], [0, 0, 1]), "cone radius"),
     ]
 

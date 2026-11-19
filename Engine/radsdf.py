@@ -849,9 +849,35 @@ def rect(size, center=(0.0, 0.0), radius=0.0):
     return _transformed(node, np.eye(2), _vector(center, 2, "center"))
 
 
+_POLYGON_PREFIX = re.compile(r"^.*?node \d+ \(POLYGON\): ")
+_POINT_REFERENCE = re.compile(r"\bpoint (\d+)\b")
+
+
+def _polygon_failure(node, kept):
+    """The kernel's objection to a POLYGON node, naming the caller's points
+    (`kept` maps the node's points to them), or None. Without the kernel,
+    shapes still build and decoding checks the outline later."""
+    try:
+        _native()
+    except SDFError:
+        return None
+    try:
+        Graph(node).close()
+    except SDFError as error:
+        message = str(error)
+        if not _POLYGON_PREFIX.match(message):
+            raise
+        detail = _POINT_REFERENCE.sub(lambda match: f"point {kept[int(match.group(1))]}",
+                                      _POLYGON_PREFIX.sub("", message, count=1))
+        if "not simple" in detail:
+            detail += ". Check the order of the points (numbered from 0 as given)"
+        return detail + "."
+    return None
+
+
 def polygon(points):
     """A simple polygon through `points` [(x, y), ...] (closed automatically,
-    either orientation)."""
+    either orientation). Its outline must not cross, touch or overlap itself."""
     try:
         array = np.asarray(points, dtype=float)
     except (TypeError, ValueError):
@@ -861,15 +887,23 @@ def polygon(points):
         raise SDFError("polygon needs at least three finite (x, y) points.")
     # Repeated consecutive points, including a closing copy of the first
     # point, would form zero-length edges, which have no inside side.
-    array = array[np.linalg.norm(array - np.roll(array, -1, axis=0), axis=1) > 1e-9]
+    kept = np.flatnonzero(np.linalg.norm(array - np.roll(array, -1, axis=0), axis=1) > 1e-9)
+    array = array[kept]
     if len(array) < 3:
         raise SDFError("polygon needs at least three distinct points.")
     if len(array) > _MAX_PARAMS // 2:
         raise SDFError(f"polygon supports at most {_MAX_PARAMS // 2} points.")
+    node = SDF2(Opcode.POLYGON, array.ravel().tolist())
+    # A crossing outline is reported first: its lobes can cancel its area.
+    failure = _polygon_failure(node, kept)
+    if failure is not None and "not simple" in failure:
+        raise SDFError(failure)
     area = 0.5 * np.sum(array[:, 0] * np.roll(array[:, 1], -1) - np.roll(array[:, 0], -1) * array[:, 1])
     if abs(area) < 1e-12:
         raise SDFError("polygon has no area.")
-    return SDF2(Opcode.POLYGON, array.ravel().tolist())
+    if failure is not None:
+        raise SDFError(failure)
+    return node
 
 
 def regular_polygon(sides, radius, center=(0.0, 0.0), angle=0.0):
