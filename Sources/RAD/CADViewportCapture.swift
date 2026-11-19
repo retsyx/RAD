@@ -17,6 +17,7 @@ final class CADViewportCapture: @unchecked Sendable {
             throw RADError.message("The design camera is unavailable for capture.")
         }
         source = try Self.isolatedCopy(of: view.scene, camera: camera)
+        source.synchronizeCameras()
         frame = view.makeFrame(width: width, height: height)
     }
 

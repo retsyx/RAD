@@ -8,7 +8,8 @@ import Foundation
 enum PreviewMeshBuffers {
     static let fileName = "mesh.bin"
     static let maximumBytes = 256_000_000
-    static let sectionNames: Set<String> = ["positions", "normals", "triangles", "edges", "triangleSolids", "edgeSolids"]
+    static let sectionNames: Set<String> = ["positions", "normals", "triangles", "edges", "triangleSolids", "edgeSolids",
+                                            "proxyPositions", "proxyTriangles", "proxySolids"]
 
     struct Section: Decodable {
         let offset: Int
@@ -65,5 +66,8 @@ enum PreviewMeshBuffers {
         mesh.edgePoints = try section("edges", as: Float.self) ?? []
         mesh.triangleSolids = try owners("triangleSolids")
         mesh.edgeSolids = try owners("edgeSolids")
+        mesh.proxyPositions = try section("proxyPositions", as: Float.self)
+        mesh.proxyTriangleIndices = try section("proxyTriangles", as: UInt32.self)
+        mesh.proxySolids = try owners("proxySolids")
     }
 }

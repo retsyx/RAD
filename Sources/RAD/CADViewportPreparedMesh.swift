@@ -13,11 +13,14 @@ struct CADViewportPreparedMesh: Sendable {
     let solidBounds: [Int: [Double]]
     let edges: [Int: CADStrokeGeometry.Prepared]
     let hasOwnedEdges: Bool
+    /// Exact faces of the parts with a field program and proxy.
+    let field: CADFieldGeometry?
 
     static func requiresBackgroundPreparation(_ mesh: PreviewMesh) -> Bool {
         // Bound every collection traversed, including the part statistics.
         var remaining = 2_048
-        for count in [mesh.vertexCount, mesh.triangleCount, mesh.edgeSegmentCount, mesh.partStats?.count ?? 0] {
+        for count in [mesh.vertexCount, mesh.triangleCount, mesh.edgeSegmentCount, mesh.partStats?.count ?? 0,
+                      mesh.proxySolids?.count ?? 0] {
             guard count <= remaining else { return true }
             remaining -= count
         }
@@ -91,9 +94,10 @@ struct CADViewportPreparedMesh: Sendable {
         for (solid, segments) in edgeGroups {
             edges[solid] = try CADStrokeGeometry.prepare(points: mesh.edgePoints, segments: segments, surfaces: surfaces)
         }
+        let field = try CADFieldGeometry.prepare(mesh, solidBounds: solidBounds)
         try Task.checkCancellation()
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
-                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: owners != nil)
+                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: owners != nil, field: field)
     }
 
     private static func validBounds(_ bounds: [Double]) -> Bool {
@@ -106,7 +110,7 @@ struct CADViewportPreparedMesh: Sendable {
     fileprivate func presenting(_ mesh: PreviewMesh) -> Self? {
         guard Self.validBounds(mesh.bounds) else { return nil }
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
-                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: hasOwnedEdges)
+                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: hasOwnedEdges, field: field)
     }
 
     /// Buffers another view or capture already prepared for this preview.
@@ -182,7 +186,8 @@ extension CADViewportPreparedMesh {
                 }
                 arrays = [storage(mesh.positions), storage(mesh.triangleIndices), storage(mesh.edgePoints),
                           storage(mesh.vertexNormals), storage(mesh.triangleSolids), storage(mesh.edgeSolids),
-                          storage(mesh.partStats)]
+                          storage(mesh.partStats), storage(mesh.proxyPositions), storage(mesh.proxyTriangleIndices),
+                          storage(mesh.proxySolids), storage(mesh.fieldProgram?.words), storage(mesh.proxy?.parts)]
                 solids = mesh.solids
             }
         }

@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 import platform
 import re
+import struct
 import time
 import uuid
 
@@ -51,6 +52,32 @@ PREVIEW_PROBE_FACTOR = 4
 PREVIEW_DEPTH = 3
 PREVIEW_TOLERANCE_CELLS = 0.05
 PREVIEW_BASE_SHARE = 0.75
+# Exact-face proxies: every part with a GPU field program also gets a closed,
+# outward mesh of its offset surface {f = delta}, delta = PROXY_OFFSET_CELLS
+# preview cells, meshed at PROXY_CELL_FACTOR preview cells (PROXY_DEPTH
+# levels of refinement) within PROXY_TOLERANCE_FRACTION of delta, simplified
+# within PROXY_SIMPLIFY_FRACTION of delta (large triangles are cheaper to
+# shade), its folds repaired. A proxy is published only if f >
+# PROXY_MINIMUM_FRACTION * delta (and PROXY_FLOAT_ULPS float32 rounding steps
+# of its coordinates) at every triangle sample (PROXY_SAMPLE_SPACING apart on
+# large triangles) and no triangle is flipped; its shell is
+# PROXY_SHELL_FACTOR times the larger of delta and the largest sampled f,
+# plus that float32 margin. All parts' proxies share PROXY_TRIANGLE_BUDGET
+# triangles.
+PROXY_CELL_FACTOR = 2.0
+PROXY_OFFSET_CELLS = 0.5
+PROXY_TOLERANCE_FRACTION = 1 / 3
+PROXY_MINIMUM_FRACTION = 0.1
+PROXY_SHELL_FACTOR = 1.1
+PROXY_FLOAT_ULPS = 16
+PROXY_TRIANGLE_BUDGET = 1_000_000
+PROXY_DEPTH = PREVIEW_DEPTH
+PROXY_SIMPLIFY_FRACTION = 0.6
+PROXY_SAMPLE_SPACING = 0.5  # of delta: the largest spacing of field samples on a proxy triangle
+PROXY_MAX_SUBDIVISIONS = 24
+PROXY_DEGENERATE = 1e-6  # twice the area over the longest edge squared below which a triangle has no normal
+PROXY_REPAIR_ROUNDS = 8
+PROXY_RIDGE_FRACTION = 0.5  # of delta: the step across a triangle that tells a fold from a ridge
 
 ROOT_KEYS = {"title", "summary", "units", "script"}
 FIELD_TO_SOLID = ("a field becomes a solid only through implicit(field, bounds), for example "
@@ -838,7 +865,8 @@ def assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerp
 PREVIEW_SECTIONS = (
     ("vertices", "positions", "<f4", 3), ("normals", "normals", "<f4", 3), ("triangles", "triangles", "<u4", 3),
     ("edges", "edges", "<f4", 6), ("triangleSolids", "triangleSolids", "<i4", 1),
-    ("edgeSolids", "edgeSolids", "<i4", 1),
+    ("edgeSolids", "edgeSolids", "<i4", 1), ("proxyVertices", "proxyPositions", "<f4", 3),
+    ("proxyTriangles", "proxyTriangles", "<u4", 3), ("proxyTriangleSolids", "proxySolids", "<i4", 1),
 )
 
 
@@ -1002,6 +1030,425 @@ def custom_fields(graph, order, normalized):
     return records, warnings
 
 
+# ------------------------------------------------------------------ proxies
+
+def offset_graph_bytes(data, roots, distance):
+    """`data` (RSDF bytes) with one OFFSET node, growing `roots[i]` by
+    `distance`, appended per root; returns (bytes, the new nodes' indices)."""
+    import radsdf
+    magic, version, count, reserved = struct.unpack_from("<4sIII", data)
+    records = [struct.pack("<4IId", radsdf.Opcode.OFFSET, 1, 1, 0, root, distance) for root in roots]
+    header = struct.pack("<4sIII", magic, version, count + len(roots), reserved)
+    return b"".join([header, data[16:], *records]), list(range(count, count + len(roots)))
+
+
+# Triangle samples beyond the corners (barycentric weights): the edge
+# midpoints, the centroid (index 3, where the gradient is taken) and three
+# interior points halfway between the centroid and the corners.
+_PROXY_WEIGHTS = ((0.5, 0.5, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (1 / 3, 1 / 3, 1 / 3),
+                  (2 / 3, 1 / 6, 1 / 6), (1 / 6, 2 / 3, 1 / 6), (1 / 6, 1 / 6, 2 / 3))
+_PROXY_CHUNK = 1 << 16
+
+
+def _triangle_normals(corners):
+    """(area-weighted normals, non-degenerate mask) of triangles' corners
+    (n, 3, 3): degenerate triangles have twice their area at most
+    PROXY_DEGENERATE times their longest edge squared."""
+    import numpy as np
+    edges = (corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 1], corners[:, 0] - corners[:, 2])
+    normals = np.cross(edges[0], -edges[2])
+    longest = np.max([np.einsum("td,td->t", edge, edge) for edge in edges], axis=0)
+    return normals, np.linalg.norm(normals, axis=1) > PROXY_DEGENERATE * longest
+
+
+def _flipped(graph, root, corners, normals, usable, centroid_gradients, distance, threads):
+    """Mask of the flipped triangles among `corners` (n, 3, 3) with their
+    normals and non-degenerate mask (_triangle_normals) and the field
+    gradients at their centroids: non-degenerate, facing against the field
+    gradient at the centroid and all three corners, and the field
+    decreasing through the centroid along the normal by
+    PROXY_RIDGE_FRACTION * distance on both sides. (Beside a concave crease
+    whose faces turn by more than 90 degrees, a triangle bridging the
+    crease faces the opening yet against the gradient of the face nearer
+    to its centroid; where two sheets of the offset surface touch, the
+    gradient on the ridge between them is one sheet's: neither is a fold.)"""
+    import numpy as np
+    flipped = usable & (np.einsum("td,td->t", normals, centroid_gradients) <= 0)
+    index = np.nonzero(flipped)[0]
+    if len(index):
+        gradients = graph.gradient(root, corners[index].reshape(-1, 3), threads=threads).reshape(-1, 3, 3)
+        index = index[np.all(np.einsum("td,tkd->tk", normals[index], gradients) <= 0, axis=1)]
+        flipped[:] = False
+    if len(index):
+        centroids = corners[index].mean(axis=1)
+        step = normals[index] * (PROXY_RIDGE_FRACTION * distance / np.linalg.norm(normals[index], axis=1))[:, None]
+        values = graph.evaluate(root, np.concatenate([centroids + step, centroids, centroids - step]),
+                                threads=threads).reshape(3, -1)
+        flipped[index] = (values[0] < values[1]) & (values[1] < values[2])
+    return flipped
+
+
+def proxy_samples(graph, root, positions, triangles, distance, threads):
+    """(lowest, highest, flipped) of a proxy of solid `root` offset by
+    `distance`: the extreme field values at its vertices and its triangles'
+    _PROXY_WEIGHTS samples, and the mask of its flipped triangles
+    (_flipped)."""
+    import numpy as np
+    positions = positions.astype(np.float64)
+    triangles = triangles.astype(np.int64)
+    values = graph.evaluate(root, positions, threads=threads)
+    lowest, highest = float(np.min(values)), float(np.max(values))
+    weights = np.array(_PROXY_WEIGHTS)
+    flipped = []
+    for start in range(0, len(triangles), _PROXY_CHUNK):
+        corners = positions[triangles[start:start + _PROXY_CHUNK]]
+        samples = np.einsum("sk,tkd->tsd", weights, corners)
+        values = graph.evaluate(root, samples.reshape(-1, 3), threads=threads)
+        lowest, highest = min(lowest, float(np.min(values))), max(highest, float(np.max(values)))
+        normals, usable = _triangle_normals(corners)
+        gradients = graph.gradient(root, np.ascontiguousarray(samples[:, 3]), threads=threads)
+        flipped.append(_flipped(graph, root, corners, normals, usable, gradients, distance, threads))
+    return lowest, highest, np.concatenate(flipped)
+
+
+def _grid_weights(n):
+    """Barycentric weights of the vertices of a triangle cut into n * n
+    similar triangles."""
+    import numpy as np
+    return np.array([(i / n, j / n, (n - i - j) / n) for i in range(n + 1) for j in range(n + 1 - i)])
+
+
+def proxy_extremes(graph, root, positions, triangles, spacing, threads):
+    """(lowest, highest) field values on a regular grid of samples at most
+    `spacing` apart (up to PROXY_MAX_SUBDIVISIONS per edge) on every
+    triangle longer than `spacing`: simplified proxies have large
+    triangles, between whose fixed samples the field could stray."""
+    import numpy as np
+    positions = positions.astype(np.float64)
+    corners = positions[triangles.astype(np.int64)]
+    longest = np.max(np.linalg.norm(corners - np.roll(corners, 1, axis=1), axis=2), axis=1)
+    divisions = np.minimum(np.ceil(longest / spacing), PROXY_MAX_SUBDIVISIONS).astype(np.int64)
+    lowest, highest = math.inf, -math.inf
+    for n in np.unique(divisions):
+        if n <= 2:
+            continue
+        weights = _grid_weights(int(n))
+        group = corners[divisions == n]
+        for start in range(0, len(group), max(1, _PROXY_CHUNK // len(weights))):
+            samples = np.einsum("sk,tkd->tsd", weights, group[start:start + _PROXY_CHUNK // len(weights)])
+            values = graph.evaluate(root, samples.reshape(-1, 3), threads=threads)
+            lowest, highest = min(lowest, float(np.min(values))), max(highest, float(np.max(values)))
+    return lowest, highest
+
+
+def weld_proxy(positions, triangles):
+    """(positions, triangles) with coincident vertices merged, in order of
+    first use. The kernel splits vertices at sharp features and pinches."""
+    import numpy as np
+    keys = np.ascontiguousarray(positions, dtype=np.float32).view(np.dtype((np.void, 12))).ravel()
+    _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    rank = np.argsort(first, kind="stable")
+    remap = np.empty(len(first), dtype=np.int64)
+    remap[rank] = np.arange(len(first))
+    return positions[first[rank]], remap[inverse.ravel()][triangles.astype(np.int64)].astype(np.uint32)
+
+
+def closed_surface(triangles, vertex_count):
+    """Whether every directed edge occurs as often as its reverse (closed
+    and consistently oriented; pinches, where two sheets touch, use an edge
+    twice each way)."""
+    import numpy as np
+    triangles = triangles.astype(np.int64)
+    following = np.roll(triangles, -1, axis=1)
+    keys, counts = np.unique((triangles * vertex_count + following).ravel(), return_counts=True)
+    reverse, reverse_counts = np.unique((following * vertex_count + triangles).ravel(), return_counts=True)
+    return np.array_equal(keys, reverse) and np.array_equal(counts, reverse_counts)
+
+
+class ProxyRepair:
+    """Untangles folds of a proxy mesh (float64 copies of its float32
+    positions, its triangles) with local edits of flipped triangles
+    (_flipped): flipping one of their edges, and moving one of their
+    vertices toward the centre of its neighbours, projected back onto
+    f = distance and rounded to float32. An edit is kept only if no changed triangle is
+    degenerate or flipped unless it was before, fewer are, and every
+    _PROXY_WEIGHTS sample of the changed triangles (and the moved vertex)
+    has f above `required`. Edits are taken in index order, so the result
+    does not depend on the thread count."""
+
+    def __init__(self, graph, root, positions, triangles, distance, required):
+        import numpy as np
+        self.graph, self.root, self.distance, self.required = graph, root, distance, required
+        self.positions = positions.astype(np.float64)
+        self.triangles = triangles.astype(np.int64)
+        self.count = len(self.positions)
+        keys = (self.triangles * self.count + np.roll(self.triangles, -1, axis=1)).ravel()
+        self._edge_order = np.argsort(keys, kind="stable")
+        self._edge_keys = keys[self._edge_order]
+        self._edges = {}  # directed edge key -> triangle (-1: removed), over the sorted keys
+        corners = self.triangles.ravel()
+        self._corner_order = np.argsort(corners, kind="stable")
+        self._first = np.searchsorted(corners[self._corner_order], np.arange(self.count + 1))
+        self._incident = {}  # vertex -> its triangles, over the sorted corners
+        self._weights = np.array(_PROXY_WEIGHTS)
+        self.edits = 0
+
+    def owner(self, a, b):
+        """The triangle with the directed edge a -> b: -1 if none, -2 if
+        several (a pinch)."""
+        import numpy as np
+        key = int(a) * self.count + int(b)
+        if key in self._edges:
+            return self._edges[key]
+        low = int(np.searchsorted(self._edge_keys, key, "left"))
+        high = int(np.searchsorted(self._edge_keys, key, "right"))
+        return int(self._edge_order[low] // 3) if high - low == 1 else -1 if high == low else -2
+
+    def incident(self, vertex):
+        found = self._incident.get(vertex)
+        if found is None:
+            found = sorted(set((self._corner_order[self._first[vertex]:self._first[vertex + 1]] // 3).tolist()))
+        return found
+
+    def bad(self, rows):
+        """Rows (triangles as vertex indices) that are degenerate or flipped."""
+        import numpy as np
+        corners = self.positions[rows]
+        normals, usable = _triangle_normals(corners)
+        gradients = self.graph.gradient(self.root, corners.mean(axis=1), threads=1)
+        return ~usable | _flipped(self.graph, self.root, corners, normals, usable, gradients, self.distance, 1)
+
+    def outside(self, rows, points=None):
+        import numpy as np
+        samples = np.einsum("sk,tkd->tsd", self._weights, self.positions[rows]).reshape(-1, 3)
+        if points is not None:
+            samples = np.concatenate([samples, points])
+        return bool(np.all(self.graph.evaluate(self.root, samples, threads=1) > self.required))
+
+    def flip(self, triangle):
+        """Flip an edge of `triangle`; returns the two changed triangles or None."""
+        import numpy as np
+        rows = self.triangles
+        for corner in range(3):
+            a, b, c = (int(rows[triangle, (corner + step) % 3]) for step in range(3))
+            other = self.owner(b, a)
+            if other < 0 or other == triangle:
+                continue
+            row = rows[other].tolist()
+            d = row[(row.index(b) + 2) % 3]
+            if (d == c or self.owner(c, d) != -1 or self.owner(d, c) != -1 or self.owner(c, a) != triangle
+                    or self.owner(b, c) != triangle or self.owner(a, d) != other or self.owner(d, b) != other):
+                continue
+            new = np.array([[a, d, c], [d, b, c]])
+            if self.bad(new).any() or not self.outside(new):
+                continue
+            rows[triangle], rows[other] = new
+            for x, y, owner in ((a, b, -1), (b, a, -1), (a, d, triangle), (d, c, triangle), (c, a, triangle),
+                                (d, b, other), (b, c, other), (c, d, other)):
+                self._edges[x * self.count + y] = owner
+            for vertex, drop, add in ((a, other, None), (b, triangle, None), (c, None, other), (d, None, triangle)):
+                found = set(self.incident(vertex))
+                found.discard(drop)
+                if add is not None:
+                    found.add(add)
+                self._incident[vertex] = sorted(found)
+            self.edits += 1
+            return triangle, other
+        return None
+
+    def project(self, point):
+        """`point` moved onto f = distance (three Newton steps), in float32."""
+        import numpy as np
+        for _ in range(3):
+            point = point - ((self.graph.evaluate(self.root, point, threads=1) - self.distance)
+                             * self.graph.gradient(self.root, point, threads=1))
+        return point.astype(np.float32).astype(np.float64)
+
+    def move(self, vertex):
+        """Move `vertex`; returns (its triangles, which are bad) or None."""
+        import numpy as np
+        triangles = self.incident(vertex)
+        rows = self.triangles[triangles]
+        before = self.bad(rows)
+        if not before.any():
+            return None
+        ring = np.unique(rows)
+        target = self.positions[ring[ring != vertex]].mean(axis=0)
+        start = self.positions[vertex].copy()
+        for weight in (1.0, 0.5, 0.25):
+            point = self.project((1 - weight) * start + weight * target)
+            if not np.all(np.isfinite(point)):
+                continue
+            self.positions[vertex] = point
+            after = self.bad(rows)
+            if (np.count_nonzero(after) < np.count_nonzero(before) and not np.any(after & ~before)
+                    and self.outside(rows, point[None])):
+                self.edits += 1
+                return triangles, after
+            self.positions[vertex] = start
+        return None
+
+    def run(self, triangles):
+        """Repair from the given triangles for PROXY_REPAIR_ROUNDS rounds of
+        edge flips and then vertex moves; returns the triangles still bad."""
+        pending = {int(triangle) for triangle in triangles}
+        for _ in range(PROXY_REPAIR_ROUNDS):
+            edits = self.edits
+            for triangle in sorted(pending):
+                changed = self.flip(triangle) if triangle in pending else None
+                if changed:
+                    pending.difference_update(changed)
+            for vertex in sorted({int(vertex) for triangle in pending for vertex in self.triangles[triangle]}):
+                moved = self.move(vertex)
+                for triangle, bad in zip(*moved) if moved else ():
+                    if bad:
+                        pending.add(triangle)
+                    else:
+                        pending.discard(triangle)
+            if not pending or self.edits == edits:
+                break
+        return sorted(pending)
+
+
+def checked_proxy(graph, root, mesh, distance, threads):
+    """(failure, None) or (None, (positions, triangles, lowest, highest,
+    margin)) of a proxy mesh of solid `root` offset by `distance`, its
+    coincident vertices merged (weld_proxy). It must be closed and
+    edge-manifold; every vertex and _PROXY_WEIGHTS sample of its triangles
+    must have f above PROXY_MINIMUM_FRACTION * distance and the float32
+    margin (PROXY_FLOAT_ULPS float32 steps of its largest coordinate times
+    the field's slope bound); flipped triangles (_flipped) are repaired
+    (ProxyRepair), and none may remain."""
+    import numpy as np
+    stats = mesh.stats
+    if not len(mesh.triangles):
+        return "the offset surface has no triangles", None
+    open_edges, nonmanifold = int(stats["boundary_edges"]), int(stats["nonmanifold_edges"])
+    if open_edges or nonmanifold:
+        return f"the proxy mesh is not closed ({open_edges} boundary and {nonmanifold} non-manifold edges)", None
+    positions, triangles = weld_proxy(mesh.positions, mesh.triangles)
+    if not closed_surface(triangles, len(positions)):
+        return "the proxy mesh is not closed once its coincident vertices are merged", None
+    margin = PROXY_FLOAT_ULPS * 2.0 ** -23 * float(np.max(np.abs(positions))) * max(1.0, graph.lipschitz(root))
+    if not math.isfinite(margin):
+        return "the field has no finite slope bound", None
+    required = max(PROXY_MINIMUM_FRACTION * distance, margin)
+    lowest, highest, flipped = proxy_samples(graph, root, positions, triangles, distance, threads)
+    if lowest > required and flipped.any():
+        repair = ProxyRepair(graph, root, positions, triangles, distance, required)
+        repair.run(np.nonzero(flipped)[0])
+        if repair.edits:
+            positions, triangles = repair.positions.astype(np.float32), repair.triangles.astype(np.uint32)
+            if not closed_surface(triangles, len(positions)):
+                return "the repaired proxy mesh is not closed", None
+            lowest, highest, flipped = proxy_samples(graph, root, positions, triangles, distance, threads)
+    dense_lowest, dense_highest = proxy_extremes(graph, root, positions, triangles,
+                                                 PROXY_SAMPLE_SPACING * distance, threads)
+    lowest, highest = min(lowest, dense_lowest), max(highest, dense_highest)
+    if not (math.isfinite(lowest) and math.isfinite(highest)):
+        return "the field is not finite on the proxy", None
+    if lowest <= required:
+        return f"a proxy sample has f = {lowest:.4g} mm, not above {required:.4g} mm", None
+    if flipped.any():
+        return f"{int(np.count_nonzero(flipped))} proxy triangles are folded against the field", None
+    return None, (positions, triangles, lowest, highest, margin)
+
+
+def mesh_proxy(graph, node, cell, tolerance, budget, threads):
+    """The adaptive mesh of an offset node (no display creases)."""
+    simplify = PROXY_SIMPLIFY_FRACTION * tolerance / PROXY_TOLERANCE_FRACTION
+    return graph.native_mesh(node, cell_size=cell, crease_angle=180.0, threads=threads, tolerance=tolerance,
+                             max_depth=PROXY_DEPTH, max_triangles=budget).mesh(simplify or None)
+
+
+def proxy_part(graph, root, node, distance, cell, budget, threads):
+    """(result entry without the solid, (positions, triangles) or None) of
+    one part's proxy. A proxy over its triangle budget is meshed once more
+    at twice the cell; one that fails checked_proxy once more at half the
+    tolerance."""
+    import radsdf
+    tolerance = PROXY_TOLERANCE_FRACTION * distance
+    coarsened = retried = False
+    while True:
+        try:
+            mesh = mesh_proxy(graph, node, cell, tolerance, budget, threads)
+        except radsdf.SDFError as error:
+            return {"status": "none", "reason": f"the offset surface could not be meshed: {error}"}, None
+        if len(mesh.triangles) > budget:
+            if coarsened:
+                return {"status": "none", "reason": f"the proxy needs {len(mesh.triangles)} triangles, more than "
+                                                    f"its budget of {budget}"}, None
+            coarsened, cell = True, 2 * cell
+            continue
+        try:
+            failure, checked = checked_proxy(graph, root, mesh, distance, threads)
+        except radsdf.SDFError as error:
+            failure = f"the proxy could not be checked: {error}"
+        if failure is None:
+            break
+        if retried:
+            return {"status": "none", "reason": failure}, None
+        retried, tolerance = True, tolerance / 2
+    positions, triangles, lowest, highest, margin = checked
+    deviation = float(mesh.stats["max_deviation"])
+    entry = {"status": "proxy", "triangles": len(triangles),
+             "shell": PROXY_SHELL_FACTOR * max(distance, highest) + margin,
+             "minimum": lowest, "maxDeviation": deviation}
+    if coarsened:
+        entry["cellSize"] = cell
+    return entry, (positions, triangles)
+
+
+def build_proxies(data, roots, meshes, program, failure, cell, threads):
+    """(result.json "proxy" record, preview arrays or None) of the design's
+    proxies: one per part whose GPU field program status is "field", meshed
+    on a graph of the design's RSDF `data` with one OFFSET node per such part
+    appended (model.rsdf keeps `data`). Budgets follow part_budget with the
+    parts' preview triangle counts. Never raises for a design's geometry."""
+    import numpy as np
+    import radsdf
+    started = time.perf_counter()
+    if program is None:
+        return {"error": failure or "the GPU field program is unavailable"}, None
+    distance = PROXY_OFFSET_CELLS * cell
+    proxy_cell = PROXY_CELL_FACTOR * cell
+    record = {"offset": distance, "cellSize": proxy_cell, "tolerance": PROXY_TOLERANCE_FRACTION * distance,
+              "buildSeconds": 0.0}
+    entries = [{"solid": solid, "status": "none", "reason": "no GPU field program"} for solid in range(len(roots))]
+    eligible = [solid for solid, part in enumerate(program.parts) if part["status"] == "field"]
+    proxies = {}
+    if eligible:
+        augmented, nodes = offset_graph_bytes(data, [roots[solid] for solid in eligible], distance)
+        try:
+            graph = radsdf.Graph.from_bytes(augmented, roots)
+        except radsdf.SDFError as error:
+            return {"error": f"the proxy graph could not be loaded: {error}"}, None
+        with graph:
+            estimates = [len(meshes[solid].triangles) for solid in eligible]
+            used = 0
+            for index, (solid, node) in enumerate(zip(eligible, nodes)):
+                budget = part_budget(estimates, index, used, PROXY_TRIANGLE_BUDGET)
+                entry, proxy = proxy_part(graph, roots[solid], node, distance, proxy_cell, budget, threads)
+                entries[solid] = {"solid": solid, **entry}
+                if proxy is not None:
+                    proxies[solid] = proxy
+                    used += len(proxy[1])
+    record["buildSeconds"] = time.perf_counter() - started
+    record["parts"] = entries
+    if not proxies:
+        return record, None
+    positions, triangles, owners, offset = [], [], [], 0
+    for solid in sorted(proxies):
+        points, faces = proxies[solid]
+        positions.append(points)
+        triangles.append(faces.astype(np.int64) + offset)
+        owners.append(np.full(len(faces), solid, dtype=np.int32))
+        offset += len(points)
+    return record, {"proxyVertices": np.concatenate(positions),
+                    "proxyTriangles": np.concatenate(triangles).astype(np.uint32),
+                    "proxyTriangleSolids": np.concatenate(owners)}
+
+
 def encode_design(normalized):
     """(RSDF bytes, part root indices, encoded nodes) of the design's parts."""
     import radsdf
@@ -1085,6 +1532,7 @@ def build(spec, directory, output, threads, started=None):
         meshes, cell, default = mesh_parts(graph, normalized, boxes, threads)
         fields, field_warnings = custom_fields(graph, order, normalized)
         field_program = sdf_field.build(graph, cell, threads)
+    proxy, proxy_arrays = build_proxies(data, roots, meshes, *field_program, cell, threads)
     artifact = (output / "model.rsdf").resolve()
     preview = assemble_preview(normalized, meshes, cell, default, roots, artifact, fingerprint,
                                build_mode.printing_read)
@@ -1092,9 +1540,12 @@ def build(spec, directory, output, threads, started=None):
         preview["customFields"] = fields
     write_artifact(data, output)
     preview["fieldProgram"] = sdf_field.publish(*field_program, output)
+    preview["proxy"] = proxy
     preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime)
     # Keep the protocol's key order: warnings follow the runtime facts.
     warnings = preview.pop("warnings")
     preview["warnings"] = warnings + field_warnings[:max(0, MAX_WARNINGS - len(warnings))]
+    if proxy_arrays is not None:
+        preview.update(proxy_arrays)
     write_preview_result(preview, output)
     return preview

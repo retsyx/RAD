@@ -8,11 +8,13 @@ import simd
 @MainActor
 enum CADStrokeGeometry {
     static let viewportHeightKey = "cadEdgeViewportHeight"
+    static let depthAllowanceKey = "cadEdgeDepthAllowance"
     static let normalWidth: CGFloat = 1.6
 
     private static let modifier = """
     #pragma arguments
     float cadEdgeViewportHeight;
+    float cadEdgeDepthAllowance;
     #pragma body
     float cadEdgeWidth = \(Float(normalWidth));
     float4 cadViewPosition = scn_node.modelViewTransform * _geometry.position;
@@ -90,7 +92,10 @@ enum CADStrokeGeometry {
         // derivative, retaining the projection's actual depth direction.
         float cadDepthGradient = (scn_frame.projectionTransform[2][2] * cadClip.w
             - scn_frame.projectionTransform[2][3] * cadClip.z) / cadClip.w;
-        cadClip.z += 2e-6 * abs(cadViewPosition.z) * cadDepthGradient;
+        // Strokes of exactly drawn faces come from the display mesh, which
+        // lies within its deviation bound inside the exact surface: they get
+        // that view-depth allowance too (zero for display-mesh faces).
+        cadClip.z += (2e-6 * abs(cadViewPosition.z) + cadEdgeDepthAllowance) * cadDepthGradient;
         _geometry.position = scn_node.inverseModelViewProjectionTransform * cadClip;
     }
     """
@@ -228,6 +233,7 @@ enum CADStrokeGeometry {
                                                                  bytesPerIndex: MemoryLayout<Int32>.size)])
         geometry.shaderModifiers = [.geometry: modifier]
         setViewportHeight(viewportHeight, on: geometry)
+        setDepthAllowance(0, on: geometry)
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.diffuse.contents = color
@@ -242,8 +248,15 @@ enum CADStrokeGeometry {
         geometry.setValue(NSNumber(value: Double(height.isFinite ? max(1, height) : 1)), forKey: viewportHeightKey)
     }
 
+    /// The view-depth distance (scene units) by which strokes may lie behind
+    /// the faces that draw them.
+    static func setDepthAllowance(_ allowance: Float, on geometry: SCNGeometry) {
+        geometry.setValue(NSNumber(value: allowance.isFinite ? max(0, allowance) : 0), forKey: depthAllowanceKey)
+    }
+
     static func copyParameters(from source: SCNGeometry, to destination: SCNGeometry) {
         guard source.shaderModifiers?[.geometry] == modifier else { return }
         if let value = source.value(forKey: viewportHeightKey) { destination.setValue(value, forKey: viewportHeightKey) }
+        if let value = source.value(forKey: depthAllowanceKey) { destination.setValue(value, forKey: depthAllowanceKey) }
     }
 }

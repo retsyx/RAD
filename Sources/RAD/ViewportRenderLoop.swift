@@ -23,12 +23,13 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private var stopped = false
     /// Frames encoded but not yet completed by the GPU.
     private let inFlight = DispatchSemaphore(value: 2)
-    private let completion: @Sendable (UInt64) -> Void
+    private let completion: @Sendable (UInt64, Double) -> Void
 
     /// `renderer` is drawn only by this loop's thread; other threads may use
     /// it for asynchronous resource preparation. `completion` runs on the
-    /// main queue with each frame's generation once the GPU has finished it.
-    init?(layer: CAMetalLayer, renderer: SCNRenderer, completion: @escaping @Sendable (UInt64) -> Void) {
+    /// main queue with each frame's generation and GPU seconds once the GPU
+    /// has finished it.
+    init?(layer: CAMetalLayer, renderer: SCNRenderer, completion: @escaping @Sendable (UInt64, Double) -> Void) {
         guard let device = renderer.device ?? layer.device ?? MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
               let passes = try? CADViewportPasses(device: device) else { return nil }
@@ -105,9 +106,10 @@ final class ViewportRenderLoop: @unchecked Sendable {
         passes.encode(frame, source: request.source, renderer: renderer, into: drawable.texture, commandBuffer: commandBuffer)
         commandBuffer.present(drawable)
         let generation = request.generation, completion = completion, inFlight = inFlight
-        commandBuffer.addCompletedHandler { _ in
+        commandBuffer.addCompletedHandler { buffer in
             inFlight.signal()
-            DispatchQueue.main.async { completion(generation) }
+            let seconds = buffer.gpuEndTime - buffer.gpuStartTime
+            DispatchQueue.main.async { completion(generation, seconds) }
         }
         commandBuffer.commit()
     }

@@ -551,11 +551,12 @@ class WriteResultTests(unittest.TestCase):
 
 
 SECTION_TYPES = {"positions": ("<f4", 3), "normals": ("<f4", 3), "triangles": ("<u4", 3), "edges": ("<f4", 6),
-                 "triangleSolids": ("<i4", 1), "edgeSolids": ("<i4", 1)}
+                 "triangleSolids": ("<i4", 1), "edgeSolids": ("<i4", 1), "proxyPositions": ("<f4", 3),
+                 "proxyTriangles": ("<u4", 3), "proxySolids": ("<i4", 1)}
 
 RESULT_KEYS = ["buildID", "artifactPath", "partRoots", "bounds", "volume", "area", "solids", "parts", "partStats",
-               "mesh", "assemblyMotion", "printVersion", "printDown", "validatedHash", "fieldProgram", "buildSeconds",
-               "threads", "runtime", "warnings", "meshBuffers"]
+               "mesh", "assemblyMotion", "printVersion", "printDown", "validatedHash", "fieldProgram", "proxy",
+               "buildSeconds", "threads", "runtime", "warnings", "meshBuffers"]
 
 ARM = '''
 result = Assembly("Hinged arm")
@@ -871,7 +872,10 @@ m.couple("geneva", drive, index, **geneva(N))
                 mock.patch.object(radsdf.Graph, "from_bytes", recording_load):
             output, _, result, _ = self.build("result = [sphere(5), box(4, center=(10, 0, 0))]")
         self.assertEqual(encoded, [2])
-        self.assertEqual(loaded, [((output / "model.rsdf").read_bytes(), result["partRoots"])])
+        data = (output / "model.rsdf").read_bytes()
+        # The proxies mesh the same records with one offset node per part appended.
+        proxies = sdf_build.offset_graph_bytes(data, result["partRoots"], result["proxy"]["offset"])[0]
+        self.assertEqual(loaded, [(data, result["partRoots"]), (proxies, result["partRoots"])])
 
 
 @unittest.skipUnless(kernel_available(), "the native SDF kernel is not available")

@@ -4,21 +4,37 @@ import SceneKit
 import simd
 
 /// SceneKit node categories drawn by the viewport's scene passes. Hit testing
-/// queries `faces` only.
+/// queries `pickable`.
 enum CADViewportCategory {
+    /// Faces of solids drawn from their display meshes.
     static let faces = 1
     static let decorations = 2
-    /// Translucent mode's depth-only copies of each solid's faces.
+    /// Translucent mode's depth-only copies of each mesh solid's faces.
     static let visibility = 8
-    /// Translucent mode's transmittance copies of each solid's faces.
+    /// Translucent mode's transmittance copies of each mesh solid's faces.
     static let revealage = 16
     /// The geometry-free node that records each frame's camera matrices.
     static let probe = 32
+    /// Display meshes of solids with exact faces, and their translucent
+    /// copies: drawn only by mesh frames, always hit tested and framed.
+    static let meshFaces = 64
+    static let meshVisibility = 128
+    static let meshRevealage = 256
+    /// The geometry-free nodes that draw exact faces in each scene pass.
+    static let fieldOpaque = 512
+    static let fieldVisibility = 1024
+    static let fieldAccumulation = 2048
+    static let fieldRevealage = 4096
 
-    static let opaqueScene = faces | decorations | probe
-    static let translucentDecorations = visibility | decorations | probe
-    static let translucentAccumulation = faces
-    static let translucentRevealage = revealage
+    static let pickable = faces | meshFaces
+    static let opaqueScene = faces | decorations | probe | fieldOpaque
+    static let translucentDecorations = visibility | decorations | probe | fieldVisibility
+    static let translucentAccumulation = faces | fieldAccumulation
+    static let translucentRevealage = revealage | fieldRevealage
+    static let opaqueMeshScene = faces | meshFaces | decorations | probe
+    static let translucentMeshDecorations = visibility | meshVisibility | decorations | probe
+    static let translucentMeshAccumulation = faces | meshFaces
+    static let translucentMeshRevealage = revealage | meshRevealage
 }
 
 /// Translucent faces keep this fraction of their complete shaded color.
@@ -114,6 +130,8 @@ struct CADViewportFrame: @unchecked Sendable {
         var buffer: CADHighlightBuffers.Mask
         var selected: Bool
         var model: simd_float4x4
+        /// Exact solids cover their field projection instead of their mesh.
+        var field: (resources: CADFieldResources, solid: Int)? = nil
     }
     /// Disjoint masks share one projection and contour pass.
     struct Batch {
@@ -134,6 +152,8 @@ struct CADViewportFrame: @unchecked Sendable {
     /// Projected bounds of every seed and mask, before the highlight kernel.
     var highlightBounds: CADSilhouetteBatching.Rect?
     var verticesEnabled = false
+    /// Exact faces; nil draws every solid from its display mesh.
+    var field: CADFieldFrame?
 
     var hasHighlights: Bool { !seeds.isEmpty || !batches.isEmpty }
 
@@ -154,30 +174,71 @@ final class CADViewportSceneSource: @unchecked Sendable {
     static let decorationsCameraName = "radTranslucentDecorationsCamera"
     static let accumulationCameraName = "radTranslucentAccumulationCamera"
     static let revealageCameraName = "radTranslucentRevealageCamera"
+    static let opaqueExactCameraName = "radExactOpaqueCamera"
+    static let decorationsMeshCameraName = "radMeshTranslucentDecorationsCamera"
+    static let accumulationMeshCameraName = "radMeshTranslucentAccumulationCamera"
+    static let revealageMeshCameraName = "radMeshTranslucentRevealageCamera"
     static let probeName = "radFrameProbe"
+    static let fieldNodeNames: [(CADFieldResources.Mode, String, Int)] = [
+        (.opaque, "radFieldOpaque", CADViewportCategory.fieldOpaque),
+        (.visibility, "radFieldVisibility", CADViewportCategory.fieldVisibility),
+        (.accumulation, "radFieldAccumulation", CADViewportCategory.fieldAccumulation),
+        (.revealage, "radFieldRevealage", CADViewportCategory.fieldRevealage),
+    ]
 
-    let scene: SCNScene
-    /// The design camera, also used for the opaque scene pass.
-    let camera: SCNNode
-    let decorationsCamera: SCNNode
-    let accumulationCamera: SCNNode
-    let revealageCamera: SCNNode
-    let probe: CADViewportFrameProbe
-
-    init(scene: SCNScene, camera: SCNNode, decorationsCamera: SCNNode, accumulationCamera: SCNNode,
-         revealageCamera: SCNNode, probe: CADViewportFrameProbe) {
-        self.scene = scene
-        self.camera = camera
-        self.decorationsCamera = decorationsCamera
-        self.accumulationCamera = accumulationCamera
-        self.revealageCamera = revealageCamera
-        self.probe = probe
+    /// Pass cameras of one kind of frame: exact faces or display meshes.
+    struct Cameras {
+        var opaque: SCNNode
+        var decorations: SCNNode
+        var accumulation: SCNNode
+        var revealage: SCNNode
     }
 
-    /// Adds the translucent pass cameras under `camera` and the matrix probe
-    /// to `scene`. Pass cameras mirror the design camera's projection.
+    let scene: SCNScene
+    /// The design camera, also used for the opaque scene pass of mesh frames.
+    let camera: SCNNode
+    let exact: Cameras
+    let mesh: Cameras
+    let probe: CADViewportFrameProbe
+    /// The frame's exact faces, read by the field nodes' delegates.
+    let field: CADFieldPassState
+    /// Renderer delegates are not retained by their nodes.
+    private let fieldDelegates: [CADFieldPassDelegate]
+    /// The probe and field nodes, whose delegates are cleared while this
+    /// source still holds the scene: SceneKit can crash deallocating a scene
+    /// whose nodes still have renderer delegates.
+    private let delegateNodes: [SCNNode]
+
+    var decorationsCamera: SCNNode { exact.decorations }
+    var accumulationCamera: SCNNode { exact.accumulation }
+    var revealageCamera: SCNNode { exact.revealage }
+
+    private init(scene: SCNScene, camera: SCNNode, exact: Cameras, mesh: Cameras, probe: CADViewportFrameProbe,
+                 field: CADFieldPassState, fieldDelegates: [CADFieldPassDelegate], delegateNodes: [SCNNode]) {
+        self.scene = scene
+        self.camera = camera
+        self.exact = exact
+        self.mesh = mesh
+        self.probe = probe
+        self.field = field
+        self.fieldDelegates = fieldDelegates
+        self.delegateNodes = delegateNodes
+    }
+
+    deinit {
+        for node in delegateNodes { node.rendererDelegate = nil }
+    }
+
+    /// Fresh delegates for the field nodes, sharing one frame state.
+    private static func fieldDelegates() -> (CADFieldPassState, [CADFieldPassDelegate]) {
+        let state = CADFieldPassState()
+        return (state, fieldNodeNames.map { CADFieldPassDelegate(mode: $0.0, state: state) })
+    }
+
+    /// Adds the pass cameras under `camera` and the matrix probe and exact
+    /// face nodes to `scene`. Pass cameras mirror the design camera's projection.
     static func install(in scene: SCNScene, camera: SCNNode) -> CADViewportSceneSource {
-        camera.camera?.categoryBitMask = CADViewportCategory.opaqueScene
+        camera.camera?.categoryBitMask = CADViewportCategory.opaqueMeshScene
         func passCamera(_ name: String, mask: Int) -> SCNNode {
             let node = SCNNode()
             node.name = name
@@ -186,40 +247,83 @@ final class CADViewportSceneSource: @unchecked Sendable {
             camera.addChildNode(node)
             return node
         }
-        let source = CADViewportSceneSource(
-            scene: scene, camera: camera,
-            decorationsCamera: passCamera(decorationsCameraName, mask: CADViewportCategory.translucentDecorations),
-            accumulationCamera: passCamera(accumulationCameraName, mask: CADViewportCategory.translucentAccumulation),
-            revealageCamera: passCamera(revealageCameraName, mask: CADViewportCategory.translucentRevealage),
-            probe: CADViewportFrameProbe())
-        // No geometry or bounds: the probe must never change automatic clipping.
+        let exact = Cameras(
+            opaque: passCamera(opaqueExactCameraName, mask: CADViewportCategory.opaqueScene),
+            decorations: passCamera(decorationsCameraName, mask: CADViewportCategory.translucentDecorations),
+            accumulation: passCamera(accumulationCameraName, mask: CADViewportCategory.translucentAccumulation),
+            revealage: passCamera(revealageCameraName, mask: CADViewportCategory.translucentRevealage))
+        let mesh = Cameras(
+            opaque: camera,
+            decorations: passCamera(decorationsMeshCameraName, mask: CADViewportCategory.translucentMeshDecorations),
+            accumulation: passCamera(accumulationMeshCameraName, mask: CADViewportCategory.translucentMeshAccumulation),
+            revealage: passCamera(revealageMeshCameraName, mask: CADViewportCategory.translucentMeshRevealage))
+        // No geometry or bounds: these nodes must never change automatic
+        // clipping. SceneKit calls a renderer delegate only if the node has
+        // it when it joins the scene, so delegates are attached first.
+        let probe = CADViewportFrameProbe()
         let probeNode = SCNNode()
         probeNode.name = probeName
         probeNode.categoryBitMask = CADViewportCategory.probe
         probeNode.renderingOrder = 1_000_000
-        probeNode.rendererDelegate = source.probe
+        probeNode.rendererDelegate = probe
         scene.rootNode.addChildNode(probeNode)
+        let (state, delegates) = fieldDelegates()
+        var nodes = [probeNode]
+        for ((_, name, category), delegate) in zip(fieldNodeNames, delegates) {
+            let node = SCNNode()
+            node.name = name
+            node.categoryBitMask = category
+            // Exact faces fill visibility depth before mesh solids and decorations.
+            node.renderingOrder = -1
+            node.rendererDelegate = delegate
+            scene.rootNode.addChildNode(node)
+            nodes.append(node)
+        }
+        let source = CADViewportSceneSource(scene: scene, camera: camera, exact: exact, mesh: mesh, probe: probe,
+                                            field: state, fieldDelegates: delegates, delegateNodes: nodes)
         source.synchronizeCameras()
         return source
     }
 
-    /// Finds the pass cameras and probe in a cloned scene graph, attaching a
-    /// fresh probe so the copy never reports into the original.
+    /// Finds the pass cameras, probe and field nodes in a cloned scene graph,
+    /// attaching fresh delegates so the copy never reports into the original.
     static func adopt(scene: SCNScene, camera: SCNNode) -> CADViewportSceneSource? {
-        guard let decorations = camera.childNode(withName: decorationsCameraName, recursively: false),
-              let accumulation = camera.childNode(withName: accumulationCameraName, recursively: false),
-              let revealage = camera.childNode(withName: revealageCameraName, recursively: false),
+        func child(_ name: String) -> SCNNode? { camera.childNode(withName: name, recursively: false) }
+        guard let decorations = child(decorationsCameraName), let accumulation = child(accumulationCameraName),
+              let revealage = child(revealageCameraName), let opaqueExact = child(opaqueExactCameraName),
+              let decorationsMesh = child(decorationsMeshCameraName), let accumulationMesh = child(accumulationMeshCameraName),
+              let revealageMesh = child(revealageMeshCameraName),
               let probeNode = scene.rootNode.childNode(withName: probeName, recursively: true) else { return nil }
+        var fieldNodes: [SCNNode] = []
+        for (_, name, _) in fieldNodeNames {
+            guard let node = scene.rootNode.childNode(withName: name, recursively: true) else { return nil }
+            fieldNodes.append(node)
+        }
+        // Each node rejoins the scene with its new delegate, which SceneKit
+        // registers only on insertion.
+        func attach(_ delegate: any SCNNodeRendererDelegate, to node: SCNNode) {
+            let parent = node.parent
+            node.removeFromParentNode()
+            node.rendererDelegate = delegate
+            (parent ?? scene.rootNode).addChildNode(node)
+        }
         let probe = CADViewportFrameProbe()
-        probeNode.rendererDelegate = probe
-        return CADViewportSceneSource(scene: scene, camera: camera, decorationsCamera: decorations,
-                                      accumulationCamera: accumulation, revealageCamera: revealage, probe: probe)
+        attach(probe, to: probeNode)
+        let (state, delegates) = fieldDelegates()
+        for (node, delegate) in zip(fieldNodes, delegates) { attach(delegate, to: node) }
+        return CADViewportSceneSource(
+            scene: scene, camera: camera,
+            exact: Cameras(opaque: opaqueExact, decorations: decorations, accumulation: accumulation, revealage: revealage),
+            mesh: Cameras(opaque: camera, decorations: decorationsMesh, accumulation: accumulationMesh,
+                          revealage: revealageMesh),
+            probe: probe, field: state, fieldDelegates: delegates, delegateNodes: [probeNode] + fieldNodes)
     }
 
     /// Copies the design camera's projection into each pass camera.
     func synchronizeCameras() {
         guard let source = camera.camera else { return }
-        for node in [decorationsCamera, accumulationCamera, revealageCamera] {
+        for node in [exact.opaque, exact.decorations, exact.accumulation, exact.revealage, mesh.decorations,
+                     mesh.accumulation, mesh.revealage] {
             guard let target = node.camera else { continue }
             if target.fieldOfView != source.fieldOfView { target.fieldOfView = source.fieldOfView }
             if target.projectionDirection != source.projectionDirection { target.projectionDirection = source.projectionDirection }
@@ -242,17 +346,20 @@ final class CADViewportSceneSource: @unchecked Sendable {
 /// highlight passes align with the rendered faces to the pixel.
 final class CADViewportFrameProbe: NSObject, SCNNodeRendererDelegate, @unchecked Sendable {
     private let lock = NSLock()
-    private var viewProjection: simd_float4x4?
+    private var matrices: (view: simd_float4x4, projection: simd_float4x4)?
 
-    func reset() { lock.withLock { viewProjection = nil } }
+    func reset() { lock.withLock { matrices = nil } }
 
-    func take() -> simd_float4x4? { lock.withLock { viewProjection } }
+    func take() -> simd_float4x4? { lock.withLock { matrices.map { $0.projection * $0.view } } }
+
+    /// The pass's view and projection, for passes that trace view rays.
+    func takeMatrices() -> (view: simd_float4x4, projection: simd_float4x4)? { lock.withLock { matrices } }
 
     func renderNode(_ node: SCNNode, renderer: SCNRenderer, arguments: [String: Any]) {
         guard let view = (arguments[SCNViewTransform] as? NSValue)?.scnMatrix4Value,
               let projection = (arguments[SCNProjectionTransform] as? NSValue)?.scnMatrix4Value else { return }
-        let matrix = simd_float4x4(projection) * simd_float4x4(view)
-        lock.withLock { viewProjection = matrix }
+        let value = (simd_float4x4(view), simd_float4x4(projection))
+        lock.withLock { matrices = value }
     }
 }
 
@@ -262,7 +369,7 @@ final class CADViewportFrameProbe: NSObject, SCNNodeRendererDelegate, @unchecked
 /// and exist only while something is highlighted.
 final class CADViewportPasses: @unchecked Sendable {
     static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
-    private static let sampleCount = 4
+    static let sampleCount = 4
 
     let device: any MTLDevice
     private let pipelines: Pipelines
@@ -284,35 +391,44 @@ final class CADViewportPasses: @unchecked Sendable {
         renderer.autoenablesDefaultLighting = false
         let viewport = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
         source.probe.reset()
+        // Exact frames draw field solids through the field nodes; mesh frames
+        // draw their display meshes instead.
+        let cameras = frame.field == nil ? source.mesh : source.exact
+        source.field.begin(frame.field)
+        defer { source.field.end() }
         var translucentTargets: (decorations: any MTLTexture, accumulated: any MTLTexture, revealage: any MTLTexture)?
         if frame.translucent {
             guard let decorations = targets.decorations(), let accumulated = targets.accumulated(),
                   let revealage = targets.revealage(), let half4 = targets.multisampleHalf4(),
                   let half1 = targets.multisampleHalf1() else { return }
-            renderScene(renderer, camera: source.decorationsCamera, viewport: viewport, commandBuffer: commandBuffer,
+            renderScene(renderer, camera: cameras.decorations, viewport: viewport, commandBuffer: commandBuffer,
                         color: targets.multisampleColor, resolve: decorations, clear: MTLClearColor(),
                         depth: targets.multisampleDepth)
-            renderScene(renderer, camera: source.accumulationCamera, viewport: viewport, commandBuffer: commandBuffer,
+            renderScene(renderer, camera: cameras.accumulation, viewport: viewport, commandBuffer: commandBuffer,
                         color: half4, resolve: accumulated, clear: MTLClearColor(), depth: targets.multisampleDepth)
-            renderScene(renderer, camera: source.revealageCamera, viewport: viewport, commandBuffer: commandBuffer,
-                        color: half1, resolve: revealage, clear: MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1),
-                        depth: targets.multisampleDepth)
+            // Transmittance needs its own pass only for display-mesh layers.
+            if frame.field?.complete != true {
+                renderScene(renderer, camera: cameras.revealage, viewport: viewport, commandBuffer: commandBuffer,
+                            color: half1, resolve: revealage, clear: MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1),
+                            depth: targets.multisampleDepth)
+            }
             translucentTargets = (decorations, accumulated, revealage)
         } else {
             let background = frame.palette.background
-            renderScene(renderer, camera: source.camera, viewport: viewport, commandBuffer: commandBuffer,
+            renderScene(renderer, camera: cameras.opaque, viewport: viewport, commandBuffer: commandBuffer,
                         color: targets.multisampleColor, resolve: target,
                         clear: MTLClearColor(red: Double(background.x), green: Double(background.y),
                                              blue: Double(background.z), alpha: Double(background.w)),
                         depth: targets.multisampleDepth)
         }
-        let viewProjection = source.probe.take()
+        let matrices = source.probe.takeMatrices()
         var uniforms = HighlightUniforms(frame: frame)
+        if frame.translucent, frame.field?.complete == true { uniforms.revealage.x = 1 }
         var horizontal: (any MTLTexture)?
-        if frame.hasHighlights, let viewProjection, let area = highlightArea(frame) {
+        if frame.hasHighlights, let matrices, let area = highlightArea(frame) {
             uniforms.highlightArea = area
             uniforms.hasHighlights = 1
-            horizontal = encodeHighlights(frame, viewProjection: viewProjection, area: area, uniforms: uniforms,
+            horizontal = encodeHighlights(frame, matrices: matrices, area: area, uniforms: uniforms,
                                           targets: targets, commandBuffer: commandBuffer)
             if horizontal == nil { uniforms.hasHighlights = 0 }
         }
@@ -429,9 +545,10 @@ final class CADViewportPasses: @unchecked Sendable {
     /// Seeds and contours, then the horizontal distance pass. Every texture
     /// here covers only the highlight area, whose origin maps to texel zero.
     /// Returns the horizontal distances read by the final compositor.
-    private func encodeHighlights(_ frame: CADViewportFrame, viewProjection: simd_float4x4, area: SIMD4<Int32>,
-                                  uniforms: HighlightUniforms, targets: Targets,
+    private func encodeHighlights(_ frame: CADViewportFrame, matrices: (view: simd_float4x4, projection: simd_float4x4),
+                                  area: SIMD4<Int32>, uniforms: HighlightUniforms, targets: Targets,
                                   commandBuffer: any MTLCommandBuffer) -> (any MTLTexture)? {
+        let viewProjection = matrices.projection * matrices.view
         let areaX = Int(area.x), areaY = Int(area.y)
         let areaWidth = Int(area.z - area.x) + 1, areaHeight = Int(area.w - area.y) + 1
         guard let multisampleMask = targets.multisampleMask(),
@@ -471,8 +588,29 @@ final class CADViewportPasses: @unchecked Sendable {
             // Map exactly this batch's pixels onto the restricted target.
             let batchRemap = remap(x: pixels.x, y: pixels.y, width: pixels.width, height: pixels.height, frame: frame)
             for item in batch.masks {
+                var channel: SIMD4<Float> = item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0)
+                if let field = item.field, let lights = frame.field?.lights,
+                   let pipeline = try? field.resources.pipeline(.mask, color: .rgba8Unorm, depth: .invalid,
+                                                                samples: Self.sampleCount) {
+                    // The exact projection: proxies march to the field's crossing.
+                    var values = CADFieldResources.Uniforms(view: matrices.view, projection: matrices.projection,
+                                                            height: frame.height, lights: lights, alpha: 1, debug: 0,
+                                                            sampleOffsets: field.resources.sampleOffsets)
+                    values.remap = batchRemap
+                    encoder.setRenderPipelineState(pipeline)
+                    encoder.setVertexBytes(&values, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&values, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&channel, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
+                    encoder.setCullMode(.back)
+                    encoder.setFrontFacing(.counterClockwise)
+                    field.resources.draw([CADFieldInstance(solid: field.solid, model: item.model, albedo: .zero,
+                                                           emission: .zero)], view: matrices.view, encoder: encoder)
+                    encoder.setCullMode(.none)
+                    encoder.setRenderPipelineState(pipelines.mask)
+                    continue
+                }
                 var mask = MaskUniforms(modelViewProjection: viewProjection * item.model, remap: batchRemap,
-                                        channel: item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0))
+                                        channel: channel)
                 encoder.setVertexBuffer(item.buffer.positions, offset: 0, index: 0)
                 encoder.setVertexBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
@@ -628,6 +766,8 @@ final class CADViewportPasses: @unchecked Sendable {
         var frameHeight: Float
         /// Frame pixels (x0, y0, x1, y1 inclusive) covered by the area targets.
         var highlightArea = SIMD4<Int32>(0, 0, -1, -1)
+        /// x: transmittance derives from the accumulated alpha (y: each layer's alpha).
+        var revealage = SIMD4<Float>(0, CADTranslucency.alpha, 0, 0)
 
         init(frame: CADViewportFrame) {
             selected = frame.palette.selected
@@ -738,6 +878,7 @@ final class CADViewportPasses: @unchecked Sendable {
         float hasHighlights;
         float frameHeight;
         int4 highlightArea;
+        float4 revealage;
     };
 
     constant float cadEdgeHoverRadius = \(Float(CADHighlightStyle.hoverEdgeWidth / 2))f;
@@ -900,6 +1041,9 @@ final class CADViewportPasses: @unchecked Sendable {
         int2 center = int2(in.position.xy);
         float4 sum = accumulated.read(uint2(center));
         float reveal = saturate(revealage.read(uint2(center)).r);
+        // Every layer has the same alpha, so without a transmittance pass the
+        // accumulated alpha counts the layers: (1 - alpha) ^ count.
+        if (u.revealage.x > 0.5f) reveal = pow(1.0f - u.revealage.y, max(sum.a, 0.0f) / u.revealage.y);
         float coverage = 1.0f - reveal;
         float3 averageColor = sum.rgb / max(sum.a, 1.0e-5f);
         float4 result = float4(averageColor * coverage + u.backgroundColor.rgb * reveal,

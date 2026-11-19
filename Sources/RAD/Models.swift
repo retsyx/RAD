@@ -156,6 +156,13 @@ struct PreviewMesh: Codable, Sendable {
     /// The build's GPU field program (field.bin), validated; nil when the
     /// build has none. Session data like the display buffers.
     var fieldProgram: FieldProgram? = nil
+    /// Exact-face proxies: result.json `proxy` and the mesh.bin proxy
+    /// sections (xyz per vertex, three outward counter-clockwise indices and
+    /// one solid per triangle, grouped by solid). Session data.
+    var proxy: CADFieldProxyManifest? = nil
+    var proxyPositions: [Float]? = nil
+    var proxyTriangleIndices: [UInt32]? = nil
+    var proxySolids: [Int]? = nil
 
     /// Keeps private native files alive across copies and history navigation.
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.

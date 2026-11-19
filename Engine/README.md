@@ -12,7 +12,7 @@ interfaces.
 | File | Role |
 | --- | --- |
 | `worker.py` | CLI, prepared build workers (`--await-build`), the serving worker (`--serve`) and error reports |
-| `sdf_build.py` | Builds: runs the program, normalizes `result`, meshes the parts, publishes the outputs |
+| `sdf_build.py` | Builds: runs the program, normalizes `result`, meshes the parts and their proxies, publishes the outputs |
 | `sdf_ops.py` | Native operations on a build's graph: measure, clearance, print_orient, export, validate, probe |
 | `radsdf.py` | Modeling API and the kernel's ctypes bindings |
 | `radsdf_assembly.py` | `Assembly`, `Part`, `Placement`, `Motion` and coupling helpers |
@@ -84,9 +84,32 @@ publishes its outputs, each written to a temporary name and renamed:
   normals: SDF gradients, split at creases), `triangles` (UInt32 × 3, outward
   counter-clockwise, contiguous per part), `edges` (Float32 × 6 crease segments
   whose endpoints are bit-identical copies of the same part's vertex
-  positions), and `triangleSolids` and `edgeSolids` (Int32 part owners).
-  Float32 matches the attributes the app uploads to the GPU, and the app copies
-  each section straight into its packed array.
+  positions), and `triangleSolids` and `edgeSolids` (Int32 part owners);
+  then, when any part has a proxy, `proxyPositions` (Float32 × 3),
+  `proxyTriangles` (UInt32 × 3 indices into `proxyPositions`, outward
+  counter-clockwise, grouped by part in ascending solid order) and
+  `proxySolids` (Int32 part owners). Float32 matches the attributes the app
+  uploads to the GPU, and the app copies each section straight into its
+  packed array.
+- Proxies, for exact per-pixel faces: each part with a GPU field program
+  gets a closed, outward mesh of its offset surface f = δ (δ = 0.5 preview
+  cells), meshed adaptively at two preview cells within δ / 3 from the
+  design's graph with one appended OFFSET node per part (`model.rsdf` keeps
+  the design's nodes only), simplified within 0.6 δ of the offset surface
+  (the GPU shades every proxy fragment, so few large triangles are cheaper),
+  its coincident vertices merged. The mesher's folds are repaired by edge
+  flips and by vertex moves projected back onto f = δ. Every vertex, seven
+  samples of every triangle (edge midpoints, centroid, three interior
+  points) and a grid of samples at most δ / 2 apart on longer triangles have
+  f > 0.1 δ and above 16 float32 steps of the largest coordinate times the
+  slope bound; no triangle is flipped (non-degenerate, facing against the
+  gradient at its centroid and corners while f decreases through it along
+  its normal). The part's `shell` = 1.1 × max(δ, largest sampled f) + that
+  float32 margin: the app's march misses only once f rises above it. Parts
+  share 1,000,000 proxy triangles by their preview triangle counts; a proxy
+  over its share is meshed once at twice the cell, one failing a check once
+  at half the tolerance, and otherwise the part has none. Proxies never fail
+  a build.
 - `field.bin`: the GPU field program of every part (`sdf_field.py`,
   SDF-DESIGN.md "GPU field programs"): little-endian 32-bit words that the
   app uploads as one Metal buffer and evaluates per pixel. Top bricks are 8
@@ -106,7 +129,14 @@ publishes its outputs, each written to a temporary name and renamed:
   `validatedHash`, `fieldProgram` (`{path: "field.bin", version, words,
   brickSize, margin, buildSeconds, parts: [{solid, status: "field" |
   "meshOnly", reason?, bandBricks?, tapes?, words?, maxInstructions?}]}`, or
-  `{error}` when the kernel could not compile it), `buildSeconds`, `threads`,
+  `{error}` when the kernel could not compile it), `proxy` (`{offset,
+  cellSize, tolerance, buildSeconds, parts: [{solid, status: "proxy",
+  triangles, shell, minimum, maxDeviation, cellSize?} | {solid, status:
+  "none", reason}]}`: δ, the proxy cell and tolerance, and per part its
+  shell, smallest sampled f, the mesher's deviation bound before
+  simplification and a coarsened cell; or `{error}` without a field program
+  or proxy graph),
+  `buildSeconds`, `threads`,
   `runtime` (`{python, numpy, kernel}`), `warnings` and `meshBuffers` (the
   section offsets and value counts of `mesh.bin`). `customFields` lists the
   first 32 `implicit()` shapes (custom fields) as `{solids, line?, bounds,

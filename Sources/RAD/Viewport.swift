@@ -134,6 +134,7 @@ final class CADSceneView: NSView {
     _output.color = float4(\(1 - CADTranslucency.alpha));
     """
     private static let selectionColor = NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1)
+    private static let selectionEmission = NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1)
     private static let edgeInk = NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1)
     private static let hoverColor = selectionColor.blended(withFraction: 0.25, of: .white) ?? selectionColor
     private static let hoverHalo = selectionColor.blended(withFraction: 0.70, of: .white) ?? selectionColor
@@ -219,6 +220,19 @@ final class CADSceneView: NSView {
     private var originalMeshBounds: [Double] = []
     private var meshSources = [SCNGeometrySource]()
     private var solidNodes = [Int: SCNNode]()
+    /// Exact faces of the installed model, and their GPU resources once prepared.
+    private var installedField: CADFieldGeometry?
+    private var fieldResources: CADFieldResources?
+    private var fieldLights = CADFieldLights()
+    /// Exact or display-mesh faces while navigating, from measured GPU times.
+    var navigationPolicy = ViewportNavigationPolicy()
+    private var wheelSettle: Task<Void, Never>?
+    /// Whether the newest published frame drew exact faces where it could.
+    private var publishedExactFaces = true
+    /// Shader diagnostics for measurements (CADFieldFrame.debug).
+    var fieldDebugMode = 0
+    /// The parts drawn with exact faces. Diagnostics and tests read it.
+    var exactSolids: Set<Int> { fieldResources == nil ? [] : Set(installedField?.parts.keys ?? [:].keys) }
     /// Highlight geometry for the unoccluded overlay, created on first use.
     private var meshPositions: (any MTLBuffer)?
     private var partMasks = [Int: CADHighlightBuffers.Mask]()
@@ -257,7 +271,10 @@ final class CADSceneView: NSView {
     private(set) var renderedCameraTransform: simd_float4x4?
     /// Whether the newest completed frame drew the model.
     private(set) var renderedShowsModel = false
-    private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4, showsModel: Bool)] = []
+    /// Whether the newest completed frame drew exact faces.
+    private(set) var renderedExactFaces = false
+    private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4, showsModel: Bool,
+                                             exact: Bool, pixels: Int)] = []
     /// A model replaced by another display ready to install, such as the
     /// design and its 3D printing version, stays on screen in the last
     /// presented frame until the replacement and its highlights are prepared.
@@ -387,6 +404,7 @@ final class CADSceneView: NSView {
     override var isOpaque: Bool { true }
     deinit {
         meshPreparationTask?.cancel()
+        wheelSettle?.cancel()
         renderLoop?.stop()
         if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
     }
@@ -441,6 +459,7 @@ final class CADSceneView: NSView {
                  parent: cameraNode, rotation: SCNVector3(-0.4, 0.35, 0))
         addLight(type: .directional, intensity: 700, color: NSColor(srgbRed: 0.62, green: 0.76, blue: 1, alpha: 1),
                  parent: cameraNode, rotation: SCNVector3(-0.15, -0.85, 0))
+        fieldLights = CADFieldLights.rig(scene: scene, camera: cameraNode)
         rebuildGrid()
         applyCamera()
     }
@@ -619,6 +638,9 @@ final class CADSceneView: NSView {
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         modelNode.geometry = nil
         solidNodes.removeAll()
+        installedField = prepared.field
+        fieldResources = nil
+        let exact = Set(prepared.field?.parts.keys ?? [:].keys)
         for solid in groups.keys.sorted() {
             let geometry = SCNGeometry(sources: [source, normalSource],
                                        elements: [SCNGeometryElement(indices: groups[solid]!, primitiveType: .triangles)])
@@ -631,13 +653,21 @@ final class CADSceneView: NSView {
             geometry.materials = [material]
             let node = SCNNode(geometry: geometry)
             node.name = "solid:\(solid)"
-            node.categoryBitMask = CADViewportCategory.faces
+            // Solids with exact faces keep their display meshes for mesh
+            // frames, hit testing and automatic clipping.
+            let isExact = exact.contains(solid)
+            node.categoryBitMask = isExact ? CADViewportCategory.meshFaces : CADViewportCategory.faces
             modelNode.addChildNode(node)
             solidNodes[solid] = node
             // Translucent passes draw the same shared buffers with their own
             // fixed materials. Children follow the solid's pose and hiding.
             for category in [CADViewportCategory.visibility, CADViewportCategory.revealage] {
-                node.addChildNode(Self.translucentCopy(of: geometry, category: category, visible: mode == .translucent))
+                let copy = Self.translucentCopy(of: geometry, category: category, visible: mode == .translucent)
+                if isExact {
+                    copy.categoryBitMask = category == CADViewportCategory.visibility
+                        ? CADViewportCategory.meshVisibility : CADViewportCategory.meshRevealage
+                }
+                node.addChildNode(copy)
             }
         }
         solidBounds = prepared.solidBounds
@@ -669,6 +699,8 @@ final class CADSceneView: NSView {
         modelNode.geometry = nil
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         solidNodes.removeAll()
+        installedField = nil
+        fieldResources = nil
         edgeNode.geometry = nil
         edgeNode.childNodes.forEach { $0.removeFromParentNode() }
         ownedEdgeSolids.removeAll()
@@ -776,30 +808,45 @@ final class CADSceneView: NSView {
         guard pendingMesh == nil, hasModel else { return }
         let token = UUID()
         resourcePreparationID = token
-        guard preparesRendererResources else {
+        var remaining = 0
+        func finished() {
+            remaining -= 1
+            guard remaining == 0, resourcePreparationID == token else { return }
             isPreparingResources = false
+            // Even if preparation fails, let SceneKit attempt its normal
+            // rendering path rather than leaving the model hidden.
             updateModelVisibility()
-            return
+            requestRedraw()
         }
-        isPreparingResources = true
-        updateModelVisibility()
-        // Upload geometry and prepare the material/light pipelines before the
-        // model is revealed, rather than compiling on the first orbit frame.
-        // The renderer's asynchronous overload performs this work off the UI
-        // thread, on the renderer the render thread draws with. Including the
-        // scene root gives it the complete light setup. Keep the view alive
-        // through completion, then release its final capture on the main
-        // queue even if the containing SwiftUI view has been removed.
-        renderer.prepare([scene.rootNode], completionHandler: { [self] _ in
-            DispatchQueue.main.async {
-                guard self.resourcePreparationID == token else { return }
-                self.isPreparingResources = false
-                // Even if preparation fails, let SceneKit attempt its normal
-                // rendering path rather than leaving the model hidden.
-                self.updateModelVisibility()
-                self.requestRedraw()
+        // Exact faces need their buffers and pipelines on every surface,
+        // including detached capture surfaces, before the model is revealed.
+        if let field = installedField, fieldResources == nil, let device {
+            remaining += 1
+            Task { @MainActor [weak self] in
+                let resources = await field.gpu.resources(for: field, device: device)
+                guard let self, self.installedField?.gpu === field.gpu else { return }
+                self.fieldResources = resources
+                if self.resourcePreparationID == token { finished() }
             }
-        })
+        }
+        if preparesRendererResources {
+            remaining += 1
+            // Upload geometry and prepare the material/light pipelines before the
+            // model is revealed, rather than compiling on the first orbit frame.
+            // The renderer's asynchronous overload performs this work off the UI
+            // thread, on the renderer the render thread draws with. Including the
+            // scene root gives it the complete light setup. Keep the view alive
+            // through completion, then release its final capture on the main
+            // queue even if the containing SwiftUI view has been removed.
+            renderer.prepare([scene.rootNode], completionHandler: { [self] _ in
+                DispatchQueue.main.async {
+                    guard self.resourcePreparationID == token else { return }
+                    finished()
+                }
+            })
+        }
+        isPreparingResources = remaining > 0
+        updateModelVisibility()
     }
 
     private func updateModelVisibility() {
@@ -860,11 +907,28 @@ final class CADSceneView: NSView {
     }
 
     /// Highlight geometry and parameters for one frame of `width`×`height`
-    /// pixels. Captures call this with their own output size.
-    func makeFrame(width: Int, height: Int) -> CADViewportFrame {
+    /// pixels. Captures call this with their own output size and always
+    /// draw exact faces; `exact` false draws every solid's display mesh.
+    func makeFrame(width: Int, height: Int, exact: Bool = true) -> CADViewportFrame {
         var frame = CADViewportFrame(width: width, height: height, referenceHeight: Double(bounds.height),
                                      translucent: mode == .translucent, palette: Self.highlightPalette)
         guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
+        if exact, mode != .wireframe, let resources = fieldResources {
+            var instances: [CADFieldInstance] = []
+            for solid in resources.parts.keys.sorted() where !hiddenSolids.contains(solid) {
+                let selected = selectedSolids.contains(solid)
+                let color = selected ? Self.selectionColor
+                    : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
+                let albedo = CADHighlightPalette.linear(color), glow = CADHighlightPalette.linear(Self.selectionEmission)
+                instances.append(CADFieldInstance(
+                    solid: solid, model: ViewportRigidTransform.sceneMatrix(solidMatrices[solid] ?? matrix_identity_double4x4),
+                    albedo: SIMD3(albedo.x, albedo.y, albedo.z),
+                    emission: selected ? SIMD3(glow.x, glow.y, glow.z) : .zero))
+            }
+            let visible = solidNodes.keys.filter { !hiddenSolids.contains($0) }.count
+            frame.field = CADFieldFrame(resources: resources, instances: instances, lights: fieldLights,
+                                        complete: instances.count == visible, debug: fieldDebugMode)
+        }
         let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
         let pixels = SIMD2(Double(width), Double(height))
         var area: CADSilhouetteBatching.Rect?
@@ -892,7 +956,9 @@ final class CADSceneView: NSView {
         for solid in selectedSolids.sorted() where !hiddenSolids.contains(solid) {
             guard let mask = partMask(solid) else { continue }
             let transform = model(solid)
-            masks.append(.init(buffer: mask, selected: true, model: transform))
+            var item = CADViewportFrame.Mask(buffer: mask, selected: true, model: transform)
+            if let field = frame.field, field.resources.parts[solid] != nil { item.field = (field.resources, solid) }
+            masks.append(item)
             rectangles.append(project(solidBounds[solid] ?? originalMeshBounds, transform))
         }
         // Disjoint masks share one projection and contour pass; overlapping
@@ -906,6 +972,15 @@ final class CADSceneView: NSView {
         return frame
     }
 
+    /// This view's own scene, not a copy, rendered offscreen in its current
+    /// state through the viewport's passes. Tests use it to check the live
+    /// scene's own nodes and delegates.
+    func imageOfLiveScene(width: Int, height: Int) throws -> CGImage {
+        sceneSource.synchronizeCameras()
+        SCNTransaction.flush()
+        return try CADViewportCapture.image(of: makeFrame(width: width, height: height), source: sceneSource)
+    }
+
     private func installEdges(_ prepared: CADViewportPreparedMesh) {
         edgeNode.geometry = nil
         edgeNode.childNodes.forEach { $0.removeFromParentNode() }
@@ -915,6 +990,11 @@ final class CADSceneView: NSView {
             let node = SCNNode(geometry: CADStrokeGeometry.make(prepared.edges[solid]!, color: Self.edgeInk,
                 viewportHeight: bounds.height))
             node.name = solid < 0 ? "legacy-edges" : "edges:\(solid)"
+            // Strokes of exact faces may lie this far behind them (1.5 times
+            // the display mesh's deviation bound, which covers chord sagitta).
+            if let part = prepared.field?.parts[solid], let geometry = node.geometry {
+                CADStrokeGeometry.setDepthAllowance(1.5 * part.deviation, on: geometry)
+            }
             node.categoryBitMask = CADViewportCategory.decorations
             node.renderingOrder = 1
             node.geometry?.firstMaterial?.writesToDepthBuffer = false
@@ -975,7 +1055,7 @@ final class CADSceneView: NSView {
                 ? selectionColor
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
             node.geometry?.firstMaterial?.emission.contents = selected && mode != .wireframe
-                ? NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1) : NSColor.black
+                ? Self.selectionEmission : NSColor.black
         }
         return true
     }
@@ -1111,6 +1191,7 @@ final class CADSceneView: NSView {
         let transition = CameraTransition(from: rig, to: destination)
         let token = UUID()
         cameraTransitionID = token
+        beginNavigation(.transition)
         cameraTransitionTask = Task { @MainActor [weak self] in
             let started = ProcessInfo.processInfo.systemUptime
             while !Task.isCancelled {
@@ -1134,6 +1215,7 @@ final class CADSceneView: NSView {
         if progress >= 1 {
             cameraTransitionID = nil
             cameraTransitionTask = nil
+            endNavigation(.transition)
             return false
         }
         return true
@@ -1144,6 +1226,44 @@ final class CADSceneView: NSView {
         cameraTransitionID = nil
         cameraTransitionTask?.cancel()
         cameraTransitionTask = nil
+        endNavigation(.transition)
+    }
+
+    // MARK: Navigation and exact faces
+
+    /// Direct navigation of a heavy design draws display meshes until it ends.
+    private func beginNavigation(_ source: ViewportNavigationPolicy.Source) {
+        navigationPolicy.begin(source)
+    }
+
+    /// Ending navigation publishes an exact frame when the last one was not.
+    private func endNavigation(_ source: ViewportNavigationPolicy.Source) {
+        if navigationPolicy.end(source), !publishedExactFaces { requestRedraw() }
+    }
+
+    /// Wheel scrolling reports no end: one deferred publish follows its last event.
+    private func settleWheelNavigation() {
+        beginNavigation(.wheel)
+        wheelSettle?.cancel()
+        wheelSettle = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: ViewportNavigationPolicy.wheelSettle)
+            guard !Task.isCancelled, let self else { return }
+            self.wheelSettle = nil
+            self.endNavigation(.wheel)
+        }
+    }
+
+    /// Trackpad scrolling and magnification report their phases.
+    private func trackGesturePhase(_ event: NSEvent, source: ViewportNavigationPolicy.Source) {
+        let phase = event.phase, momentum = event.momentumPhase
+        if phase.isEmpty && momentum.isEmpty {
+            settleWheelNavigation()
+        } else if phase.contains(.ended) || phase.contains(.cancelled) || momentum.contains(.ended)
+                    || momentum.contains(.cancelled) {
+            endNavigation(source)
+        } else {
+            beginNavigation(source)
+        }
     }
 
     /// Used only by an independent offscreen tool view. The live viewport's
@@ -1262,30 +1382,41 @@ final class CADSceneView: NSView {
         let size = convertToBacking(bounds).size
         let width = Int(size.width.rounded()), height = Int(size.height.rounded())
         guard width > 0, height > 0 else { return }
+        // Pass cameras follow the design camera however it was changed.
+        sceneSource.synchronizeCameras()
         // Commit this turn's implicit scene changes before the render thread
         // reads the scene, so the frame shows all of them together.
         SCNTransaction.flush()
         publishedGeneration &+= 1
-        publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform, !modelNode.isHidden))
+        let interval = 1 / Double(max(window?.screen?.maximumFramesPerSecond ?? 60, 1))
+        let frame = makeFrame(width: width, height: height,
+                              exact: navigationPolicy.drawsExactFaces(pixels: width * height, interval: interval))
+        let exact = frame.field != nil
+        publishedExactFaces = exact || frame.width == 0 || fieldResources == nil || mode == .wireframe
+        publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform, !modelNode.isHidden,
+                                          exact, width * height))
         if publishedCameraTransforms.count > 16 { publishedCameraTransforms.removeFirst() }
-        loop.submit(.init(frame: makeFrame(width: width, height: height), source: sceneSource,
-                          generation: publishedGeneration))
+        loop.submit(.init(frame: frame, source: sceneSource, generation: publishedGeneration))
     }
 
     private func startRenderLoop() -> ViewportRenderLoop? {
         guard renderLoop == nil, let layer = layer as? CAMetalLayer else { return renderLoop }
-        renderLoop = ViewportRenderLoop(layer: layer, renderer: renderer) { [weak self] generation in
-            MainActor.assumeIsolated { self?.frameCompleted(generation) }
+        renderLoop = ViewportRenderLoop(layer: layer, renderer: renderer) { [weak self] generation, seconds in
+            MainActor.assumeIsolated { self?.frameCompleted(generation, gpuSeconds: seconds) }
         }
         return renderLoop
     }
 
-    private func frameCompleted(_ generation: UInt64) {
+    private func frameCompleted(_ generation: UInt64, gpuSeconds: Double) {
         renderedFrameCount += 1
         renderedGeneration = max(renderedGeneration, generation)
         if let published = publishedCameraTransforms.last(where: { $0.generation == generation }) {
             renderedCameraTransform = published.transform
             renderedShowsModel = published.showsModel
+            renderedExactFaces = published.exact
+            if published.showsModel, fieldResources != nil {
+                navigationPolicy.record(exact: published.exact, gpuSeconds: gpuSeconds, pixels: published.pixels)
+            }
         }
         publishedCameraTransforms.removeAll { $0.generation <= generation }
         onFrameRendered?()
@@ -1592,6 +1723,7 @@ final class CADSceneView: NSView {
         if !gesture.isDragging {
             guard hypot(point.x - gesture.start.x, point.y - gesture.start.y) >= 3 else { return }
             gesture.isDragging = true
+            beginNavigation(.drag)
             NSCursor.closedHand.set()
         }
         // Some mouse/remote input paths report zero NSEvent deltas even as
@@ -1615,12 +1747,14 @@ final class CADSceneView: NSView {
         window?.makeFirstResponder(self)
         setHoveredPoint(nil)
         otherDragPoint = convert(event.locationInWindow, from: nil)
+        beginNavigation(.pan)
         NSCursor.closedHand.set()
     }
     override func otherMouseUp(with event: NSEvent) {
         guard !commandGrabGesture else { return }
         trackPointer(with: event)
         otherDragPoint = nil
+        endNavigation(.pan)
         updatePointerCursor()
     }
     override func otherMouseDragged(with event: NSEvent) {
@@ -1680,6 +1814,8 @@ final class CADSceneView: NSView {
     private func resetNavigationGesture() {
         rightGesture = nil
         otherDragPoint = nil
+        endNavigation(.drag)
+        endNavigation(.pan)
         updatePointerCursor()
     }
 
@@ -1809,7 +1945,7 @@ final class CADSceneView: NSView {
         let search = hiddenSolids.isEmpty ? SCNHitTestSearchMode.closest : .all
         // The deprecated sortResults option overrides nearest-hit ordering,
         // even with searchMode.closest, and can return a farther solid first.
-        return hitTest(point, options: [.categoryBitMask: CADViewportCategory.faces, .ignoreHiddenNodes: false,
+        return hitTest(point, options: [.categoryBitMask: CADViewportCategory.pickable, .ignoreHiddenNodes: false,
                                  .searchMode: search.rawValue])
             .first { hit in
                 guard let solid = solidIndex(of: hit.node) else { return false }
@@ -1884,6 +2020,7 @@ final class CADSceneView: NSView {
     override func scrollWheel(with event: NSEvent) {
         cancelAssemblyGrab()
         cancelCameraTransition()
+        trackGesturePhase(event, source: .scroll)
         let point = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.shift) {
             rig.pan(dx: event.scrollingDeltaX, dy: event.scrollingDeltaY, height: bounds.height)
@@ -1897,6 +2034,7 @@ final class CADSceneView: NSView {
     override func magnify(with event: NSEvent) {
         cancelAssemblyGrab()
         cancelCameraTransition()
+        trackGesturePhase(event, source: .magnify)
         let point = convert(event.locationInWindow, from: nil)
         if event.phase == .began || zoomAnchor == nil { zoomAnchor = anchor(at: point) }
         rig.zoom(factor: exp(-event.magnification), anchor: zoomAnchor!)

@@ -896,6 +896,9 @@ final class EngineService {
             } catch {
                 EngineService.log.error("Ignoring the build's field program: \(error.localizedDescription, privacy: .public)")
             }
+            // Proxies are validated with the display buffers before drawing;
+            // without them every part draws its display mesh.
+            result.proxy = try? CADFieldProxyManifest.manifest(in: data)
             artifacts.discardAll(except: ["model.rsdf"])
             return result
         }
