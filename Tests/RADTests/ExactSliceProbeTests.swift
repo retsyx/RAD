@@ -385,6 +385,26 @@ final class Probe: @unchecked Sendable {
             }
             if result.count == 1 { result[0].whole = true }
             return result
+        case "strips":
+            let k = Int(spec[1])!
+            var plan = CADSlicePlan(width: width, height: height, rects: job.draws.map(\.rect))
+            let budget = plan.budget(slices: k)
+            var result: [CADSlicePlan.Slice] = []
+            while let slice = plan.next(budget: budget) { result.append(slice) }
+            if result.count == 1 { result[0].whole = true }
+            return result
+        case "halves":
+            // K strips of the live plan, each split into its left and right halves (two slices).
+            let k = Int(spec[1])!
+            var plan = CADSlicePlan(width: width, height: height, rects: job.draws.map(\.rect))
+            var result: [CADSlicePlan.Slice] = []
+            let half = Int32(width / 2), budget = plan.budget(slices: k)
+            while let slice = plan.next(budget: budget) {
+                let r = slice.rects[0]
+                result.append(CADSlicePlan.Slice(rects: [SIMD4(r.x, r.y, max(r.x, min(r.z, half)), r.w)], covered: 1))
+                result.append(CADSlicePlan.Slice(rects: [SIMD4(min(r.z, max(r.x, half)), r.y, r.z, r.w)], covered: 1))
+            }
+            return result
         case "bands":
             // Full-width bands of B rows, band j in slice j mod K (only the reached x-range).
             let k = Int(spec[1])!, band = Int(spec[2])!

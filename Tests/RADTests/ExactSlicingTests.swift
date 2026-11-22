@@ -93,8 +93,8 @@ final class ExactSlicingTests: XCTestCase {
         }
     }
 
-    /// Slices plan with a running average of measured costs (a dense strip
-    /// does not make every later slice small); whether a frame draws its
+    /// Slices plan with an average of recent measured costs weighed by their
+    /// pixels (a dense strip does not make every later slice small); whether a frame draws its
     /// geometry itself uses the largest cost of frames drawn at once. Budgets
     /// split the remaining bands evenly, so no small remainder pays a pass.
     func testSliceBudgetsAverageMeasuredCostsAndSplitEvenly() {
@@ -107,11 +107,13 @@ final class ExactSlicingTests: XCTestCase {
         cost.recordSlice(opaque, seconds: 0.010, covered: 10_000)
         XCTAssertTrue(cost.hasSliceRate(opaque))
         XCTAssertEqual(cost.sliceRate(opaque), 1e-6, accuracy: 1e-12)
-        cost.recordSlice(opaque, seconds: 0.030, covered: 10_000)
-        XCTAssertEqual(cost.sliceRate(opaque), 2e-6, accuracy: 1e-12, "a running average")
+        cost.recordSlice(opaque, seconds: 0.090, covered: 30_000)
+        let decay = CADExactCost.decay
+        let average = (0.010 * decay + 0.090) / (10_000 * decay + 30_000)
+        XCTAssertEqual(cost.sliceRate(opaque), average, accuracy: 1e-12, "recent slices, weighed by their pixels")
         cost.recordSlice(opaque, seconds: 1, covered: CADExactCost.minimumCovered - 1)
-        XCTAssertEqual(cost.sliceRate(opaque), 2e-6, accuracy: 1e-12, "tiny slices do not measure")
-        XCTAssertEqual(cost.frameRate(opaque), 2e-6, accuracy: 1e-12, "slices stand in for unmeasured frames")
+        XCTAssertEqual(cost.sliceRate(opaque), average, accuracy: 1e-12, "tiny slices do not measure")
+        XCTAssertEqual(cost.frameRate(opaque), average, accuracy: 1e-12, "slices stand in for unmeasured frames")
         cost.recordFrame(opaque, seconds: 0.004, covered: 1_000)
         cost.recordFrame(opaque, seconds: 0.001, covered: 1_000)
         XCTAssertEqual(cost.frameRate(opaque), 4e-6, accuracy: 1e-12, "the largest frame")

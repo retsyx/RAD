@@ -392,7 +392,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// GPU seconds of one exact slice. A newer frame waits for the tiles in
     /// flight, not for the slice; a slice bounds the work committed when a
     /// newer view abandons the job.
-    static let sliceBudget = 0.05
+    static let sliceBudget = 0.064
     /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
     nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
 

@@ -6,7 +6,10 @@ import XCTest
 /// Measurement tool (RAD_NAV_SCENARIO): replays orbit, hover and zoom input in
 /// a live viewport window and records each frame's and exact slice's timeline.
 /// The scenario JSON names `designs` (build specs), `output`, window `sizes`
-/// in points, display `modes` and `phases`.
+/// in points, display `modes` and `phases`. Phases "resume-<ms>" orbit,
+/// release, wait that long and orbit again, so the second orbit starts while
+/// the first one's exact slices run; "resume-cold-<ms>" first forgets the
+/// design's measured costs, like the first view after loading.
 @MainActor
 final class NavigationPacingScenarioTests: XCTestCase {
     struct Scenario: Decodable {
@@ -210,6 +213,27 @@ final class NavigationPacingScenarioTests: XCTestCase {
                     navigationEnd = CACurrentMediaTime()
                     if direction > 0 { try await Task.sleep(for: .milliseconds(200)) }
                 }
+            case let name where name.hasPrefix("resume-"):
+                let delay = Double(name.split(separator: "-").last.map(String.init) ?? "0") ?? 0
+                if name.hasPrefix("resume-cold-"),
+                   let resources = view.makeFrame(width: 8, height: 8).field.map({ ObjectIdentifier($0.resources) }) {
+                    CADExactCost.shared.forget(resources)
+                }
+                func orbit(_ count: Int, direction: Double) async throws {
+                    timed { view.rightMouseDown(with: mouse(.rightMouseDown, center)) }
+                    let start = CACurrentMediaTime()
+                    for i in 0..<count {
+                        let p = NSPoint(x: center.x + direction * Double(i) * 4, y: center.y + Double(i) * 0.7)
+                        timed { view.rightMouseDragged(with: mouse(.rightMouseDragged, p)) }
+                        try await pace(i, start, 120)
+                    }
+                    timed { view.rightMouseUp(with: mouse(.rightMouseUp, center)) }
+                }
+                try await orbit(36, direction: 1)
+                if delay > 0 { try await Task.sleep(for: .microseconds(Int(delay * 1000))) }
+                navigationStart = CACurrentMediaTime()
+                try await orbit(30, direction: -1)
+                navigationEnd = CACurrentMediaTime()
             default: continue
             }
             try await Task.sleep(for: .milliseconds(400))

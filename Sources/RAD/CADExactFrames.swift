@@ -208,9 +208,9 @@ struct CADSlicePlan: Sendable {
 }
 
 /// Measured exact costs, kept per field resources, frame size and display
-/// mode: GPU seconds per estimated covered pixel, as a running average of
-/// slices (slices plan with it) and as the largest of complete frames drawn
-/// at once (whether one frame can draw the geometry).
+/// mode: GPU seconds per estimated covered pixel, averaged over recent slices
+/// by their covered pixels (slices plan with it), and the largest of complete
+/// frames drawn at once (whether one frame can draw the geometry).
 final class CADExactCost: @unchecked Sendable {
     struct Key: Hashable, Sendable {
         var resources: ObjectIdentifier
@@ -225,8 +225,8 @@ final class CADExactCost: @unchecked Sendable {
     static let defaultTranslucentRate = 3e-6
     /// Slices covering fewer pixels do not change the rate.
     static let minimumCovered = 4_096
-    /// The weight of a new slice in the running average.
-    static let averaging = 0.5
+    /// Each slice's measurement weighs this much less after the next one.
+    static let decay = 0.7
 
     /// A slice the GPU fails, or one slower than this, is a strike against
     /// exact faces of its design in that display mode; three end them for the
@@ -242,7 +242,8 @@ final class CADExactCost: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var slices: [Key: Double] = [:]
+    /// Decayed sums of slices' GPU seconds and covered pixels.
+    private var slices: [Key: (seconds: Double, covered: Double)] = [:]
     private var frames: [Key: Double] = [:]
     private var failures = Set<Failure>()
     private var strikes: [Failure: Int] = [:]
@@ -270,12 +271,16 @@ final class CADExactCost: @unchecked Sendable {
         key.translucent ? defaultTranslucentRate : defaultOpaqueRate
     }
 
+    private func averageRate(_ key: Key) -> Double? {
+        slices[key].map { $0.seconds / $0.covered }
+    }
+
     func sliceRate(_ key: Key) -> Double {
-        max(Self.smallestRate, lock.withLock { slices[key] } ?? Self.initial(key))
+        max(Self.smallestRate, lock.withLock { averageRate(key) } ?? Self.initial(key))
     }
 
     func frameRate(_ key: Key) -> Double {
-        max(Self.smallestRate, lock.withLock { frames[key] ?? slices[key] } ?? Self.initial(key))
+        max(Self.smallestRate, lock.withLock { frames[key] ?? averageRate(key) } ?? Self.initial(key))
     }
 
     /// Measured before: plans of unmeasured geometry start with a small slice.
@@ -283,9 +288,9 @@ final class CADExactCost: @unchecked Sendable {
 
     func recordSlice(_ key: Key, seconds: Double, covered: Int) {
         guard covered >= Self.minimumCovered, seconds.isFinite, seconds > 0 else { return }
-        let rate = seconds / Double(covered)
         lock.withLock {
-            slices[key] = slices[key].map { $0 + Self.averaging * (rate - $0) } ?? rate
+            let sums = slices[key] ?? (seconds: 0, covered: 0)
+            slices[key] = (seconds: sums.seconds * Self.decay + seconds, covered: sums.covered * Self.decay + Double(covered))
         }
     }
 
