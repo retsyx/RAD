@@ -395,25 +395,25 @@ final class CADViewportPasses: @unchecked Sendable {
     /// idle. So a job's slices start small, when navigation is likeliest to
     /// resume, and grow: each may take twice its predecessor's time (from
     /// `firstSliceBudget` up to `sliceBudget`) and hold twice its blocks
-    /// (from `firstSliceBlocks`), whatever the cost estimate says. A design
-    /// whose small slices already outlast several frames
-    /// (`CADExactCost.isFloorBound`) keeps small slices: larger ones would
-    /// only add slow tiles in flight beside a newer frame, and tiles slowed
-    /// that much can fail as GPU hangs.
+    /// (from `firstSliceBlocks`), whatever the cost estimate says. A design's
+    /// first job keeps small slices over every region, and a design whose
+    /// small slices outlast several frames (`CADExactCost.isFloorBound`) keeps
+    /// them for good: larger ones would only add slow tiles in flight beside
+    /// a newer frame, and tiles slowed that much can fail as GPU hangs.
     static let firstSliceBudget = 0.004
     static let sliceBudget = 0.064
     static let firstSliceBlocks = 2
 
     /// GPU seconds and blocks of a design's next slice after `slices`
-    /// earlier ones of its job.
-    static func sliceLimits(after slices: Int, floorBound: Bool) -> (seconds: Double, blocks: Int) {
-        if floorBound { return (firstSliceBudget, CADExactCost.floorSliceBlocks) }
+    /// earlier ones of its job; `small` keeps small slices.
+    static func sliceLimits(after slices: Int, small: Bool) -> (seconds: Double, blocks: Int) {
+        if small { return (firstSliceBudget, CADExactCost.floorSliceBlocks) }
         let doublings = min(max(0, slices), 24)
         return (min(sliceBudget, firstSliceBudget * Double(1 << min(doublings, 16))), firstSliceBlocks << doublings)
     }
 
     static func sliceLimits(_ job: CADExactJob) -> (seconds: Double, blocks: Int) {
-        sliceLimits(after: job.encoded, floorBound: CADExactCost.shared.isFloorBound(job.costKey))
+        sliceLimits(after: job.encoded, small: !CADExactCost.shared.isProven(job.costKey))
     }
 
     /// Outline coverage slices: budgets double from the first, by count.

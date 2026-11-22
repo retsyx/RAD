@@ -187,7 +187,7 @@ struct CADFieldFrame: @unchecked Sendable {
     /// translucent transmittance derives from the accumulated alpha.
     var complete = false
     /// Shader diagnostics (0 off; 1 march steps, 2 normals, 3 sample-traced
-    /// pixels, 4 no multisample tracing).
+    /// pixels, 4 no multisample tracing, 5 field samples / 1024).
     var debug: Int = 0
 }
 

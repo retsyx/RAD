@@ -193,6 +193,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 owner.completed += 1
                 owner.gpuSeconds += seconds
                 CADExactCost.shared.recordSlice(owner.costKey, seconds: seconds, covered: covered, blocks: blocks)
+                if owner.isComplete { CADExactCost.shared.recordCompletedJob(owner.costKey) }
                 if owner === job, owner.isComplete {
                     // Only whole frames measure what one frame can draw at once.
                     if owner.encoded == 1 {

@@ -118,6 +118,8 @@ final class CADViewportCapture: @unchecked Sendable {
                     .map { ($0.covered, $0.blocks) }
             }
             job.completed = job.encoded
+            settle(keeping: 0)
+            if !slow { CADExactCost.shared.recordCompletedJob(job.costKey) }
             passes.prepareMasks(job, frame: frame)
             // Outline coverage marches far fewer pixels: its slices do not measure.
             var masks = 0

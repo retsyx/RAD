@@ -265,10 +265,11 @@ final class CADExactCost: @unchecked Sendable {
     /// A slice of at most this many blocks (two to four tiles per core) that
     /// takes longer than `floorSeconds` shows that the design's slowest tiles
     /// outlast several frames: its slices stay small
-    /// (`CADViewportPasses.sliceLimits`).
+    /// (`CADViewportPasses.sliceLimits`). Until a job completes, small
+    /// slices cover every region, so the first job finds them.
     static let smallSliceBlocks = 16
     static let floorSeconds = 0.048
-    /// Blocks of the small slices of such designs.
+    /// Blocks of the small slices of such designs and of first jobs.
     static let floorSliceBlocks = 4
 
     /// A slice the GPU fails, or one slower than this, is a strike against
@@ -291,6 +292,7 @@ final class CADExactCost: @unchecked Sendable {
     private var failures = Set<Failure>()
     private var strikes: [Failure: Int] = [:]
     private var floorBound = Set<Key>()
+    private var proven = Set<Key>()
 
     /// Records a failed or far too slow slice; returns whether exact faces of
     /// the design in this mode have now failed.
@@ -333,6 +335,14 @@ final class CADExactCost: @unchecked Sendable {
     /// Whether the design's slowest tiles outlast small slices' budgets.
     func isFloorBound(_ key: Key) -> Bool { lock.withLock { floorBound.contains(key) } }
 
+    /// Whether a job of the design completed its slices without finding it
+    /// floor-bound, so later jobs may grow their slices.
+    func isProven(_ key: Key) -> Bool { lock.withLock { proven.contains(key) && !floorBound.contains(key) } }
+
+    func recordCompletedJob(_ key: Key) {
+        _ = lock.withLock { proven.insert(key) }
+    }
+
     func recordSlice(_ key: Key, seconds: Double, covered: Int, blocks: Int = .max) {
         if seconds.isFinite, seconds > Self.floorSeconds, blocks <= Self.smallSliceBlocks {
             _ = lock.withLock { floorBound.insert(key) }
@@ -358,6 +368,7 @@ final class CADExactCost: @unchecked Sendable {
             failures = failures.filter { $0.resources != resources }
             strikes = strikes.filter { $0.key.resources != resources }
             floorBound = floorBound.filter { $0.resources != resources }
+            proven = proven.filter { $0.resources != resources }
         }
     }
 }

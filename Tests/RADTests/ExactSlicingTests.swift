@@ -99,13 +99,14 @@ final class ExactSlicingTests: XCTestCase {
 
     /// A job's slices start at the first budget and two blocks; budgets
     /// double up to the cap and so do block counts, so a cost estimate that
-    /// is too low cannot make an early slice large. Designs whose small
-    /// slices outlast several frames keep small slices; a small slice slower
-    /// than the floor threshold marks its design.
+    /// is too low cannot make an early slice large. A design's first job,
+    /// and every job of a design whose small slices outlast several frames,
+    /// keeps small slices; a small slice slower than the floor threshold
+    /// marks its design.
     func testSliceLimitsStartSmallAndGrow() {
         typealias Passes = CADViewportPasses
         let first = Passes.firstSliceBudget, cap = Passes.sliceBudget
-        let limits = (0..<30).map { Passes.sliceLimits(after: $0, floorBound: false) }
+        let limits = (0..<30).map { Passes.sliceLimits(after: $0, small: false) }
         XCTAssertEqual(limits[0].seconds, first)
         XCTAssertEqual(limits[1].seconds, 2 * first)
         XCTAssertEqual(limits[2].seconds, 4 * first)
@@ -114,7 +115,7 @@ final class ExactSlicingTests: XCTestCase {
         XCTAssertEqual(limits.prefix(4).map(\.blocks), [2, 4, 8, 16])
         XCTAssertGreaterThan(limits[29].blocks, 1_000_000)
         for slices in [0, 5, 100] {
-            let bound = Passes.sliceLimits(after: slices, floorBound: true)
+            let bound = Passes.sliceLimits(after: slices, small: true)
             XCTAssertEqual(bound.seconds, first)
             XCTAssertEqual(bound.blocks, CADExactCost.floorSliceBlocks)
         }
@@ -134,17 +135,22 @@ final class ExactSlicingTests: XCTestCase {
         XCTAssertFalse(cost.isFloorBound(key), "a large slice may take long")
         cost.recordSlice(key, seconds: CADExactCost.floorSeconds / 2, covered: 100_000, blocks: 1)
         XCTAssertFalse(cost.isFloorBound(key))
+        XCTAssertFalse(cost.isProven(key), "a first job keeps small slices")
+        cost.recordCompletedJob(key)
+        XCTAssertTrue(cost.isProven(key), "later jobs grow them")
         cost.recordSlice(key, seconds: 2 * CADExactCost.floorSeconds, covered: 100, blocks: CADExactCost.smallSliceBlocks)
         XCTAssertTrue(cost.isFloorBound(key), "a small slice that outlasts several frames")
+        XCTAssertFalse(cost.isProven(key), "floor-bound designs keep small slices")
         cost.forget(ObjectIdentifier(Self.self))
         XCTAssertFalse(cost.isFloorBound(key))
+        XCTAssertFalse(cost.isProven(key))
     }
 
     /// Slices plan with an average of recent measured costs weighed by their
     /// pixels (a dense strip does not make every later slice small); whether a frame draws its
     /// geometry itself uses the largest cost of frames drawn at once. A last
     /// slice takes up to 1.25 budgets, so no small remainder pays a pass.
-    func testSliceBudgetsAverageMeasuredCostsAndSplitEvenly() {
+    func testSliceRatesAverageRecentSlicesAndLastSlicesTakeTheRest() {
         let cost = CADExactCost()
         let opaque = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: false)
         let translucent = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: true)
