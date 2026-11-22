@@ -7,7 +7,7 @@
 namespace rsdf {
 namespace {
 
-constexpr size_t kChunk = 4096;
+constexpr size_t kChunk = 512;  // small, so passes over few points of a costly field use every core
 constexpr double kMinimumSlope = 0.25;  // |grad f| floor when estimating distances from |f|
 static const double kTetra[4][3] = {{1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {1, 1, 1}};
 

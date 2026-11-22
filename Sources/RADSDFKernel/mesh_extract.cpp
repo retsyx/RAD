@@ -41,8 +41,11 @@ constexpr int kAxisBits = 20;
 constexpr uint64_t kAxisMask = (uint64_t(1) << kAxisBits) - 1;
 constexpr int kMaxRepairPasses = 64;
 constexpr double kHalfDiagonal = 0.8660254037844386;  // sqrt(3) / 2
-constexpr size_t kChunk = 8192;
-constexpr size_t kLeafChunk = 2048;
+// Work goes to the threads in chunks small enough that a pass over a few
+// thousand leaves of a costly field (microseconds per evaluation) still
+// spreads over every core; results never depend on the chunking.
+constexpr size_t kChunk = 1024;
+constexpr size_t kLeafChunk = 256;
 constexpr int kSlots = 48;
 constexpr uint8_t kNoComponent = 0xff;
 // Grid planes lie at (phi + k / 2^l) h for level l, phi = 2 - golden ratio:
