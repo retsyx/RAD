@@ -86,7 +86,9 @@ final class CADViewportCapture: @unchecked Sendable {
                     buffer.waitUntilCompleted()
                     let seconds = buffer.gpuEndTime - max(buffer.gpuStartTime, gpuEnd)
                     gpuEnd = max(gpuEnd, buffer.gpuEndTime)
-                    if buffer.status != .completed || seconds > CADExactCost.failingSliceSeconds { slow = true }
+                    if buffer.status != .completed || seconds > CADExactCost.failingSliceSeconds {
+                        if CADExactCost.shared.recordStrike(job.costKey) || buffer.status != .completed { slow = true }
+                    }
                     waited += 1
                 }
             }
@@ -109,7 +111,6 @@ final class CADViewportCapture: @unchecked Sendable {
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
             settle(keeping: 0)
             if slow {
-                CADExactCost.shared.recordFailure(job.costKey)
                 var meshes = frame
                 meshes.field = nil
                 meshes.key = nil
@@ -130,8 +131,8 @@ final class CADViewportCapture: @unchecked Sendable {
         }
         committed.last?.waitUntilCompleted()
         if let costKey, committed.contains(where: { $0.status != .completed }) {
-            // Exact layers the GPU could not draw: display meshes from now on.
-            CADExactCost.shared.recordFailure(costKey)
+            // Exact layers the GPU could not draw: display meshes instead.
+            CADExactCost.shared.recordStrike(costKey)
             var meshes = frame
             meshes.field = nil
             meshes.key = nil

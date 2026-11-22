@@ -133,7 +133,9 @@ final class CADExactTargets: @unchecked Sendable {
 struct CADSlicePlan: Sendable {
     static let block = 256
     static let translucentBlock = 64
-    static let smallestBlock = 64
+    /// Opaque blocks halve no further: smaller ones make the exact image
+    /// several times slower to complete.
+    static let smallestBlock = 128
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
@@ -247,10 +249,12 @@ final class CADExactCost: @unchecked Sendable {
     /// Slices covering fewer pixels do not change the rate.
     static let minimumCovered = 4_096
 
-    /// A slice slower than this, or one the GPU fails, ends exact faces of
-    /// its design in that display mode for the session: such geometry would
-    /// stall or reset the GPU on every view.
+    /// A slice slower than this, or one the GPU fails, is a strike against
+    /// exact faces of its design in that display mode; three end them for the
+    /// session: such geometry would stall or reset the GPU on every view,
+    /// while another process's stall or GPU reset strikes only once.
     static let failingSliceSeconds = 0.25
+    static let strikesToFail = 3
 
     struct Failure: Hashable, Sendable {
         var resources: ObjectIdentifier
@@ -261,11 +265,13 @@ final class CADExactCost: @unchecked Sendable {
     private var slices: [Key: Double] = [:]
     private var frames: [Key: Double] = [:]
     private var failures = Set<Failure>()
+    private var strikes: [Failure: Int] = [:]
     /// Block side and the largest measured GPU seconds of one such block.
     private var blocks: [Key: (side: Int, seconds: Double)] = [:]
 
-    /// The block side of new slice plans: halved, down to the smallest
-    /// block, once a measured block takes more than eight slice budgets.
+    /// The block side of new slice plans: opaque blocks halve, down to the
+    /// smallest block, once a measured block takes more than eight slice
+    /// budgets.
     func blockSide(_ key: Key) -> Int {
         lock.withLock { blocks[key]?.side } ?? (key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block)
     }
@@ -283,15 +289,23 @@ final class CADExactCost: @unchecked Sendable {
             var entry = blocks[key] ?? (side: key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block, seconds: 0)
             guard entry.side == side else { return }
             entry.seconds = max(entry.seconds, perBlock)
-            if entry.seconds > 8 * CADViewportPasses.sliceBudget, entry.side > CADSlicePlan.smallestBlock {
+            if entry.seconds > 8 * CADViewportPasses.sliceBudget, !key.translucent, entry.side > CADSlicePlan.smallestBlock {
                 entry = (side: entry.side / 2, seconds: 0)
             }
             blocks[key] = entry
         }
     }
 
-    func recordFailure(_ key: Key) {
-        lock.withLock { _ = failures.insert(Failure(resources: key.resources, translucent: key.translucent)) }
+    /// Records a failed or far too slow slice; returns whether exact faces of
+    /// the design in this mode have now failed.
+    @discardableResult
+    func recordStrike(_ key: Key) -> Bool {
+        let failure = Failure(resources: key.resources, translucent: key.translucent)
+        return lock.withLock {
+            strikes[failure, default: 0] += 1
+            if strikes[failure, default: 0] >= Self.strikesToFail { failures.insert(failure) }
+            return failures.contains(failure)
+        }
     }
 
     func hasFailed(resources: ObjectIdentifier, translucent: Bool) -> Bool {
@@ -328,6 +342,7 @@ final class CADExactCost: @unchecked Sendable {
             slices = slices.filter { $0.key.resources != resources }
             frames = frames.filter { $0.key.resources != resources }
             failures = failures.filter { $0.resources != resources }
+            strikes = strikes.filter { $0.key.resources != resources }
             blocks = blocks.filter { $0.key.resources != resources }
         }
     }

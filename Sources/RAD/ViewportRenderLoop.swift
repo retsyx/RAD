@@ -58,7 +58,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
         case slice(CADExactJob, seconds: Double, covered: Int, blocks: Int)
         case mask(CADExactJob, CADMaskCoverage)
         /// The GPU failed a slice or took far too long for it.
-        case failed(CADExactJob)
+        case struck(CADExactJob)
     }
     private var finished: [Finished] = []
     private var slicesRunning = 0
@@ -195,9 +195,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
             case .mask(let owner, let coverage):
                 coverage.completed += 1
                 if owner === job, coverage.isComplete { needsComposite = true }
-            case .failed(let owner):
-                CADExactCost.shared.recordFailure(owner.costKey)
-                if owner === job, let latest {
+            case .struck(let owner):
+                if CADExactCost.shared.recordStrike(owner.costKey), owner === job, let latest {
                     // Display meshes from now on; show the newest state with them.
                     abandonJob()
                     requeue(latest)
@@ -381,9 +380,13 @@ final class ViewportRenderLoop: @unchecked Sendable {
             var result: Finished
             switch record {
             case .slice(let owner, _, let covered, let blocks): result = .slice(owner, seconds: seconds, covered: covered, blocks: blocks)
-            case .mask, .failed: result = record
+            case .mask, .struck: result = record
             }
-            if buffer.status == .error || seconds > CADExactCost.failingSliceSeconds { result = .failed(job) }
+            if buffer.status == .error || seconds > CADExactCost.failingSliceSeconds {
+                // The slice still counts; a failed one leaves its blocks cleared.
+                self.finished.append(result)
+                result = .struck(job)
+            }
             self.slicesRunning -= 1
             self.finished.append(result)
             self.condition.signal()
@@ -498,7 +501,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
             inFlight.signal()
             if buffer.status == .error, let geometry, let self {
                 self.condition.withLock {
-                    self.finished.append(.failed(geometry))
+                    self.finished.append(.struck(geometry))
                     self.condition.signal()
                 }
             }

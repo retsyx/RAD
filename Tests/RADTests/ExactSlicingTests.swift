@@ -85,6 +85,38 @@ final class ExactSlicingTests: XCTestCase {
         }
     }
 
+    /// Designs whose measured blocks take more than eight slice budgets
+    /// slice in halved blocks, down to the smallest; those over two budgets
+    /// keep one slice in flight. Measurements of a superseded block size are
+    /// ignored; translucent layers start with small blocks.
+    func testHeavyBlocksHalveAndKeepOneSliceInFlight() {
+        let cost = CADExactCost()
+        let opaque = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: false)
+        let budget = CADViewportPasses.sliceBudget
+        XCTAssertEqual(cost.blockSide(opaque), CADSlicePlan.block)
+        XCTAssertEqual(cost.slicesInFlight(opaque), 2)
+        cost.recordBlocks(opaque, side: 256, seconds: 1.5 * budget, count: 1)
+        XCTAssertEqual(cost.blockSide(opaque), 256)
+        XCTAssertEqual(cost.slicesInFlight(opaque), 2)
+        cost.recordBlocks(opaque, side: 256, seconds: 6 * budget, count: 2)
+        XCTAssertEqual(cost.slicesInFlight(opaque), 1, "blocks of three budgets")
+        cost.recordBlocks(opaque, side: 256, seconds: 9 * budget, count: 1)
+        XCTAssertEqual(cost.blockSide(opaque), 128)
+        XCTAssertEqual(cost.slicesInFlight(opaque), 2, "nothing measured at the new size yet")
+        cost.recordBlocks(opaque, side: 256, seconds: 100 * budget, count: 1)
+        XCTAssertEqual(cost.blockSide(opaque), 128, "a superseded size is ignored")
+        cost.recordBlocks(opaque, side: 128, seconds: 20 * budget, count: 1)
+        XCTAssertEqual(cost.blockSide(opaque), CADSlicePlan.smallestBlock, "never below the smallest block")
+        XCTAssertEqual(cost.slicesInFlight(opaque), 1)
+        let translucent = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: true)
+        XCTAssertEqual(cost.blockSide(translucent), CADSlicePlan.translucentBlock)
+        cost.recordBlocks(translucent, side: 64, seconds: 20 * budget, count: 1)
+        XCTAssertEqual(cost.blockSide(translucent), CADSlicePlan.translucentBlock, "translucent blocks stay small")
+        XCTAssertEqual(cost.slicesInFlight(translucent), 1)
+        cost.forget(ObjectIdentifier(Self.self))
+        XCTAssertEqual(cost.blockSide(opaque), CADSlicePlan.block, "released resources forget their measurements")
+    }
+
     // MARK: Geometry identity
 
     private func key(camera: simd_float4x4 = matrix_identity_float4x4, width: Int = 100,
