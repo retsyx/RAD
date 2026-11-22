@@ -350,7 +350,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 let chain = running > 0
                 guard !chain || !waiting else { break }
                 let encoded = encodeSlice(job, chain: chain) { commandBuffer in
-                    passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget(after: job.encoded), commandBuffer: commandBuffer)
+                    passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget(after: job.encoded),
+                                       blocks: CADViewportPasses.sliceBlocks(after: job.encoded), commandBuffer: commandBuffer)
                         .map { .slice(job, seconds: 0, covered: $0.covered) }
                 }
                 if !encoded { break }
@@ -366,7 +367,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
               job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
             let encoded = encodeSlice(job) { commandBuffer in
                 let slices = job.masks.values.reduce(0) { $0 + $1.encoded }
-                return passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget(after: slices), commandBuffer: commandBuffer)
+                return passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget(after: slices),
+                                              blocks: CADViewportPasses.sliceBlocks(after: slices), commandBuffer: commandBuffer)
                     .map { .mask(job, $0) }
             }
             if !encoded { break }

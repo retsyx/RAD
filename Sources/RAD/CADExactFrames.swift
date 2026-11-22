@@ -188,22 +188,24 @@ struct CADSlicePlan: Sendable {
 
     var isDone: Bool { row >= rows.count }
 
-    /// The next slice whose estimated covered pixels stay within `budget`,
-    /// at least one block, or nil when every reached block has its slice.
-    mutating func next(budget: Int) -> Slice? {
+    /// The next slice whose estimated covered pixels stay within `budget`
+    /// and whose reached blocks number at most `blocks`, at least one block,
+    /// or nil when every reached block has its slice.
+    mutating func next(budget: Int, blocks limit: Int = .max) -> Slice? {
         guard row < rows.count else { return nil }
         let first = (row: row, column: column)
         let size = Int32(block)
         var sum = 0
-        if column == 0, rows[row].covered <= budget {
+        if column == 0, rows[row].covered <= budget, rows[row].blocks.count <= limit {
             // Whole rows: a strip of their reached columns.
-            var x0 = Int32.max, x1 = Int32(0)
+            var x0 = Int32.max, x1 = Int32(0), count = 0
             repeat {
                 sum += rows[row].covered
+                count += rows[row].blocks.count
                 x0 = min(x0, Int32(rows[row].blocks.first!.column) * size)
                 x1 = max(x1, Int32(rows[row].blocks.last!.column + 1) * size)
                 row += 1
-            } while row < rows.count && sum + rows[row].covered <= budget
+            } while row < rows.count && sum + rows[row].covered <= budget && count + rows[row].blocks.count <= limit
             remaining -= sum
             let rect = SIMD4(x0, Int32(rows[first.row].index) * size, min(Int32(width), x1),
                              min(Int32(height), Int32(rows[row - 1].index + 1) * size))
@@ -212,11 +214,12 @@ struct CADSlicePlan: Sendable {
         // A run of the current row's blocks.
         let blocks = rows[row].blocks
         sum = blocks[column].covered
-        var last = column
+        var last = column, count = 1
         column += 1
-        while column < blocks.count, sum + blocks[column].covered <= budget {
+        while column < blocks.count, sum + blocks[column].covered <= budget, count < limit {
             sum += blocks[column].covered
             last = column
+            count += 1
             column += 1
         }
         let rect = SIMD4(Int32(blocks[first.column].column) * size, Int32(rows[row].index) * size,

@@ -390,18 +390,25 @@ final class CADViewportPasses: @unchecked Sendable {
     /// GPU seconds of exact geometry a frame draws itself.
     static let frameBudget = 0.004
     /// GPU seconds of a job's first exact slice; each later one may take
-    /// twice its predecessor's, up to `sliceBudget`. A newer frame waits for
-    /// the tiles in flight: about one per core while a slice holds a few
-    /// blocks, several once it spans the frame. Small slices right after
-    /// navigation ends, when it is likeliest to resume, keep that wait near
-    /// the heaviest tile's; later slices are large, since every pass ends
-    /// with its slowest tile while the other cores idle.
+    /// twice its predecessor's, up to `sliceBudget`, and hold four times its
+    /// blocks (two at first), whatever the cost estimate says. A newer frame
+    /// waits for the tiles in flight: about one per core while a slice holds
+    /// a few blocks, several once it spans the frame. Small slices right
+    /// after navigation ends, when it is likeliest to resume, keep that wait
+    /// near the heaviest tile's; later slices are large, since every pass
+    /// ends with its slowest tile while the other cores idle.
     static let firstSliceBudget = 0.004
     static let sliceBudget = 0.064
+    static let firstSliceBlocks = 2
 
     /// The budget of a job's slice after `slices` earlier ones.
     static func sliceBudget(after slices: Int) -> Double {
         min(sliceBudget, firstSliceBudget * Double(1 << min(max(0, slices), 16)))
+    }
+
+    /// The most blocks a job's slice after `slices` earlier ones may hold.
+    static func sliceBlocks(after slices: Int) -> Int {
+        firstSliceBlocks << (2 * min(max(0, slices), 12))
     }
     /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
     nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
@@ -510,9 +517,10 @@ final class CADViewportPasses: @unchecked Sendable {
     /// clears the stored layers). Returns it, or nil when every slice has
     /// been encoded.
     @discardableResult
-    func encodeSlice(_ job: CADExactJob, budget: Double, commandBuffer: any MTLCommandBuffer) -> CADSlicePlan.Slice? {
+    func encodeSlice(_ job: CADExactJob, budget: Double, blocks: Int = .max,
+                     commandBuffer: any MTLCommandBuffer) -> CADSlicePlan.Slice? {
         let covered = Self.evenBudget(job.plan, Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey)))
-        var next = job.plan.next(budget: covered)
+        var next = job.plan.next(budget: covered, blocks: blocks)
         if next == nil {
             guard !job.cleared else { return nil }
             next = CADSlicePlan.Slice(rects: [], covered: 0)
@@ -749,13 +757,14 @@ final class CADViewportPasses: @unchecked Sendable {
     /// Encodes the next slice of a job's unfinished outline coverage, and
     /// returns that coverage, or nil when none remains.
     @discardableResult
-    func encodeMaskSlice(_ job: CADExactJob, budget: Double, commandBuffer: any MTLCommandBuffer) -> CADMaskCoverage? {
+    func encodeMaskSlice(_ job: CADExactJob, budget: Double, blocks: Int = .max,
+                         commandBuffer: any MTLCommandBuffer) -> CADMaskCoverage? {
         let pending = job.masks.values.filter { !$0.cleared || !$0.plan.isDone }
             .sorted { ($0.key.rect.y, $0.key.rect.x) < ($1.key.rect.y, $1.key.rect.x) }
         guard let coverage = pending.first else { return nil }
         let resources = job.field.resources
         let covered = Self.evenBudget(coverage.plan, Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey)))
-        guard let slice = coverage.plan.next(budget: covered) ?? (coverage.cleared ? nil : .init(rects: [], covered: 0)) else {
+        guard let slice = coverage.plan.next(budget: covered, blocks: blocks) ?? (coverage.cleared ? nil : .init(rects: [], covered: 0)) else {
             return nil
         }
         let clear = !coverage.cleared
