@@ -76,9 +76,22 @@ final class CADViewportCapture: @unchecked Sendable {
             costKey = job.costKey
             commandBuffer.commit()
             committed.append(commandBuffer)
-            // One queue orders the slices before the composite.
+            // One queue orders the slices before the composite. A few slices
+            // run ahead; one that fails or takes far too long ends exact
+            // faces of the design in this mode (display meshes instead).
+            var waited = 0, gpuEnd = 0.0, slow = false
+            func settle(keeping ahead: Int) {
+                while committed.count - waited > ahead {
+                    let buffer = committed[waited]
+                    buffer.waitUntilCompleted()
+                    let seconds = buffer.gpuEndTime - max(buffer.gpuStartTime, gpuEnd)
+                    gpuEnd = max(gpuEnd, buffer.gpuEndTime)
+                    if buffer.status != .completed || seconds > CADExactCost.failingSliceSeconds { slow = true }
+                    waited += 1
+                }
+            }
             func slices(_ encode: (any MTLCommandBuffer) -> Bool) throws {
-                while true {
+                while !slow {
                     try Task.checkCancellation()
                     guard let slice = queue.makeCommandBuffer() else {
                         throw RADError.message("RAD could not render the design image.")
@@ -86,6 +99,7 @@ final class CADViewportCapture: @unchecked Sendable {
                     guard encode(slice) else { return }
                     slice.commit()
                     committed.append(slice)
+                    settle(keeping: 4)
                 }
             }
             try slices { passes.encodeSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
@@ -93,6 +107,15 @@ final class CADViewportCapture: @unchecked Sendable {
             passes.prepareMasks(job, frame: frame)
             try slices { passes.encodeMaskSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
+            settle(keeping: 0)
+            if slow {
+                CADExactCost.shared.recordFailure(job.costKey)
+                var meshes = frame
+                meshes.field = nil
+                meshes.key = nil
+                return try image(of: meshes, source: source, renderer: renderer, passes: passes, sliceBudget: sliceBudget,
+                                 statistics: statistics)
+            }
             guard let composite = queue.makeCommandBuffer(),
                   passes.encodeComposite(frame, job: job, source: source, renderer: renderer, into: target,
                                          commandBuffer: composite) else {

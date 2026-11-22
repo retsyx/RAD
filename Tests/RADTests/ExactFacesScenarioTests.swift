@@ -35,6 +35,9 @@ final class ExactFacesScenarioTests: XCTestCase {
             /// Sliced captures to time (GPU busy, the union of their command
             /// buffers' execution; the minimum is reported).
             var slicedTiming: Int?
+            /// Composites of stored layers to time, without and with a hover
+            /// marker at the frame's center (median reported).
+            var compositeTiming: Int?
         }
         var design: String
         var output: String
@@ -97,6 +100,10 @@ final class ExactFacesScenarioTests: XCTestCase {
                 let times = try Self.time(capture, frames: frames)
                 line += String(format: ", GPU median %.2f ms (min %.2f, max %.2f)", times[times.count / 2], times.first!, times.last!)
             }
+            if let count = render.compositeTiming, count > 0 {
+                let times = try Self.timeComposites(capture, frames: count)
+                line += String(format: ", composite GPU median %.2f ms, with hover marker %.2f ms", times.0, times.1)
+            }
             if let count = render.slicedTiming, count > 0 {
                 var busy: [Double] = [], buffers = 0
                 for _ in 0..<count {
@@ -111,6 +118,48 @@ final class ExactFacesScenarioTests: XCTestCase {
         }
         try log.joined(separator: "\n").write(to: output.appendingPathComponent("log.txt"), atomically: true, encoding: .utf8)
         print(log.joined(separator: "\n"))
+    }
+
+    /// Median GPU milliseconds of composites of one frame's stored layers,
+    /// without and with a hover marker at the frame's center.
+    static func timeComposites(_ capture: CADViewportCapture, frames: Int) throws -> (Double, Double) {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let renderer = SCNRenderer(device: device, options: nil)
+        renderer.scene = capture.source.scene
+        renderer.pointOfView = capture.source.camera
+        renderer.usesReverseZ = true
+        renderer.autoenablesDefaultLighting = false
+        XCTAssertTrue(renderer.prepare(capture.source.scene, shouldAbortBlock: nil))
+        let passes = try CADViewportPasses(device: device)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: CADViewportPasses.colorFormat,
+                                                                  width: capture.width, height: capture.height, mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+        let setup = try XCTUnwrap(queue.makeCommandBuffer())
+        let job = try XCTUnwrap(passes.makeJob(capture.frame, source: capture.source, renderer: renderer, commandBuffer: setup))
+        passes.encodeAll(job, frame: capture.frame, commandBuffer: setup)
+        setup.commit()
+        setup.waitUntilCompleted()
+        var hovered = capture.frame
+        let marker = try XCTUnwrap(CADHighlightBuffers.Seeds(device: device, points: [.zero], primitive: .point))
+        hovered.seeds = [.init(buffer: marker, channel: .hoveredVertex, model: matrix_identity_float4x4)]
+        hovered.highlightBounds = .init(low: SIMD2(-0.01, -0.01), high: SIMD2(0.01, 0.01))
+        hovered.verticesEnabled = true
+        func median(_ frame: CADViewportFrame) throws -> Double {
+            var times: [Double] = []
+            for index in 0..<(frames + 3) {
+                let buffer = try XCTUnwrap(queue.makeCommandBuffer())
+                _ = passes.encodeComposite(frame, job: job, source: capture.source, renderer: renderer, into: target,
+                                           commandBuffer: buffer)
+                buffer.commit()
+                buffer.waitUntilCompleted()
+                if index >= 3 { times.append((buffer.gpuEndTime - buffer.gpuStartTime) * 1000) }
+            }
+            return times.sorted()[times.count / 2]
+        }
+        return (try median(capture.frame), try median(hovered))
     }
 
     /// Sorted GPU milliseconds of `frames` frames after three warm-up frames.

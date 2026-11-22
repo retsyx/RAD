@@ -27,7 +27,7 @@ final class ExactSlicingTests: XCTestCase {
     /// proxy reaches get no slice.
     func testSlicePlanCoversEveryReachedBlockOnceWithinItsBudget() {
         var random = Generator(state: 7)
-        let size = CADSlicePlan.largestBlock
+        let size = CADSlicePlan.block
         for _ in 0..<200 {
             let width = Int.random(in: 1...2_400, using: &random), height = Int.random(in: 1...1_600, using: &random)
             let rects: [SIMD4<Int32>?] = (0..<Int.random(in: 0...6, using: &random)).map { _ in
@@ -83,11 +83,6 @@ final class ExactSlicingTests: XCTestCase {
                 XCTAssertEqual(owners[block] != -1, value > 0, "exactly the reached blocks have slices")
             }
         }
-        // Frames whose blocks would each take many budgets use smaller blocks.
-        let rects: [SIMD4<Int32>?] = [SIMD4(0, 0, 1_000, 1_000)]
-        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 60_000).block, 256)
-        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 10_000).block, 128)
-        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 100).block, 64)
     }
 
     // MARK: Geometry identity

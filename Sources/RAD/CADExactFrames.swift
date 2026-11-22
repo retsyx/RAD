@@ -121,18 +121,15 @@ final class CADExactTargets: @unchecked Sendable {
     }
 }
 
-/// Screen slices of one exact frame's geometry: square blocks (256 pixels,
-/// smaller only for frames whose blocks would each take many budgets) that
-/// some proxy reaches, in row order, grouped into slices whose estimated
-/// covered pixels (each proxy's projected bounds, counted per proxy) stay
-/// within a budget, at least one block each. Small scissored regions cost
-/// the GPU far more per pixel than one pass over the frame, so a block is
-/// the smallest slice. Blocks no proxy reaches get no slice; their stored
-/// layers keep the clear.
+/// Screen slices of one exact frame's geometry: square blocks of 256 pixels
+/// that some proxy reaches, in row order, grouped into slices whose
+/// estimated covered pixels (each proxy's projected bounds, counted per
+/// proxy) stay within a budget, at least one block each. Small scissored
+/// regions cost the GPU far more per pixel than one pass over the frame, so
+/// a block is the smallest slice. Blocks no proxy reaches get no slice;
+/// their stored layers keep the clear.
 struct CADSlicePlan: Sendable {
-    static let tile = 32
-    static let largestBlock = 256
-    static let smallestBlock = 64
+    static let block = 256
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
@@ -158,21 +155,7 @@ struct CADSlicePlan: Sendable {
     private(set) var remaining: Int
 
     /// `rects` are proxies' pixel rectangles; nil covers the whole frame.
-    /// With `budget` (estimated covered pixels per slice), blocks halve
-    /// while the reached ones would average more than four budgets.
-    init(width: Int, height: Int, rects: [SIMD4<Int32>?], budget: Int? = nil) {
-        var size = Self.largestBlock
-        if let budget, budget > 0 {
-            while size > Self.smallestBlock {
-                let probe = Self(width: width, height: height, rects: rects, block: size)
-                guard probe.blocks.count > 0, probe.total / probe.blocks.count > 4 * budget else { break }
-                size /= 2
-            }
-        }
-        self.init(width: width, height: height, rects: rects, block: size)
-    }
-
-    private init(width: Int, height: Int, rects: [SIMD4<Int32>?], block size: Int) {
+    init(width: Int, height: Int, rects: [SIMD4<Int32>?], block size: Int = Self.block) {
         self.width = max(0, width)
         self.height = max(0, height)
         block = size
@@ -281,12 +264,16 @@ final class CADExactCost: @unchecked Sendable {
         lock.withLock { failures.contains(Failure(resources: resources, translucent: translucent)) }
     }
 
+    /// Rates never fall below this: a frame's covered pixels are always worth some time.
+    static let smallestRate = 1e-10
+
     func sliceRate(_ key: Key) -> Double {
-        lock.withLock { slices[key] } ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate)
+        max(Self.smallestRate, lock.withLock { slices[key] } ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate))
     }
 
     func frameRate(_ key: Key) -> Double {
-        lock.withLock { frames[key] ?? slices[key] } ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate)
+        max(Self.smallestRate, lock.withLock { frames[key] ?? slices[key] }
+            ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate))
     }
 
     func recordSlice(_ key: Key, seconds: Double, covered: Int) {
@@ -390,8 +377,7 @@ final class CADExactJob: @unchecked Sendable {
         draws = field.resources.draws(field.instances, view: view, projection: projection, width: width, height: height,
                                       contacts: !key.translucent)
         costKey = .init(resources: key.resources, width: width, height: height, translucent: key.translucent)
-        let budget = Int(CADViewportPasses.sliceBudget / CADExactCost.shared.sliceRate(costKey))
-        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect), budget: budget)
+        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect))
     }
 
     var isComplete: Bool { cleared && plan.isDone && completed == encoded }

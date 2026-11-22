@@ -495,7 +495,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// been encoded.
     @discardableResult
     func encodeSlice(_ job: CADExactJob, budget: Double, commandBuffer: any MTLCommandBuffer) -> CADSlicePlan.Slice? {
-        let covered = budget.isFinite ? max(1, Int(budget / CADExactCost.shared.sliceRate(job.costKey))) : Int.max
+        let covered = Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey))
         var next = job.plan.next(budget: covered)
         if next == nil {
             guard !job.cleared else { return nil }
@@ -512,6 +512,12 @@ final class CADViewportPasses: @unchecked Sendable {
             encodeOpaqueSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
         }
         return slice
+    }
+
+    /// Covered pixels a slice of `budget` GPU seconds may estimate.
+    static func coveredBudget(_ budget: Double, rate: Double) -> Int {
+        let pixels = budget / rate
+        return pixels.isFinite && pixels < Double(Int.max / 2) ? max(1, Int(pixels)) : Int.max / 2
     }
 
     private func fieldUniforms(_ job: CADExactJob) -> CADFieldResources.Uniforms {
@@ -710,7 +716,7 @@ final class CADViewportPasses: @unchecked Sendable {
             .sorted { ($0.key.rect.y, $0.key.rect.x) < ($1.key.rect.y, $1.key.rect.x) }
         guard let coverage = pending.first else { return nil }
         let resources = job.field.resources
-        let covered = budget.isFinite ? max(1, Int(budget / CADExactCost.shared.sliceRate(job.costKey))) : Int.max
+        let covered = Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey))
         guard let slice = coverage.plan.next(budget: covered) ?? (coverage.cleared ? nil : .init(rects: [], covered: 0)) else {
             return nil
         }

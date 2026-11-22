@@ -272,6 +272,12 @@ final class CADFieldResources: @unchecked Sendable {
         _ = try pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: samples)
     }
 
+    deinit {
+        // Measurements and failures are keyed by identity, which a later
+        // design's resources may reuse.
+        CADExactCost.shared.forget(ObjectIdentifier(self))
+    }
+
     /// The pipeline for a mode and pass formats, compiled on first use.
     func pipeline(_ mode: Mode, colors: [MTLPixelFormat], depth: MTLPixelFormat, samples: Int) throws -> any MTLRenderPipelineState {
         let key = "\(mode.rawValue)/\(colors.map { String($0.rawValue) }.joined(separator: ","))/\(depth.rawValue)/\(samples)"
