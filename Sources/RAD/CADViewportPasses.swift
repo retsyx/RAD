@@ -398,8 +398,9 @@ final class CADViewportPasses: @unchecked Sendable {
     /// (from `firstSliceBlocks`), whatever the cost estimate says. A design's
     /// first job keeps small slices over every region, and a design whose
     /// small slices outlast several frames (`CADExactCost.isFloorBound`) keeps
-    /// them for good: larger ones would only add slow tiles in flight beside
-    /// a newer frame, and tiles slowed that much can fail as GPU hangs.
+    /// them for good, as do translucent layers, which march every layer of a
+    /// pixel: larger ones would only add slow tiles in flight beside a newer
+    /// frame, and tiles slowed that much can fail as GPU hangs.
     static let firstSliceBudget = 0.004
     static let sliceBudget = 0.064
     static let firstSliceBlocks = 2
@@ -413,7 +414,7 @@ final class CADViewportPasses: @unchecked Sendable {
     }
 
     static func sliceLimits(_ job: CADExactJob) -> (seconds: Double, blocks: Int) {
-        sliceLimits(after: job.encoded, small: !CADExactCost.shared.isProven(job.costKey))
+        sliceLimits(after: job.encoded, small: job.key.translucent || !CADExactCost.shared.isProven(job.costKey))
     }
 
     /// Outline coverage slices: budgets double from the first, by count.
@@ -534,15 +535,7 @@ final class CADViewportPasses: @unchecked Sendable {
             next = CADSlicePlan.Slice(rects: [], covered: 0)
         }
         guard let slice = next else { return nil }
-        let clear = !job.cleared
-        job.cleared = true
-        job.encoded += 1
-        count { $0.geometrySlices += 1 }
-        if job.key.translucent {
-            encodeTranslucentSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
-        } else {
-            encodeOpaqueSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
-        }
+        encode(job, slice: slice, commandBuffer: commandBuffer)
         return slice
     }
 
