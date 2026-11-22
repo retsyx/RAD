@@ -1396,6 +1396,8 @@ final class CADSceneView: NSView {
         publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform, !modelNode.isHidden,
                                           exact, width * height))
         if publishedCameraTransforms.count > 16 { publishedCameraTransforms.removeFirst() }
+        let traced = publishedGeneration
+        ViewportFrameTrace.shared.update(traced) { $0.published = ViewportFrameTrace.now }
         loop.submit(.init(frame: frame, source: sceneSource, generation: publishedGeneration))
     }
 

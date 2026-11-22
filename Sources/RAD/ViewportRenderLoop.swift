@@ -83,9 +83,12 @@ final class ViewportRenderLoop: @unchecked Sendable {
 
     private func draw(_ request: Request) {
         let frame = request.frame
+        let trace = ViewportFrameTrace.shared, traced = request.generation
+        trace.update(traced) { $0.drawStart = ViewportFrameTrace.now; $0.exact = frame.field != nil; $0.pixels = frame.width * frame.height }
         let size = CGSize(width: frame.width, height: frame.height)
         if layer.drawableSize != size { layer.drawableSize = size }
         inFlight.wait()
+        trace.update(traced) { $0.afterInFlight = ViewportFrameTrace.now }
         // A drawable is unavailable while the display sleeps or the window is
         // hidden, and one acquired across a resize has the old size. Keep the
         // request unless a newer one has replaced it, and retry shortly; no
@@ -102,15 +105,29 @@ final class ViewportRenderLoop: @unchecked Sendable {
             condition.unlock()
             return
         }
+        trace.update(traced) { $0.afterDrawable = ViewportFrameTrace.now }
         commandBuffer.label = "RAD viewport frame \(request.generation)"
         passes.encode(frame, source: request.source, renderer: renderer, into: drawable.texture, commandBuffer: commandBuffer)
+        trace.update(traced) { $0.afterEncode = ViewportFrameTrace.now }
+        if ViewportFrameTrace.enabled {
+            drawable.addPresentedHandler { presented in
+                let time = presented.presentedTime
+                trace.update(traced) { $0.presented = time }
+            }
+        }
         commandBuffer.present(drawable)
         let generation = request.generation, completion = completion, inFlight = inFlight
         commandBuffer.addCompletedHandler { buffer in
             inFlight.signal()
             let seconds = buffer.gpuEndTime - buffer.gpuStartTime
-            DispatchQueue.main.async { completion(generation, seconds) }
+            let start = buffer.gpuStartTime, end = buffer.gpuEndTime
+            trace.update(generation) { $0.gpuStart = start; $0.gpuEnd = end }
+            DispatchQueue.main.async {
+                trace.update(generation) { $0.completedOnMain = ViewportFrameTrace.now }
+                completion(generation, seconds)
+            }
         }
         commandBuffer.commit()
+        trace.update(traced) { $0.committed = ViewportFrameTrace.now }
     }
 }
