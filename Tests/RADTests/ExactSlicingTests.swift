@@ -27,7 +27,7 @@ final class ExactSlicingTests: XCTestCase {
     /// proxy reaches get no slice.
     func testSlicePlanCoversEveryReachedBlockOnceWithinItsBudget() {
         var random = Generator(state: 7)
-        let size = CADSlicePlan.block
+        let size = CADSlicePlan.largestBlock
         for _ in 0..<200 {
             let width = Int.random(in: 1...2_400, using: &random), height = Int.random(in: 1...1_600, using: &random)
             let rects: [SIMD4<Int32>?] = (0..<Int.random(in: 0...6, using: &random)).map { _ in
@@ -83,6 +83,11 @@ final class ExactSlicingTests: XCTestCase {
                 XCTAssertEqual(owners[block] != -1, value > 0, "exactly the reached blocks have slices")
             }
         }
+        // Frames whose blocks would each take many budgets use smaller blocks.
+        let rects: [SIMD4<Int32>?] = [SIMD4(0, 0, 1_000, 1_000)]
+        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 60_000).block, 256)
+        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 10_000).block, 128)
+        XCTAssertEqual(CADSlicePlan(width: 1_000, height: 1_000, rects: rects, budget: 100).block, 64)
     }
 
     // MARK: Geometry identity
@@ -173,6 +178,29 @@ final class ExactSlicingTests: XCTestCase {
         XCTAssertNil(policy.exactSecondsPerPixel, "a new frame size forgets it")
         XCTAssertTrue(policy.end(.drag))
         XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "exact at rest")
+    }
+
+    // MARK: Antialiasing variants
+
+    /// Traced multisample rays are the default; builds with
+    /// `-DRAD_ANALYTIC_EXACT_AA` derive coverage analytically. Both shader
+    /// variants compile, with and without the gradient pass.
+    func testBothExactAntialiasingVariantsCompile() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        for analytic in [0, 1] {
+            for gradient in [0, 1] {
+                let options = MTLCompileOptions()
+                options.preprocessorMacros = ["RAD_EXACT_ANALYTIC_AA": NSNumber(value: analytic),
+                                              "RAD_FIELD_GRADIENT_PASS": NSNumber(value: gradient)]
+                if #available(macOS 15.0, *) { options.mathMode = .safe } else { options.fastMathEnabled = false }
+                let library = try device.makeLibrary(source: FieldProgramShaders.functions + CADFieldShading.source
+                                                     + CADFieldPipelines.shaderSource, options: options)
+                for name in ["cad_field_vertex", "cad_field_geometry", "cad_field_visibility", "cad_field_accumulate",
+                             "cad_field_revealage", "cad_field_mask"] {
+                    XCTAssertNotNil(library.makeFunction(name: name), "\(name) analytic \(analytic) gradient \(gradient)")
+                }
+            }
+        }
     }
 
     // MARK: Engine-backed fixtures

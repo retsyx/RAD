@@ -678,6 +678,10 @@ struct CADFieldResult {
     float value;          // the field at the shading ray's crossing
     float3 direction;     // the shading ray's marched direction
     float contact;        // ray 0's crossing: the nearest contact part's field, in footprints
+#if RAD_EXACT_ANALYTIC_AA
+    float closestT;       // where ray 0 passed closest to the surface
+    bool approached;      // the shading ray missed: its closest approach stands in for the crossing
+#endif
 };
 
 inline void cad_field_ray(thread const CADFieldRays &r, constant CADFieldUniforms &u, uint i,
@@ -708,10 +712,12 @@ inline void cad_field_ray(thread const CADFieldRays &r, constant CADFieldUniform
 // With `contacts`, every crossing is then sampled in the fields of the parts
 // whose bounds overlap this one (at the same call): a multisample crossing
 // inside another part belongs to that part, which is nearer there.
+// With `approach` (analytic antialiasing), a ray 0 that misses within a
+// pixel of the surface is shaded at its closest approach instead.
 void cad_field_march(device const uint *w, thread const RADFieldGrid &own, thread RADFieldCell &cell,
                      thread const CADFieldRays &rays, constant CADFieldUniforms &u,
                      constant CADFieldInstance &instance, bool contacts,
-                     uint first, uint last, thread CADFieldResult &r) {
+                     uint first, uint last, thread CADFieldResult &r, bool approach = false) {
     const float shell = instance.material.z;
     const uint contactCount = contacts ? min(instance.part.y, 8u) : 0u;
     RADFieldGrid g = own;
@@ -750,7 +756,11 @@ void cad_field_march(device const uint *w, thread const RADFieldGrid &own, threa
         } else if (phase == 0) {
             const float footprint = max(footprint0 + slope * t, 1e-7f);
             const float tolerance = max(u.march.y * footprint, 4e-7f * (length(x) + 1.0f) * s.lipschitz);
+#if RAD_EXACT_ANALYTIC_AA
+            if (ray == 0 && s.value >= 0 && s.value / footprint < r.closest) { r.closest = s.value / footprint; r.closestT = t; }
+#else
             if (ray == 0 && s.value >= 0) r.closest = min(r.closest, s.value / footprint);
+#endif
             ++ray_steps;
             if (fabs(s.value) < tolerance) {
                 hit = true;
@@ -852,6 +862,27 @@ void cad_field_march(device const uint *w, thread const RADFieldGrid &own, threa
             done = true;
         }
         if (done) {
+#if RAD_EXACT_ANALYTIC_AA
+            if (approach && ray == 0 && r.shaded == CAD_FIELD_NONE && r.closest < 1.0f) {
+                // Ray 0 passed within a pixel of the surface: its closest
+                // approach shades the samples on the surface's side.
+                t = r.closestT;
+                hit_position = o + t * d;
+                hit_footprint = max(footprint0 + slope * t, 1e-7f);
+                candidate = 0;
+                occluded = false;
+                r.approached = true;
+                r.shaded = 0;
+                r.position = hit_position;
+                r.value = r.closest * hit_footprint;
+                r.direction = d;
+                r.footprint = hit_footprint;
+                eps = max(0.25f * r.footprint, 2e-5f * (length(hit_position) + 1.0f));
+                phase = 2; k = 0; gradient = 0;
+                x = hit_position + eps * rad_field_stencil[0];
+                continue;
+            }
+#endif
             if (++ray > last) break;
             cad_field_ray(rays, u, ray, o, d, footprint0, slope);
             // Multisample rays start where ray 0 proved their way clear.
@@ -880,6 +911,49 @@ CADFieldResult cad_field_surface(CADFieldVarying in, constant CADFieldUniforms &
     const RADFieldGrid g = rad_field_grid(w, instance.part.x);
     RADFieldCell cell = rad_field_cell(w, g, in.partPosition);
     traced = false;
+#if RAD_EXACT_ANALYTIC_AA
+    // Analytic antialiasing: each sample's coverage from ray 0 alone, by the
+    // signed pixel distances to the silhouette (n.v over its change per
+    // pixel where ray 0 hit, minus its closest approach where it missed)
+    // and to contact parts (their field at the crossing), extrapolated to
+    // the sample by their screen derivatives.
+    r.closestT = 0;
+    r.approached = false;
+    const int debugMode = int(u.projection.w);
+    const bool analytic = antialias && debugMode != 4;
+    cad_field_march(w, g, cell, rays, u, instance, contacts && antialias, 0u, 0u, r, analytic);
+#if RAD_FIELD_GRADIENT_PASS
+    if (r.shaded != CAD_FIELD_NONE && all(r.normal == 0)) {
+        const float eps = max(0.25f * r.footprint, 2e-5f * (length(r.position) + 1.0f));
+        r.normal = rad_field_gradient_cached(w, g, cell, r.position, eps);
+    }
+#endif
+    const bool hit = (r.mask & 1u) != 0 && !r.approached;
+    float facing = 0;
+    if (r.shaded != CAD_FIELD_NONE) {
+        const float3 n = normalize((u.view * (instance.worldFromPart * float4(r.normal, 0.0f))).xyz);
+        const float3 v = rays.orthographic ? float3(0, 0, 1) : normalize(-rays.viewPoint);
+        facing = fabs(dot(n, v));
+    }
+    const float change = fwidth(facing);
+    const float silhouette = clamp(hit ? facing / max(change, 1e-6f) : -r.closest, -4.0f, 4.0f);
+    const float contact = clamp(r.contact, -4.0f, 4.0f);
+    const float2 towardSilhouette = float2(dfdx(silhouette), dfdy(silhouette));
+    const float2 towardContact = float2(dfdx(contact), dfdy(contact));
+    if (r.shaded == CAD_FIELD_NONE) {
+        r.mask = 0;
+    } else if (!analytic) {
+        r.mask = hit ? 0xFu : 0u;
+    } else {
+        uint mask = 0;
+        for (uint i = 0; i < 4; ++i) {
+            const float2 o = i == 0 ? u.samples01.xy : i == 1 ? u.samples01.zw : i == 2 ? u.samples23.xy : u.samples23.zw;
+            if (silhouette + dot(towardSilhouette, o) > 0.0f && contact + dot(towardContact, o) > 0.0f) mask |= 1u << i;
+        }
+        r.mask = mask;
+    }
+    traced = r.mask != 0 && r.mask != 0xFu;
+#else
     for (uint stage = 0; stage < 2; ++stage) {
         if (stage == 1) {
             // Every lane reaches this point, so quad derivatives are defined.
@@ -910,6 +984,7 @@ CADFieldResult cad_field_surface(CADFieldVarying in, constant CADFieldUniforms &
     }
     if (!traced) r.mask = (r.mask & 1u) ? 0xFu : 0u;
     else r.mask >>= 1;
+#endif
     // The march stops within its tolerance on the near side: one Newton step
     // along the ray puts depth on the surface, where crease strokes lie.
     if (r.shaded != CAD_FIELD_NONE) {
