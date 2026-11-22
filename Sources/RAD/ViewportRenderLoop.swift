@@ -62,6 +62,12 @@ final class ViewportRenderLoop: @unchecked Sendable {
     }
     private var finished: [Finished] = []
     private var slicesRunning = 0
+    /// With one slice in flight, the next one is encoded ahead and committed
+    /// by the running slice's completion, so the GPU does not wait for the
+    /// render thread between slices. Dropped with its job.
+    private var chained: (job: CADExactJob, buffer: any MTLCommandBuffer, serial: UInt64)?
+    /// The serial of the newest committed slice, which frames wait for.
+    private var committedSliceSerial: UInt64 = 0
     /// GPU end of the latest completed slice: slices run one after another
     /// on their queue, so each one's own time starts no earlier.
     private var sliceGPUEnd = 0.0
@@ -171,7 +177,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private func hasJobWork() -> Bool {
         guard let job else { return false }
         let limit = CADExactCost.shared.slicesInFlight(job.costKey)
-        if job.hasSlicesToEncode { return slicesRunning < limit }
+        if job.hasSlicesToEncode { return slicesRunning < limit || (limit == 1 && chained == nil) }
         guard job.isComplete else { return false }
         if needsComposite, latest != nil { return true }
         return slicesRunning < limit && job.masks.values.contains { !$0.cleared || !$0.plan.isDone }
@@ -259,7 +265,10 @@ final class ViewportRenderLoop: @unchecked Sendable {
         job = nil
         latest = nil
         needsComposite = false
+        condition.withLock { chained = nil }
     }
+
+    private func committedSerial() -> UInt64 { condition.withLock { committedSliceSerial } }
 
     /// Starts a job for a frame with a new geometry identity: in the frame
     /// itself when its estimated cost fits one slice, in slices otherwise.
@@ -291,7 +300,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 abandonJob()
                 return
             }
-            commandBuffer.encodeWaitForEvent(sliceEvent, value: sliceSerial)
+            commandBuffer.encodeWaitForEvent(sliceEvent, value: committedSerial())
             passes.encodeAll(job, frame: frame, commandBuffer: commandBuffer)
             let matched = passes.encodeComposite(frame, job: job, source: request.source, renderer: renderer,
                                                  into: drawable.texture, commandBuffer: commandBuffer)
@@ -329,8 +338,11 @@ final class ViewportRenderLoop: @unchecked Sendable {
         guard let job else { return }
         let limit = CADExactCost.shared.slicesInFlight(job.costKey)
         if job.hasSlicesToEncode {
-            while job.hasSlicesToEncode, running() < limit {
-                let encoded = encodeSlice(job) { commandBuffer in
+            while job.hasSlicesToEncode {
+                let (running, waiting) = condition.withLock { (slicesRunning, chained != nil) }
+                let chain = running >= limit
+                guard !chain || (limit == 1 && !waiting) else { break }
+                let encoded = encodeSlice(job, chain: chain) { commandBuffer in
                     passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
                         .map { .slice(job, seconds: 0, covered: $0.covered, blocks: $0.blocks) }
                 }
@@ -343,7 +355,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
             composite()
             return
         }
-        while running() < limit, job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
+        while running() < limit, condition.withLock({ chained == nil }),
+              job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
             let encoded = encodeSlice(job) { commandBuffer in
                 passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
                     .map { .mask(job, $0) }
@@ -354,16 +367,17 @@ final class ViewportRenderLoop: @unchecked Sendable {
 
     private func running() -> Int { condition.withLock { slicesRunning } }
 
-    /// Encodes one slice command buffer on the slice queue; false when there
-    /// was nothing to encode.
-    private func encodeSlice(_ job: CADExactJob, _ body: (any MTLCommandBuffer) -> Finished?) -> Bool {
+    /// Encodes one slice command buffer on the slice queue, committed now or,
+    /// with `chain`, by the running slice's completion; false when there was
+    /// nothing to encode.
+    private func encodeSlice(_ job: CADExactJob, chain: Bool = false, _ body: (any MTLCommandBuffer) -> Finished?) -> Bool {
         guard let commandBuffer = sliceQueue.makeCommandBuffer() else { return false }
         commandBuffer.label = "RAD exact slice"
         commandBuffer.encodeWaitForEvent(frameEvent, value: frameSerial)
         guard let record = body(commandBuffer) else { return false }
         sliceSerial += 1
-        commandBuffer.encodeSignalEvent(sliceEvent, value: sliceSerial)
-        condition.withLock { slicesRunning += 1 }
+        let serial = sliceSerial
+        commandBuffer.encodeSignalEvent(sliceEvent, value: serial)
         let trace = ViewportFrameTrace.shared, committed = ViewportFrameTrace.now
         commandBuffer.addCompletedHandler { [weak self] buffer in
             if ViewportFrameTrace.enabled {
@@ -389,10 +403,26 @@ final class ViewportRenderLoop: @unchecked Sendable {
             }
             self.slicesRunning -= 1
             self.finished.append(result)
+            let next = self.chained
+            if let next {
+                self.chained = nil
+                self.slicesRunning += 1
+                self.committedSliceSerial = max(self.committedSliceSerial, next.serial)
+            }
             self.condition.signal()
             self.condition.unlock()
+            next?.buffer.commit()
         }
-        commandBuffer.commit()
+        let commitNow: Bool = condition.withLock {
+            if chain, slicesRunning > 0 {
+                chained = (job, commandBuffer, serial)
+                return false
+            }
+            slicesRunning += 1
+            committedSliceSerial = max(committedSliceSerial, serial)
+            return true
+        }
+        if commitNow { commandBuffer.commit() }
         return true
     }
 
@@ -405,7 +435,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
         trace.update(request.generation) { $0.drawStart = ViewportFrameTrace.now; $0.pixels = frame.width * frame.height }
         guard let drawable = acquireDrawable(for: request), let commandBuffer = frameQueue.makeCommandBuffer() else { return }
         commandBuffer.label = "RAD viewport frame \(request.generation)"
-        commandBuffer.encodeWaitForEvent(sliceEvent, value: sliceSerial)
+        commandBuffer.encodeWaitForEvent(sliceEvent, value: committedSerial())
         passes.prepareMasks(job, frame: frame)
         let pendingMasks = job.masks.values.filter { !$0.cleared || !$0.plan.isDone }
         let maskCost = pendingMasks.reduce(0) { $0 + $1.plan.remaining }
