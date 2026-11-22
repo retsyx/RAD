@@ -299,7 +299,7 @@ final class ExactFacesTests: XCTestCase {
         let interval = 1.0 / 60, pixels = 1_000_000
         XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "at rest")
         policy.begin(.drag)
-        XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "nothing measured yet")
+        XCTAssertFalse(policy.drawsExactFaces(pixels: pixels, interval: interval), "unmeasured designs move with meshes")
         policy.record(exact: true, gpuSeconds: 0.004, pixels: pixels)
         XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "a light design stays exact while moving")
         policy.record(exact: true, gpuSeconds: 0.030, pixels: pixels)

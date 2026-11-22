@@ -171,14 +171,14 @@ struct CADFieldLights: Sendable, Equatable {
 }
 
 /// One exact solid of a frame.
-struct CADFieldInstance: Sendable {
+struct CADFieldInstance: Sendable, Equatable {
     var solid: Int
     var model: simd_float4x4
     var albedo: SIMD3<Float>
     var emission: SIMD3<Float>
 }
 
-/// The exact faces a frame draws. Without it, field parts draw their meshes.
+/// The exact faces a frame shows. Without it, field parts draw their meshes.
 struct CADFieldFrame: @unchecked Sendable {
     var resources: CADFieldResources
     var instances: [CADFieldInstance]
@@ -191,15 +191,32 @@ struct CADFieldFrame: @unchecked Sendable {
     var debug: Int = 0
 }
 
+/// One proxy draw of an exact solid, prepared once per exact frame geometry.
+struct CADFieldDraw {
+    var values: CADFieldResources.Instance
+    var solid: Int
+    var indexStart: Int
+    var indexCount: Int
+    /// Pixel rectangle (x0, y0, x1, y1 exclusive, top-left origin) holding the
+    /// proxy's projection; nil when the part reaches behind the eye.
+    var rect: SIMD4<Int32>?
+}
+
 /// Immutable GPU buffers and pipelines for one preview's field geometry.
 final class CADFieldResources: @unchecked Sendable {
+    /// Exact passes: stored geometry (opaque), translucent layers, and
+    /// highlight outline coverage.
     enum Mode: Int, CaseIterable, Sendable {
-        case opaque, visibility, accumulation, revealage, mask
+        case geometry, visibility, accumulation, revealage, mask
     }
 
     static let metalness: Float = 0.28
     static let roughness: Float = 0.42
     static let sampleCount = 4
+    /// Stored geometry formats: octahedral view-space normal, solid + 1, depth.
+    static let normalFormat = MTLPixelFormat.rg16Snorm
+    static let partFormat = MTLPixelFormat.r16Uint
+    static let depthFormat = MTLPixelFormat.depth32Float
 
     let device: any MTLDevice
     let program: any MTLBuffer
@@ -245,25 +262,26 @@ final class CADFieldResources: @unchecked Sendable {
         depthRead = try depth(.greater, write: false)
         depthIgnored = try depth(.always, write: false)
         sampleOffsets = device.getDefaultSamplePositions(sampleCount: Self.sampleCount).map { SIMD2(Float($0.x) - 0.5, Float($0.y) - 0.5) }
-        // The viewport's own pass formats, compiled before the model is revealed.
-        let scene = CADViewportPasses.colorFormat
-        for (mode, color) in [(Mode.opaque, scene), (.visibility, scene), (.accumulation, .rgba16Float),
-                              (.revealage, .r16Float)] {
-            _ = try pipeline(mode, color: color, depth: .depth32Float, samples: Self.sampleCount)
-        }
-        _ = try pipeline(.mask, color: .rgba8Unorm, depth: .invalid, samples: Self.sampleCount)
+        // The exact passes' formats, compiled before the model is revealed.
+        let samples = Self.sampleCount
+        _ = try pipeline(.geometry, colors: [Self.normalFormat, Self.partFormat], depth: Self.depthFormat, samples: samples)
+        _ = try pipeline(.visibility, colors: [], depth: Self.depthFormat, samples: samples)
+        _ = try pipeline(.visibility, colors: [.r16Float], depth: Self.depthFormat, samples: samples)
+        _ = try pipeline(.revealage, colors: [.r16Float], depth: Self.depthFormat, samples: samples)
+        _ = try pipeline(.accumulation, colors: [.rgba16Float], depth: .invalid, samples: samples)
+        _ = try pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: 1)
     }
 
     /// The pipeline for a mode and pass formats, compiled on first use.
-    func pipeline(_ mode: Mode, color: MTLPixelFormat, depth: MTLPixelFormat, samples: Int) throws -> any MTLRenderPipelineState {
-        let key = "\(mode.rawValue)/\(color.rawValue)/\(depth.rawValue)/\(samples)"
+    func pipeline(_ mode: Mode, colors: [MTLPixelFormat], depth: MTLPixelFormat, samples: Int) throws -> any MTLRenderPipelineState {
+        let key = "\(mode.rawValue)/\(colors.map { String($0.rawValue) }.joined(separator: ","))/\(depth.rawValue)/\(samples)"
         if let pipeline = lock.withLock({ pipelines[key] }) { return pipeline }
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.label = "RAD exact faces \(mode)"
-        descriptor.vertexFunction = library.makeFunction(name: mode == .mask ? "cad_field_mask_vertex" : "cad_field_vertex")
+        descriptor.vertexFunction = library.makeFunction(name: "cad_field_vertex")
         let fragment: String
         switch mode {
-        case .opaque: fragment = "cad_field_opaque"
+        case .geometry: fragment = "cad_field_geometry"
         case .visibility: fragment = "cad_field_visibility"
         case .accumulation: fragment = "cad_field_accumulate"
         case .revealage: fragment = "cad_field_revealage"
@@ -275,37 +293,41 @@ final class CADFieldResources: @unchecked Sendable {
         }
         descriptor.rasterSampleCount = samples
         descriptor.depthAttachmentPixelFormat = depth
-        let attachment: MTLRenderPipelineColorAttachmentDescriptor = descriptor.colorAttachments[0]
-        attachment.pixelFormat = color
-        switch mode {
-        case .opaque: break
-        case .visibility: attachment.writeMask = []
-        case .accumulation:
-            // Premultiplied color and alpha add, independent of order.
-            attachment.isBlendingEnabled = true
-            attachment.rgbBlendOperation = .add
-            attachment.alphaBlendOperation = .add
-            attachment.sourceRGBBlendFactor = .one
-            attachment.destinationRGBBlendFactor = .one
-            attachment.sourceAlphaBlendFactor = .one
-            attachment.destinationAlphaBlendFactor = .one
-        case .revealage:
-            // Each crossing multiplies the remaining transmittance.
-            attachment.isBlendingEnabled = true
-            attachment.rgbBlendOperation = .add
-            attachment.alphaBlendOperation = .add
-            attachment.sourceRGBBlendFactor = .zero
-            attachment.destinationRGBBlendFactor = .sourceColor
-            attachment.sourceAlphaBlendFactor = .zero
-            attachment.destinationAlphaBlendFactor = .sourceAlpha
-        case .mask:
-            attachment.isBlendingEnabled = true
-            attachment.rgbBlendOperation = .max
-            attachment.alphaBlendOperation = .max
-            attachment.sourceRGBBlendFactor = .one
-            attachment.destinationRGBBlendFactor = .one
-            attachment.sourceAlphaBlendFactor = .one
-            attachment.destinationAlphaBlendFactor = .one
+        for (index, format) in colors.enumerated() {
+            let attachment: MTLRenderPipelineColorAttachmentDescriptor = descriptor.colorAttachments[index]
+            attachment.pixelFormat = format
+            switch mode {
+            case .geometry: break
+            case .visibility:
+                // Shares a pass with the transmittance layers' target.
+                attachment.writeMask = []
+            case .accumulation:
+                // Premultiplied color and alpha add, independent of order.
+                attachment.isBlendingEnabled = true
+                attachment.rgbBlendOperation = .add
+                attachment.alphaBlendOperation = .add
+                attachment.sourceRGBBlendFactor = .one
+                attachment.destinationRGBBlendFactor = .one
+                attachment.sourceAlphaBlendFactor = .one
+                attachment.destinationAlphaBlendFactor = .one
+            case .revealage:
+                // Each crossing multiplies the remaining transmittance.
+                attachment.isBlendingEnabled = true
+                attachment.rgbBlendOperation = .add
+                attachment.alphaBlendOperation = .add
+                attachment.sourceRGBBlendFactor = .zero
+                attachment.destinationRGBBlendFactor = .sourceColor
+                attachment.sourceAlphaBlendFactor = .zero
+                attachment.destinationAlphaBlendFactor = .sourceAlpha
+            case .mask:
+                attachment.isBlendingEnabled = true
+                attachment.rgbBlendOperation = .max
+                attachment.alphaBlendOperation = .max
+                attachment.sourceRGBBlendFactor = .one
+                attachment.destinationRGBBlendFactor = .one
+                attachment.sourceAlphaBlendFactor = .one
+                attachment.destinationAlphaBlendFactor = .one
+            }
         }
         let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
         lock.withLock { pipelines[key] = pipeline }
@@ -324,6 +346,8 @@ final class CADFieldResources: @unchecked Sendable {
         var lightColor1: SIMD4<Float>
         /// Footprint per unit view depth (perspective) or per pixel, orthographic flag, alpha, debug mode.
         var projection: SIMD4<Float>
+        /// The frame's NDC sub-rectangle mapped onto the pass (slices into
+        /// their own targets and highlight masks); the whole frame otherwise.
         var remap = SIMD4<Float>(-1, -1, 1, 1)
         var samples01: SIMD4<Float>
         var samples23: SIMD4<Float>
@@ -417,15 +441,7 @@ final class CADFieldResources: @unchecked Sendable {
         }
         let boxes: [(SIMD3<Float>, SIMD3<Float>)?] = instances.map { instance in
             guard let part = parts[instance.solid] else { return nil }
-            var lower = SIMD3<Float>(repeating: .infinity), upper = SIMD3<Float>(repeating: -.infinity)
-            for corner in 0..<8 {
-                let local = SIMD3(corner & 1 == 0 ? part.lower.x : part.upper.x, corner & 2 == 0 ? part.lower.y : part.upper.y,
-                                  corner & 4 == 0 ? part.lower.z : part.upper.z)
-                let world = instance.model * SIMD4(local, 1)
-                lower = simd_min(lower, SIMD3(world.x, world.y, world.z))
-                upper = simd_max(upper, SIMD3(world.x, world.y, world.z))
-            }
-            return (lower, upper)
+            return Self.posedBounds(part.lower, part.upper, instance.model)
         }
         func volume(_ box: (SIMD3<Float>, SIMD3<Float>)) -> Float {
             let size = simd_max(box.1 - box.0, .zero)
@@ -449,28 +465,80 @@ final class CADFieldResources: @unchecked Sendable {
         }
     }
 
-    /// Draws `instances`' proxies with the bound pipeline, nearest first,
-    /// with their contact parts when `contacts` is set.
-    func draw(_ instances: [CADFieldInstance], view: simd_float4x4, encoder: any MTLRenderCommandEncoder,
-              contacts: Bool = false) {
+    static func posedBounds(_ lower: SIMD3<Float>, _ upper: SIMD3<Float>, _ model: simd_float4x4)
+        -> (SIMD3<Float>, SIMD3<Float>) {
+        var low = SIMD3<Float>(repeating: .infinity), high = SIMD3<Float>(repeating: -.infinity)
+        for corner in 0..<8 {
+            let local = SIMD3(corner & 1 == 0 ? lower.x : upper.x, corner & 2 == 0 ? lower.y : upper.y,
+                              corner & 4 == 0 ? lower.z : upper.z)
+            let world = model * SIMD4(local, 1)
+            low = simd_min(low, SIMD3(world.x, world.y, world.z))
+            high = simd_max(high, SIMD3(world.x, world.y, world.z))
+        }
+        return (low, high)
+    }
+
+    /// The proxy draws of `instances`, nearest posed bounds center first,
+    /// with their contact parts when `contacts` is set and the pixel
+    /// rectangles their proxies can reach in a `width`×`height` frame.
+    func draws(_ instances: [CADFieldInstance], view: simd_float4x4, projection: simd_float4x4,
+               width: Int, height: Int, contacts: Bool) -> [CADFieldDraw] {
         let neighbors = contacts ? self.contacts(instances) : Array(repeating: [], count: instances.count)
-        var ordered: [(depth: Float, instance: CADFieldInstance, part: CADFieldGeometry.Part, contacts: [Contact])] = []
+        let viewProjection = projection * view
+        var ordered: [(depth: Float, draw: CADFieldDraw)] = []
         ordered.reserveCapacity(instances.count)
         for (instance, neighbors) in zip(instances, neighbors) {
             guard let part = parts[instance.solid], part.indexCount > 0 else { continue }
             let center = view * instance.model * SIMD4(part.center, 1)
-            ordered.append((center.z, instance, part, neighbors))
+            // The proxy lies within the shell of the surface, and the surface
+            // within the display mesh's deviation of the bounds.
+            let margin = SIMD3<Float>(repeating: part.shell + part.deviation)
+            let rect = Self.pixelRect(lower: part.lower - margin, upper: part.upper + margin, model: instance.model,
+                                      viewProjection: viewProjection, width: width, height: height)
+            ordered.append((center.z, CADFieldDraw(values: Instance(instance, shell: part.shell, contacts: neighbors),
+                                                   solid: instance.solid, indexStart: part.indexStart,
+                                                   indexCount: part.indexCount, rect: rect)))
         }
         // View space looks down -z: the nearest center has the largest z.
         ordered.sort { $0.depth > $1.depth }
+        return ordered.map(\.draw)
+    }
+
+    /// The pixel rectangle of posed bounds, padded by two pixels for
+    /// multisample rays; nil when a corner lies at or behind the eye plane.
+    static func pixelRect(lower: SIMD3<Float>, upper: SIMD3<Float>, model: simd_float4x4,
+                          viewProjection: simd_float4x4, width: Int, height: Int) -> SIMD4<Int32>? {
+        var low = SIMD2<Float>(repeating: .infinity), high = SIMD2<Float>(repeating: -.infinity)
+        let transform = viewProjection * model
+        for corner in 0..<8 {
+            let local = SIMD3(corner & 1 == 0 ? lower.x : upper.x, corner & 2 == 0 ? lower.y : upper.y,
+                              corner & 4 == 0 ? lower.z : upper.z)
+            let clip = transform * SIMD4(local, 1)
+            guard clip.w > 1e-6, clip.x.isFinite, clip.y.isFinite else { return nil }
+            let ndc = SIMD2(clip.x, clip.y) / clip.w
+            low = simd_min(low, ndc)
+            high = simd_max(high, ndc)
+        }
+        let x0 = (low.x + 1) / 2 * Float(width) - 2, x1 = (high.x + 1) / 2 * Float(width) + 2
+        let y0 = (1 - high.y) / 2 * Float(height) - 2, y1 = (1 - low.y) / 2 * Float(height) + 2
+        func clamped(_ value: Float, _ limit: Int) -> Int32 { Int32(max(0, min(Float(limit), value.rounded(.down)))) }
+        let rect = SIMD4(clamped(x0, width), clamped(y0, height), clamped(x1.rounded(.up), width), clamped(y1.rounded(.up), height))
+        return rect
+    }
+
+    /// Encodes the draws whose rectangles meet `rect` (all of them when nil),
+    /// with the bound pipeline and per-pass uniforms.
+    func encode(_ draws: [CADFieldDraw], within rect: SIMD4<Int32>?, encoder: any MTLRenderCommandEncoder) {
         encoder.setVertexBuffer(positions, offset: 0, index: 0)
         encoder.setFragmentBuffer(program, offset: 0, index: 3)
-        for item in ordered {
-            var values = Instance(item.instance, shell: item.part.shell, contacts: item.contacts)
+        for draw in draws {
+            if let rect, let bounds = draw.rect,
+               bounds.x >= rect.z || bounds.z <= rect.x || bounds.y >= rect.w || bounds.w <= rect.y { continue }
+            var values = draw.values
             encoder.setVertexBytes(&values, length: MemoryLayout<Instance>.stride, index: 2)
             encoder.setFragmentBytes(&values, length: MemoryLayout<Instance>.stride, index: 2)
-            encoder.drawIndexedPrimitives(type: .triangle, indexCount: item.part.indexCount, indexType: .uint32,
-                                          indexBuffer: indices, indexBufferOffset: item.part.indexStart * 4)
+            encoder.drawIndexedPrimitives(type: .triangle, indexCount: draw.indexCount, indexType: .uint32,
+                                          indexBuffer: indices, indexBufferOffset: draw.indexStart * 4)
         }
     }
 }
@@ -481,13 +549,25 @@ enum CADFieldPipelines {
     private static let lock = NSLock()
     private static var libraries: [String: any MTLLibrary] = [:]
 
-    static func library(device: any MTLDevice, macros: [String: NSNumber]) throws -> any MTLLibrary {
+    /// Exact silhouettes and contact curves are antialiased by tracing the
+    /// multisample rays; builds with `-Xswiftc -DRAD_ANALYTIC_EXACT_AA` derive
+    /// each sample's coverage analytically from ray 0 instead.
+    #if RAD_ANALYTIC_EXACT_AA
+    static let analyticAntialiasing = true
+    #else
+    static let analyticAntialiasing = false
+    #endif
+
+    static func library(device: any MTLDevice, macros programMacros: [String: NSNumber]) throws -> any MTLLibrary {
+        var macros = programMacros
+        macros["RAD_EXACT_ANALYTIC_AA"] = NSNumber(value: analyticAntialiasing ? 1 : 0)
         let key = "\(device.registryID)|" + macros.keys.sorted().map { "\($0)=\(macros[$0]!)" }.joined(separator: ",")
         if let library = lock.withLock({ libraries[key] }) { return library }
         let options = MTLCompileOptions()
         options.preprocessorMacros = macros
         if #available(macOS 15.0, *) { options.mathMode = .safe } else { options.fastMathEnabled = false }
-        let library = try device.makeLibrary(source: FieldProgramShaders.functions + shaderSource, options: options)
+        let library = try device.makeLibrary(source: FieldProgramShaders.functions + CADFieldShading.source + shaderSource,
+                                             options: options)
         lock.withLock { libraries[key] = library }
         return library
     }
@@ -500,7 +580,8 @@ enum CADFieldPipelines {
 // coordinates to the field's crossing: front faces forward to the entering
 // crossing, back faces backward to the exiting one. Rays that leave the
 // shell miss. Pixels near silhouettes trace their multisample rays too and
-// cover only the samples whose rays hit.
+// cover only the samples whose rays hit. Opaque crossings are stored per
+// sample (normal, part, depth) and shaded by the viewport's composite.
 
 struct CADFieldUniforms {
     float4x4 view;
@@ -535,22 +616,13 @@ struct CADFieldVarying {
     float3 partPosition;
 };
 
+// Passes into their own targets (translucent slices, highlight masks) map
+// a frame's NDC sub-rectangle onto the pass; the identity remap leaves clip
+// coordinates unchanged.
 vertex CADFieldVarying cad_field_vertex(const device packed_float3 *positions [[buffer(0)]],
                                         constant CADFieldUniforms &u [[buffer(1)]],
                                         constant CADFieldInstance &instance [[buffer(2)]],
                                         uint vid [[vertex_id]]) {
-    const float3 p = float3(positions[vid]);
-    CADFieldVarying out;
-    out.position = u.viewProjection * (instance.worldFromPart * float4(p, 1.0f));
-    out.partPosition = p;
-    return out;
-}
-
-// Highlight masks map a frame's NDC sub-rectangle onto their pass.
-vertex CADFieldVarying cad_field_mask_vertex(const device packed_float3 *positions [[buffer(0)]],
-                                             constant CADFieldUniforms &u [[buffer(1)]],
-                                             constant CADFieldInstance &instance [[buffer(2)]],
-                                             uint vid [[vertex_id]]) {
     const float3 p = float3(positions[vid]);
     float4 clip = u.viewProjection * (instance.worldFromPart * float4(p, 1.0f));
     const float2 center = (u.remap.xy + u.remap.zw) * 0.5f;
@@ -827,47 +899,14 @@ CADFieldResult cad_field_surface(CADFieldVarying in, constant CADFieldUniforms &
     return r;
 }
 
-// SceneKit's physically based shading for RAD's material and light rig:
-// Lambert diffuse, GGX distribution, height-correlated Smith visibility,
-// Schlick Fresnel, ambient times albedo, roughness widened by the
-// screen-space variation of the normal.
-static float cad_ggx(float alpha, float NoH) {
-    const float a2 = alpha * alpha;
-    const float d = (NoH * a2 - NoH) * NoH + 1.0f;
-    return a2 / (d * d * M_PI_F);
-}
-static float3 cad_schlick(float3 F0, float LoH) {
-    const float x = 1.0f - LoH, x2 = x * x;
-    return F0 + (1.0f - F0) * (x2 * x2 * x);
-}
-static float cad_smith(float alpha, float NoL, float NoV) {
-    const float a2 = alpha * alpha;
-    const float l = NoV * sqrt(NoL * NoL + a2 * (1.0f - NoL * NoL));
-    const float v = NoL * sqrt(NoV * NoV + a2 * (1.0f - NoV * NoV));
-    return 0.5f / (l + v + 1e-6f);
-}
+// Translucent layers shade where they are marched; roughness widens by the
+// normal's variation across the fragment quad.
 static float3 cad_shade(float3 n, float3 v, constant CADFieldInstance &instance, constant CADFieldUniforms &u) {
     const float3 dx = dfdx(n), dy = dfdy(n);
     const float variance = 0.25f * (dot(dx, dx) + dot(dy, dy));
-    const float roughness = clamp(instance.material.y, 0.01f, 1.0f);
-    const float alpha0 = roughness * roughness;
-    const float alpha = sqrt(saturate(alpha0 * alpha0 + min(variance, 0.18f)));
-    const float NoV = fabs(dot(n, v));
-    const float metalness = instance.material.x;
-    const float3 albedo = instance.albedo.rgb;
-    const float3 F0 = mix(float3(0.04f), albedo, metalness);
-    float3 diffuse = 0, specular = 0;
-    for (int i = 0; i < 2; ++i) {
-        const float3 l = i == 0 ? u.lightDirection0.xyz : u.lightDirection1.xyz;
-        const float3 c = i == 0 ? u.lightColor0.rgb : u.lightColor1.rgb;
-        const float3 h = normalize(l + v);
-        const float NoL = saturate(dot(n, l));
-        const float NoH = saturate(dot(n, h));
-        const float LoH = saturate(dot(l, h));
-        diffuse += c * NoL;
-        specular += c * cad_schlick(F0, LoH) * (NoL * cad_ggx(alpha, NoH) * cad_smith(alpha, NoL, NoV) * M_PI_F);
-    }
-    return u.ambient.rgb * albedo + diffuse * albedo * (1.0f - metalness) + specular + instance.emission.rgb;
+    return cad_shade_lit(n, v, instance.albedo.rgb, instance.emission.rgb, instance.material.x, instance.material.y,
+                         variance, u.ambient.rgb, u.lightDirection0.xyz, u.lightColor0.rgb,
+                         u.lightDirection1.xyz, u.lightColor1.rgb);
 }
 
 static float3 cad_field_color(thread const CADFieldResult &r, bool front, constant CADFieldInstance &instance,
@@ -895,22 +934,34 @@ static float cad_field_depth(thread const CADFieldResult &r, constant CADFieldIn
     return min(clip.z / clip.w, rasterized) - halfPixel;
 }
 
-struct CADFieldOpaqueOut {
-    float4 color [[color(0)]];
+struct CADFieldGeometryOut {
+    float2 normal [[color(0)]];   // octahedral unit view-space normal (debug 1, 3: a scalar in x)
+    ushort part [[color(1)]];     // solid index + 1
     float depth [[depth(less)]];
     uint mask [[sample_mask]];
 };
 
-fragment CADFieldOpaqueOut cad_field_opaque(CADFieldVarying in [[stage_in]],
-                                            constant CADFieldUniforms &u [[buffer(1)]],
-                                            constant CADFieldInstance &instance [[buffer(2)]],
-                                            device const uint *w [[buffer(3)]]) {
+// Opaque crossings, stored per sample for the composite to shade.
+fragment CADFieldGeometryOut cad_field_geometry(CADFieldVarying in [[stage_in]],
+                                               constant CADFieldUniforms &u [[buffer(1)]],
+                                               constant CADFieldInstance &instance [[buffer(2)]],
+                                               device const uint *w [[buffer(3)]]) {
     bool traced;
     const CADFieldResult r = cad_field_surface(in, u, instance, w, 1.0f, true, traced, true);
     const float halfPixel = 0.5f * (fabs(dfdx(in.position.z)) + fabs(dfdy(in.position.z)));
     if (r.mask == 0 || r.shaded == CAD_FIELD_NONE) discard_fragment();
-    CADFieldOpaqueOut out;
-    out.color = float4(cad_field_color(r, true, instance, u, traced), 1.0f);
+    CADFieldGeometryOut out;
+    const int debug = int(u.projection.w);
+    if (debug == 1) {
+        out.normal = float2(saturate(float(r.steps) / 32.0f), 0.0f);
+    } else if (debug == 3) {
+        out.normal = float2(traced ? 1.0f : 0.0f, 0.0f);
+    } else {
+        const float3 n = (u.view * (instance.worldFromPart * float4(r.normal, 0.0f))).xyz;
+        const float len = length(n);
+        out.normal = cad_octahedral_encode(len > 0.0f ? n / len : float3(0.0f, 0.0f, 1.0f));
+    }
+    out.part = ushort(instance.part.x + 1u);
     out.depth = cad_field_depth(r, instance, u, in.position.z, halfPixel);
     out.mask = r.mask;
     return out;
@@ -984,61 +1035,120 @@ fragment float4 cad_field_mask(CADFieldVarying in [[stage_in]],
 """#
 }
 
-/// Shared between a scene source's field nodes and the passes encoding a
-/// frame: the frame's exact faces, set only while SceneKit renders it.
-final class CADFieldPassState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var frame: CADFieldFrame?
+/// SceneKit's physically based shading for RAD's material and light rig,
+/// shared by the translucent layers and the opaque composite: Lambert
+/// diffuse, GGX distribution, height-correlated Smith visibility, Schlick
+/// Fresnel, ambient times albedo, roughness widened by `variance`, the
+/// normal's screen-space variation.
+enum CADFieldShading {
+    static let source = #"""
 
-    func begin(_ frame: CADFieldFrame?) { lock.withLock { self.frame = frame } }
-    func end() { lock.withLock { frame = nil } }
-    var current: CADFieldFrame? { lock.withLock { frame } }
+// ---------------------------------------------------------------- RAD exact shading
+static float cad_ggx(float alpha, float NoH) {
+    const float a2 = alpha * alpha;
+    const float d = (NoH * a2 - NoH) * NoH + 1.0f;
+    return a2 / (d * d * M_PI_F);
+}
+static float3 cad_schlick(float3 F0, float LoH) {
+    const float x = 1.0f - LoH, x2 = x * x;
+    return F0 + (1.0f - F0) * (x2 * x2 * x);
+}
+static float cad_smith(float alpha, float NoL, float NoV) {
+    const float a2 = alpha * alpha;
+    const float l = NoV * sqrt(NoL * NoL + a2 * (1.0f - NoL * NoL));
+    const float v = NoL * sqrt(NoV * NoV + a2 * (1.0f - NoV * NoV));
+    return 0.5f / (l + v + 1e-6f);
+}
+static float3 cad_shade_lit(float3 n, float3 v, float3 albedo, float3 emission, float metalness, float roughness0,
+                            float variance, float3 ambient, float3 l0, float3 c0, float3 l1, float3 c1) {
+    const float roughness = clamp(roughness0, 0.01f, 1.0f);
+    const float alpha0 = roughness * roughness;
+    const float alpha = sqrt(saturate(alpha0 * alpha0 + min(variance, 0.18f)));
+    const float NoV = fabs(dot(n, v));
+    const float3 F0 = mix(float3(0.04f), albedo, metalness);
+    float3 diffuse = 0, specular = 0;
+    for (int i = 0; i < 2; ++i) {
+        const float3 l = i == 0 ? l0 : l1;
+        const float3 c = i == 0 ? c0 : c1;
+        const float3 h = normalize(l + v);
+        const float NoL = saturate(dot(n, l));
+        const float NoH = saturate(dot(n, h));
+        const float LoH = saturate(dot(l, h));
+        diffuse += c * NoL;
+        specular += c * cad_schlick(F0, LoH) * (NoL * cad_ggx(alpha, NoH) * cad_smith(alpha, NoL, NoV) * M_PI_F);
+    }
+    return ambient * albedo + diffuse * albedo * (1.0f - metalness) + specular + emission;
 }
 
-/// A geometry-free node's renderer delegate that draws every exact solid of
-/// the frame into SceneKit's current scene pass, with that pass's exact
-/// view and projection. One node per pass; it keeps no mutable state of its
-/// own, so a capture's copy attaches a fresh delegate with its own state.
+// Unit normals stored as two signed values (octahedral mapping).
+static float2 cad_octahedral_encode(float3 n) {
+    n /= max(fabs(n.x) + fabs(n.y) + fabs(n.z), 1e-20f);
+    if (n.z < 0.0f) {
+        const float2 s = select(float2(-1.0f), float2(1.0f), n.xy >= 0.0f);
+        return (1.0f - fabs(n.yx)) * s;
+    }
+    return n.xy;
+}
+static float3 cad_octahedral_decode(float2 e) {
+    float3 n = float3(e, 1.0f - fabs(e.x) - fabs(e.y));
+    const float t = saturate(-n.z);
+    n.xy += select(float2(t), float2(-t), n.xy >= 0.0f);
+    return normalize(n);
+}
+"""#
+}
+
+/// Shared between a scene source's field nodes and the passes encoding a
+/// frame: the stored exact layers SceneKit's scene passes composite, set
+/// only while SceneKit renders the frame.
+final class CADFieldPassState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var composite: CADExactComposite?
+    private var mismatched = false
+
+    func begin(_ composite: CADExactComposite?) { lock.withLock { self.composite = composite; mismatched = false } }
+    /// Returns whether every pass drew the stored layers' own view.
+    @discardableResult
+    func end() -> Bool { lock.withLock { composite = nil; return !mismatched } }
+    var current: CADExactComposite? { lock.withLock { composite } }
+    func reportMismatch() { lock.withLock { mismatched = true } }
+}
+
+/// A geometry-free node's renderer delegate that composites the frame's
+/// stored exact layers into SceneKit's current scene pass, drawn before the
+/// pass's own geometry: shaded opaque samples with their depth, translucent
+/// visibility depth, or transmittance. One node per pass; it keeps no
+/// mutable state of its own, so a capture's copy attaches a fresh delegate
+/// with its own state.
 final class CADFieldPassDelegate: NSObject, SCNNodeRendererDelegate, @unchecked Sendable {
-    let mode: CADFieldResources.Mode
+    enum Pass: Sendable { case opaque, visibility, accumulation, revealage }
+
+    let pass: Pass
     let state: CADFieldPassState
 
-    init(mode: CADFieldResources.Mode, state: CADFieldPassState) {
-        self.mode = mode
+    init(pass: Pass, state: CADFieldPassState) {
+        self.pass = pass
         self.state = state
     }
 
     func renderNode(_ node: SCNNode, renderer: SCNRenderer, arguments: [String: Any]) {
-        guard let frame = state.current, !frame.instances.isEmpty,
+        guard let composite = state.current, pass != .accumulation,
               let encoder = renderer.currentRenderCommandEncoder,
               let view = (arguments[SCNViewTransform] as? NSValue)?.scnMatrix4Value,
               let projection = (arguments[SCNProjectionTransform] as? NSValue)?.scnMatrix4Value else { return }
-        let pass = renderer.currentRenderPassDescriptor
-        guard let color = pass.colorAttachments[0].texture else { return }
-        let depth = pass.depthAttachment.texture
-        let resources = frame.resources
-        guard let pipeline = try? resources.pipeline(mode, color: color.pixelFormat, depth: depth?.pixelFormat ?? .invalid,
-                                                      samples: color.sampleCount) else { return }
-        let viewMatrix = simd_float4x4(view)
-        var uniforms = CADFieldResources.Uniforms(view: viewMatrix, projection: simd_float4x4(projection),
-                                                  height: color.height, lights: frame.lights,
-                                                  alpha: CADTranslucency.alpha, debug: frame.debug,
-                                                  sampleOffsets: resources.sampleOffsets)
-        encoder.pushDebugGroup("RAD exact faces")
-        encoder.setRenderPipelineState(pipeline)
-        switch mode {
-        case .opaque, .visibility:
-            encoder.setDepthStencilState(resources.depthWrite)
-            encoder.setCullMode(.back)
-        case .accumulation, .revealage, .mask:
-            encoder.setDepthStencilState(resources.depthIgnored)
-            encoder.setCullMode(.none)
+        let descriptor = renderer.currentRenderPassDescriptor
+        guard let color = descriptor.colorAttachments[0].texture else { return }
+        let viewMatrix = simd_float4x4(view), projectionMatrix = simd_float4x4(projection)
+        // The stored layers belong to one view; a pass of another (a camera
+        // committed after the geometry was drawn) must not show them.
+        guard CADExactKey.sameView(viewMatrix, projectionMatrix, composite.view, composite.projection) else {
+            state.reportMismatch()
+            return
         }
-        encoder.setFrontFacing(.counterClockwise)
-        encoder.setTriangleFillMode(.fill)
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
-        resources.draw(frame.instances, view: viewMatrix, encoder: encoder, contacts: mode == .opaque)
+        encoder.pushDebugGroup("RAD exact composite")
+        composite.encode(pass, encoder: encoder, colorFormat: color.pixelFormat,
+                         depthFormat: descriptor.depthAttachment.texture?.pixelFormat ?? .invalid,
+                         samples: color.sampleCount, projection: projectionMatrix)
         encoder.popDebugGroup()
     }
 }

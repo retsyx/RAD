@@ -31,7 +31,9 @@ final class CADViewportCapture: @unchecked Sendable {
     }
 
     /// Renders a frame of any scene source offscreen through the viewport's
-    /// passes, preparing a renderer of its own unless one is supplied.
+    /// passes, preparing a renderer of its own unless one is supplied. Exact
+    /// layers are drawn in the viewport's slices, each its own command buffer
+    /// so other GPU work interleaves, then composited; the call waits for all.
     static func image(of frame: CADViewportFrame, source: CADViewportSceneSource,
                       renderer existing: SCNRenderer? = nil, passes existingPasses: CADViewportPasses? = nil) throws -> CGImage {
         try Task.checkCancellation()
@@ -57,11 +59,43 @@ final class CADViewportCapture: @unchecked Sendable {
         guard let target = device.makeTexture(descriptor: descriptor), let commandBuffer = queue.makeCommandBuffer() else {
             throw RADError.message("RAD could not allocate the design image.")
         }
-        passes.encode(frame, source: source, renderer: renderer, into: target, commandBuffer: commandBuffer)
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if commandBuffer.status != .completed {
-            throw RADError.message("RAD could not render the design image.")
+        var committed: [any MTLCommandBuffer] = []
+        if frame.field != nil, let job = passes.makeJob(frame, source: source, renderer: renderer, commandBuffer: commandBuffer) {
+            commandBuffer.commit()
+            committed.append(commandBuffer)
+            // One queue orders the slices before the composite.
+            func slices(_ encode: (any MTLCommandBuffer) -> Bool) throws {
+                while true {
+                    try Task.checkCancellation()
+                    guard let slice = queue.makeCommandBuffer() else {
+                        throw RADError.message("RAD could not render the design image.")
+                    }
+                    guard encode(slice) else { return }
+                    slice.commit()
+                    committed.append(slice)
+                }
+            }
+            try slices { passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: $0) != nil }
+            job.completed = job.encoded
+            passes.prepareMasks(job, frame: frame)
+            try slices { passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: $0) != nil }
+            for coverage in job.masks.values { coverage.completed = coverage.encoded }
+            guard let composite = queue.makeCommandBuffer(),
+                  passes.encodeComposite(frame, job: job, source: source, renderer: renderer, into: target,
+                                         commandBuffer: composite) else {
+                throw RADError.message("RAD could not render the design image.")
+            }
+            composite.commit()
+            committed.append(composite)
+        } else {
+            passes.encode(frame, source: source, renderer: renderer, into: target, commandBuffer: commandBuffer)
+            commandBuffer.commit()
+            committed.append(commandBuffer)
+        }
+        committed.last?.waitUntilCompleted()
+        for buffer in committed {
+            buffer.waitUntilCompleted()
+            if buffer.status != .completed { throw RADError.message("RAD could not render the design image.") }
         }
         let bytesPerRow = width * 4
         var pixels = Data(count: bytesPerRow * height)

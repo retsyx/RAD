@@ -227,8 +227,13 @@ final class CADSceneView: NSView {
     /// Exact or display-mesh faces while navigating, from measured GPU times.
     var navigationPolicy = ViewportNavigationPolicy()
     private var wheelSettle: Task<Void, Never>?
-    /// Whether the newest published frame drew exact faces where it could.
-    private var publishedExactFaces = true
+    /// Whether the newest published frame asked for display meshes because
+    /// the user was navigating.
+    private var publishedNavigationMeshes = false
+    /// Revision of everything frames show besides exact or display-mesh
+    /// faces: until exact layers are complete, the render thread shows a
+    /// newer revision with display meshes.
+    private var presentationRevision: UInt64 = 0
     /// Shader diagnostics for measurements (CADFieldFrame.debug).
     var fieldDebugMode = 0
     /// The parts drawn with exact faces. Diagnostics and tests read it.
@@ -274,7 +279,7 @@ final class CADSceneView: NSView {
     /// Whether the newest completed frame drew exact faces.
     private(set) var renderedExactFaces = false
     private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4, showsModel: Bool,
-                                             exact: Bool, pixels: Int)] = []
+                                             pixels: Int)] = []
     /// A model replaced by another display ready to install, such as the
     /// design and its 3D printing version, stays on screen in the last
     /// presented frame until the replacement and its highlights are prepared.
@@ -906,14 +911,13 @@ final class CADSceneView: NSView {
         return mask
     }
 
-    /// Highlight geometry and parameters for one frame of `width`×`height`
-    /// pixels. Captures call this with their own output size and always
-    /// draw exact faces; `exact` false draws every solid's display mesh.
-    func makeFrame(width: Int, height: Int, exact: Bool = true) -> CADViewportFrame {
+    /// Highlight geometry, exact faces and parameters for one frame of
+    /// `width`×`height` pixels. Captures call this with their own output size.
+    func makeFrame(width: Int, height: Int) -> CADViewportFrame {
         var frame = CADViewportFrame(width: width, height: height, referenceHeight: Double(bounds.height),
                                      translucent: mode == .translucent, palette: Self.highlightPalette)
         guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
-        if exact, mode != .wireframe, let resources = fieldResources {
+        if mode != .wireframe, let resources = fieldResources {
             var instances: [CADFieldInstance] = []
             for solid in resources.parts.keys.sorted() where !hiddenSolids.contains(solid) {
                 let selected = selectedSolids.contains(solid)
@@ -926,8 +930,15 @@ final class CADSceneView: NSView {
                     emission: selected ? SIMD3(glow.x, glow.y, glow.z) : .zero))
             }
             let visible = solidNodes.keys.filter { !hiddenSolids.contains($0) }.count
-            frame.field = CADFieldFrame(resources: resources, instances: instances, lights: fieldLights,
-                                        complete: instances.count == visible, debug: fieldDebugMode)
+            let field = CADFieldFrame(resources: resources, instances: instances, lights: fieldLights,
+                                      complete: instances.count == visible, debug: fieldDebugMode)
+            frame.field = field
+            let camera = cameraNode.camera
+            let orthographic = camera?.usesOrthographicProjection ?? false
+            let extent = Float(orthographic ? camera?.orthographicScale ?? 1 : Double(camera?.fieldOfView ?? 0))
+            frame.key = CADExactKey(field: field, camera: cameraNode.simdWorldTransform,
+                                    projection: SIMD2(extent, orthographic ? 1 : 0), width: width, height: height,
+                                    translucent: frame.translucent)
         }
         let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
         let pixels = SIMD2(Double(width), Double(height))
@@ -1236,9 +1247,10 @@ final class CADSceneView: NSView {
         navigationPolicy.begin(source)
     }
 
-    /// Ending navigation publishes an exact frame when the last one was not.
+    /// Ending navigation publishes the state again when the last frame asked
+    /// for display meshes, so its exact faces are drawn.
     private func endNavigation(_ source: ViewportNavigationPolicy.Source) {
-        if navigationPolicy.end(source), !publishedExactFaces { requestRedraw() }
+        if navigationPolicy.end(source), publishedNavigationMeshes { requestRedraw(changesContent: false) }
     }
 
     /// Wheel scrolling reports no end: one deferred publish follows its last event.
@@ -1364,7 +1376,10 @@ final class CADSceneView: NSView {
     /// Publishes the view's state to the render thread once per main-queue
     /// turn, however many changes that turn made. The render thread draws
     /// exactly the frames published; nothing renders while nothing changes.
-    private func requestRedraw() {
+    /// Redraws for the end of navigation, visibility, activation and wake
+    /// change no content.
+    private func requestRedraw(changesContent: Bool = true) {
+        if changesContent { presentationRevision &+= 1 }
         guard !framePublicationScheduled else { return }
         framePublicationScheduled = true
         DispatchQueue.main.async { [weak self] in self?.publishFrame() }
@@ -1389,13 +1404,15 @@ final class CADSceneView: NSView {
         SCNTransaction.flush()
         publishedGeneration &+= 1
         let interval = 1 / Double(max(window?.screen?.maximumFramesPerSecond ?? 60, 1))
-        let frame = makeFrame(width: width, height: height,
-                              exact: navigationPolicy.drawsExactFaces(pixels: width * height, interval: interval))
-        let exact = frame.field != nil
-        publishedExactFaces = exact || frame.width == 0 || fieldResources == nil || mode == .wireframe
+        navigationPolicy.setContext(resources: fieldResources.map(ObjectIdentifier.init), pixels: width * height)
+        var frame = makeFrame(width: width, height: height)
+        frame.navigating = navigationPolicy.isNavigating
+        frame.exactFitsBudget = navigationPolicy.exactFits(pixels: width * height, interval: interval)
+        frame.presentation = presentationRevision
+        publishedNavigationMeshes = frame.field != nil && frame.navigating && !frame.exactFitsBudget
         publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform, !modelNode.isHidden,
-                                          exact, width * height))
-        if publishedCameraTransforms.count > 16 { publishedCameraTransforms.removeFirst() }
+                                          width * height))
+        if publishedCameraTransforms.count > 64 { publishedCameraTransforms.removeFirst() }
         let traced = publishedGeneration
         ViewportFrameTrace.shared.update(traced) { $0.published = ViewportFrameTrace.now }
         loop.submit(.init(frame: frame, source: sceneSource, generation: publishedGeneration))
@@ -1403,26 +1420,35 @@ final class CADSceneView: NSView {
 
     private func startRenderLoop() -> ViewportRenderLoop? {
         guard renderLoop == nil, let layer = layer as? CAMetalLayer else { return renderLoop }
-        renderLoop = ViewportRenderLoop(layer: layer, renderer: renderer) { [weak self] generation, seconds in
-            MainActor.assumeIsolated { self?.frameCompleted(generation, gpuSeconds: seconds) }
+        renderLoop = ViewportRenderLoop(layer: layer, renderer: renderer) { [weak self] generation, seconds, outcome in
+            MainActor.assumeIsolated { self?.frameCompleted(generation, gpuSeconds: seconds, outcome: outcome) }
         }
         return renderLoop
     }
 
-    private func frameCompleted(_ generation: UInt64, gpuSeconds: Double) {
+    /// A presented frame's GPU completion. Display meshes standing in for
+    /// exact layers in progress leave the frame pending until its exact
+    /// composite completes.
+    private func frameCompleted(_ generation: UInt64, gpuSeconds: Double, outcome: ViewportRenderLoop.Outcome) {
         renderedFrameCount += 1
-        renderedGeneration = max(renderedGeneration, generation)
         if let published = publishedCameraTransforms.last(where: { $0.generation == generation }) {
             renderedCameraTransform = published.transform
             renderedShowsModel = published.showsModel
-            renderedExactFaces = published.exact
+            renderedExactFaces = outcome.exact
             if published.showsModel, fieldResources != nil {
-                navigationPolicy.record(exact: published.exact, gpuSeconds: gpuSeconds, pixels: published.pixels)
+                navigationPolicy.record(exact: outcome.exact, gpuSeconds: outcome.geometrySeconds ?? gpuSeconds,
+                                        pixels: published.pixels, geometry: outcome.geometrySeconds != nil)
             }
         }
-        publishedCameraTransforms.removeAll { $0.generation <= generation }
+        if outcome.final {
+            renderedGeneration = max(renderedGeneration, generation)
+            publishedCameraTransforms.removeAll { $0.generation < generation }
+        }
         onFrameRendered?()
     }
+
+    /// Exact work the render thread has encoded (diagnostics and tests).
+    var exactStatistics: CADViewportPasses.Statistics? { renderLoop?.statistics }
 
     private var canDrawViewport: Bool {
         guard let window, window.isVisible, !window.isMiniaturized, !isHiddenOrHasHiddenAncestor else { return false }
@@ -1476,7 +1502,8 @@ final class CADSceneView: NSView {
         resetNavigationGesture()
         cancelCameraTransition()
         if newWindow == nil {
-            renderLoop?.cancelPending()
+            // Drop unstarted frames, exact work and the stored exact layers.
+            renderLoop?.releaseResources()
             if pendingMesh != nil {
                 // Retain the requested input for reattachment, but discard work
                 // and completions owned by the detached rendering surface.
@@ -1510,7 +1537,7 @@ final class CADSceneView: NSView {
             // occlusion notifications arrive later through the event loop.
             windowVisibilityObservation = window.observe(\.isVisible) { [weak self] window, _ in
                 MainActor.assumeIsolated {
-                    if window.isVisible { self?.requestRedraw() }
+                    if window.isVisible { self?.requestRedraw(changesContent: false) }
                 }
             }
             NotificationCenter.default.addObserver(self, selector: #selector(windowDeminiaturized),
@@ -1539,13 +1566,13 @@ final class CADSceneView: NSView {
     }
     @objc private func windowBecameKey() {
         onActivated?(self)
-        requestRedraw()
+        requestRedraw(changesContent: false)
     }
-    @objc private func windowDeminiaturized() { requestRedraw() }
+    @objc private func windowDeminiaturized() { requestRedraw(changesContent: false) }
 
     @objc private func windowVisibilityChanged() {
         if window?.occlusionState.contains(.visible) == true {
-            requestRedraw()
+            requestRedraw(changesContent: false)
         } else {
             cancelAssemblyGrab()
             cancelCameraTransition()
@@ -1557,7 +1584,7 @@ final class CADSceneView: NSView {
     @objc private func viewportEnvironmentWoke() {
         cancelAssemblyGrab()
         guard window != nil else { return }
-        requestRedraw()
+        requestRedraw(changesContent: false)
     }
 
     override func mouseEntered(with event: NSEvent) { updateHover(with: event) }

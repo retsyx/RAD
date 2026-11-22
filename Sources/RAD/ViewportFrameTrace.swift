@@ -6,6 +6,8 @@ import QuartzCore
 final class ViewportFrameTrace: @unchecked Sendable {
     struct Frame: Sendable {
         var generation: UInt64
+        /// mesh, stand-in, single (exact geometry and composite) or composite.
+        var kind = ""
         var exact = false
         var pixels = 0
         var published: Double = 0
@@ -20,9 +22,20 @@ final class ViewportFrameTrace: @unchecked Sendable {
         var presented: Double = 0
     }
 
+    /// One exact slice command buffer (geometry or outline coverage).
+    struct Slice: Sendable {
+        var job: ObjectIdentifier
+        var mask: Bool
+        var covered: Int
+        var committed: Double
+        var gpuStart: Double
+        var gpuEnd: Double
+    }
+
     static let shared = ViewportFrameTrace()
     private let lock = NSLock()
     private var frames: [UInt64: Frame] = [:]
+    private var slices: [Slice] = []
     nonisolated(unsafe) static var enabled = false
 
     func update(_ generation: UInt64, _ change: (inout Frame) -> Void) {
@@ -34,10 +47,23 @@ final class ViewportFrameTrace: @unchecked Sendable {
         }
     }
 
+    func addSlice(_ slice: Slice) {
+        guard Self.enabled else { return }
+        lock.withLock { slices.append(slice) }
+    }
+
     func take() -> [Frame] {
         lock.withLock {
             let result = frames.values.sorted { $0.generation < $1.generation }
             frames.removeAll()
+            return result
+        }
+    }
+
+    func takeSlices() -> [Slice] {
+        lock.withLock {
+            let result = slices
+            slices.removeAll()
             return result
         }
     }
