@@ -39,8 +39,9 @@ final class CADViewportCapture: @unchecked Sendable {
 
     /// Renders a frame of any scene source offscreen through the viewport's
     /// passes, preparing a renderer of its own unless one is supplied. Exact
-    /// layers are drawn in the viewport's slices, each its own command buffer
-    /// so other GPU work interleaves, then composited; the call waits for all.
+    /// layers are drawn in slices like the viewport's, each its own command
+    /// buffer so other GPU work interleaves, then composited; the call waits
+    /// for all.
     /// A `sliceBudget` replaces the viewport's growing budgets (tests).
     static func image(of frame: CADViewportFrame, source: CADViewportSceneSource,
                       renderer existing: SCNRenderer? = nil, passes existingPasses: CADViewportPasses? = nil,
@@ -77,6 +78,12 @@ final class CADViewportCapture: @unchecked Sendable {
             costKey = job.costKey
             commandBuffer.commit()
             committed.append(commandBuffer)
+            // Small opaque slices (`CADViewportPasses.sliceLimits`) cover
+            // larger blocks than the viewport's.
+            if sliceBudget == nil, !job.key.translucent, !CADExactCost.shared.isProven(job.costKey) {
+                job.plan = CADSlicePlan(width: job.width, height: job.height, rects: job.draws.map(\.rect),
+                                        block: CADSlicePlan.captureBlock)
+            }
             // One queue orders the slices before the composite. One slice
             // runs ahead, and each measures the design's cost for the next;
             // one that fails or takes far too long ends exact faces of the

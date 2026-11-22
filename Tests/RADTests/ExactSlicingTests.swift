@@ -28,8 +28,8 @@ final class ExactSlicingTests: XCTestCase {
     /// reaches get no slice.
     func testSlicePlanCoversEveryReachedBlockOnceWithinItsBudget() {
         var random = Generator(state: 7)
-        let size = CADSlicePlan.block
         for trial in 0..<300 {
+            let size = [CADSlicePlan.block, CADSlicePlan.captureBlock, CADSlicePlan.translucentBlock][trial % 3]
             let width = Int.random(in: 1...2_400, using: &random), height = Int.random(in: 1...1_600, using: &random)
             let rects: [SIMD4<Int32>?] = (0..<Int.random(in: 0...6, using: &random)).map { _ in
                 if Int.random(in: 0..<12, using: &random) == 0 { return nil }
@@ -37,7 +37,7 @@ final class ExactSlicingTests: XCTestCase {
                 let y0 = Int32.random(in: -60...Int32(height + 20), using: &random)
                 return SIMD4(x0, y0, x0 + Int32.random(in: 0...1_200, using: &random), y0 + Int32.random(in: 0...900, using: &random))
             }
-            var plan = CADSlicePlan(width: width, height: height, rects: rects)
+            var plan = CADSlicePlan(width: width, height: height, rects: rects, block: size)
             let columns = (width + size - 1) / size, rows = (height + size - 1) / size
             // The reference coverage of each block.
             var expected = [Int](repeating: 0, count: columns * rows)
@@ -53,7 +53,7 @@ final class ExactSlicingTests: XCTestCase {
             }
             XCTAssertEqual(plan.total, expected.reduce(0, +))
             // Small budgets give runs of blocks, large ones strips of rows.
-            let budget = trial % 3 == 0 ? Int.random(in: 100_000...4_000_000, using: &random) : Int.random(in: 1...300_000, using: &random)
+            let budget = trial % 4 == 0 ? Int.random(in: 100_000...4_000_000, using: &random) : Int.random(in: 1...300_000, using: &random)
             var owners = [Int](repeating: -1, count: expected.count)
             var index = 0, sum = 0, lastBlock = -1
             while let slice = plan.next(budget: budget) {

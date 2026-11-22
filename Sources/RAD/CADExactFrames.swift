@@ -134,6 +134,10 @@ struct CADSlicePlan: Sendable {
     /// Block side in pixels (an even number keeps pixel quads whole).
     static let block = 128
     static let translucentBlock = 64
+    /// Opaque blocks of a capture's small slices: captures wait for every
+    /// slice, and a floor-bound design's heaviest tiles then share passes
+    /// instead of each lengthening a pass of its own.
+    static let captureBlock = 256
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of

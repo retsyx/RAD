@@ -427,8 +427,80 @@ final class Probe: @unchecked Sendable {
         return (busy * 1000, durations, waits)
     }
 
+    /// "live:MS:N": the viewport's slice loop with fixed limits (MS milliseconds by the design's recorded,
+    /// decaying rate, at most N blocks), each slice recorded when it completes, one queued behind the running one.
+    private func runLive(seconds: Double, blocks: Int, light: String?) throws -> (busy: Double, slices: [Double], waits: [Double]) {
+        let setup = try XCTUnwrap(queue.makeCommandBuffer())
+        let job = try newJob(setup)
+        setup.commit()
+        var committed: [any MTLCommandBuffer] = []
+        var done = false
+        let lock = NSLock()
+        var waits: [Double] = []
+        let group = DispatchGroup()
+        if let light {
+            group.enter()
+            Thread.detachNewThread { [self] in
+                defer { group.leave() }
+                var frames: [(any MTLCommandBuffer, Double)] = []
+                let interval = light == "sparse" ? 0.045 : 0.00833
+                let start = CACurrentMediaTime()
+                while !lock.withLock({ done }) {
+                    if light == "app", frames.count >= 2 { frames[frames.count - 2].0.waitUntilCompleted() }
+                    guard let buffer = try? lightFrame() else { break }
+                    let t = CACurrentMediaTime()
+                    buffer.commit()
+                    frames.append((buffer, t))
+                    let next = start + Double(frames.count) * interval - CACurrentMediaTime()
+                    if next > 0 { usleep(UInt32(next * 1e6)) }
+                }
+                for (buffer, t) in frames {
+                    buffer.waitUntilCompleted()
+                    waits.append((buffer.gpuEndTime - t) * 1000)
+                }
+            }
+        }
+        let key = job.costKey
+        while job.hasSlicesToEncode {
+            if committed.count >= 2 { committed[committed.count - 2].waitUntilCompleted() }
+            let buffer = try XCTUnwrap(queue.makeCommandBuffer())
+            guard let slice = passes.encodeSlice(job, budget: seconds, blocks: blocks, commandBuffer: buffer) else { break }
+            buffer.addCompletedHandler { b in
+                CADExactCost.shared.recordSlice(key, seconds: b.gpuEndTime - b.gpuStartTime, covered: slice.covered,
+                                                blocks: slice.blocks)
+            }
+            buffer.commit()
+            committed.append(buffer)
+        }
+        committed.last?.waitUntilCompleted()
+        lock.withLock { done = true }
+        group.wait()
+        var busy = 0.0, cursor = 0.0, durations: [Double] = []
+        for b in committed.sorted(by: { $0.gpuStartTime < $1.gpuStartTime }) {
+            if b.gpuEndTime > cursor { busy += b.gpuEndTime - max(b.gpuStartTime, cursor) }
+            durations.append((b.gpuEndTime - max(b.gpuStartTime, cursor)) * 1000)
+            cursor = max(cursor, b.gpuEndTime)
+        }
+        return (busy * 1000, durations, waits)
+    }
+
     func scheme(_ spec: [String]) throws -> String {
         try warmUp()
+        if spec.first == "live" {
+            let seconds = Double(spec[1])! / 1000, blocks = Int(spec[2])!
+            _ = try runLive(seconds: seconds, blocks: blocks, light: nil)  // the rate settles
+            var best: (busy: Double, slices: [Double], waits: [Double])?
+            for _ in 0..<2 {
+                let r = try runLive(seconds: seconds, blocks: blocks, light: nil)
+                if best == nil || r.busy < best!.busy { best = r }
+            }
+            let s = best!.slices.sorted()
+            var line = String(format: "busy %.1f ms, %d slices (p50 %.1f max %.1f)", best!.busy, s.count, s[s.count / 2], s.last!)
+            var sparse: [Double] = [], app: [Double] = []
+            for _ in 0..<3 { sparse += try runLive(seconds: seconds, blocks: blocks, light: "sparse").waits }
+            for _ in 0..<2 { app += try runLive(seconds: seconds, blocks: blocks, light: "app").waits }
+            return line + "; sparse " + Self.summary(sparse) + "; app " + Self.summary(app)
+        }
         var best: (busy: Double, slices: [Double], waits: [Double])?
         for _ in 0..<2 {
             let r = try runScheme(spec, light: nil)
