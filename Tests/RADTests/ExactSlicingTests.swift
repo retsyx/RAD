@@ -386,4 +386,88 @@ final class ExactSlicingTests: XCTestCase {
         XCTAssertGreaterThan(orbited.geometrySlices, rehovered.geometrySlices)
         XCTAssertTrue(view.renderedExactFaces)
     }
+
+    private final class Completions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var outcomes: [(UInt64, ViewportRenderLoop.Outcome)] = []
+        func append(_ generation: UInt64, _ outcome: ViewportRenderLoop.Outcome) {
+            lock.withLock { outcomes.append((generation, outcome)) }
+        }
+        func drewExact(_ generation: UInt64) -> Bool {
+            lock.withLock { outcomes.contains { $0.0 == generation && $0.1.exact && $0.1.final } }
+        }
+    }
+
+    /// A design whose blocks take more than two budgets keeps one slice in
+    /// flight and encodes the next one behind it. Frames with new geometry
+    /// abandon the job and release that uncommitted slice, and Metal runs a
+    /// released command buffer's completed handlers: the render loop must
+    /// ignore them and keep drawing. (Releasing it under the loop's lock once
+    /// deadlocked the render thread and every caller of `submit`.)
+    func testAbandoningAQueuedSliceKeepsTheRenderLoopDrawing() async throws {
+        let preview = try await preview("result = [sphere(5), box((30, 30, 1))]")
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
+        let capture = try await capture(preview, display: .edges, width: 1600, height: 1200)
+        let frame = capture.frame, source = capture.source
+        let key = try XCTUnwrap(frame.key)
+        // Measured as heavy: every frame slices, a block per slice, one in flight.
+        let costKey = CADExactCost.Key(resources: key.resources, width: frame.width, height: frame.height, translucent: false)
+        CADExactCost.shared.recordFrame(costKey, seconds: 1, covered: 1)
+        CADExactCost.shared.recordSlice(costKey, seconds: 1, covered: CADExactCost.minimumCovered)
+        CADExactCost.shared.recordBlocks(costKey, side: CADSlicePlan.block, seconds: 3 * CADViewportPasses.sliceBudget, count: 1)
+        XCTAssertEqual(CADExactCost.shared.slicesInFlight(costKey), 1)
+        defer { CADExactCost.shared.forget(key.resources) }
+
+        let application = NSApplication.shared
+        _ = application.setActivationPolicy(.accessory)
+        application.finishLaunching()
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        let layer = CAMetalLayer()
+        layer.pixelFormat = CADViewportPasses.colorFormat
+        layer.framebufferOnly = true
+        host.layer = layer
+        host.wantsLayer = true
+        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 400, height: 300), styleMask: [.titled],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        window.contentView = host
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
+        window.orderFrontRegardless()
+
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let renderer = SCNRenderer(device: device, options: nil)
+        renderer.scene = source.scene
+        renderer.pointOfView = source.camera
+        renderer.usesReverseZ = true
+        renderer.autoenablesDefaultLighting = false
+        XCTAssertTrue(renderer.prepare(source.scene, shouldAbortBlock: nil))
+        let completions = Completions()
+        let loop = try XCTUnwrap(ViewportRenderLoop(layer: layer, renderer: renderer) { generation, _, outcome in
+            completions.append(generation, outcome)
+        })
+        // Submitted off the main thread, so a stuck loop fails the test
+        // instead of hanging it.
+        let count: UInt64 = 60
+        let submitted = expectation(description: "every frame is submitted")
+        DispatchQueue.global(qos: .userInitiated).async {
+            for generation in 1...count {
+                var request = frame
+                request.key?.debug = Int(generation)
+                loop.submit(.init(frame: request, source: source, generation: generation))
+                usleep(1_000)
+            }
+            submitted.fulfill()
+        }
+        guard await XCTWaiter().fulfillment(of: [submitted], timeout: 30) == .completed else {
+            return XCTFail("the render loop stopped taking frames")
+        }
+        let deadline = ContinuousClock.now + .seconds(30)
+        while !completions.drewExact(count), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(completions.drewExact(count), "the newest frame is composited from its slices")
+        XCTAssertGreaterThan(loop.statistics.geometrySlices, 1, "frames were sliced")
+        loop.stop()
+    }
 }

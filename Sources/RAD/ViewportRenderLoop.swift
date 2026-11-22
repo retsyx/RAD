@@ -265,7 +265,13 @@ final class ViewportRenderLoop: @unchecked Sendable {
         job = nil
         latest = nil
         needsComposite = false
-        condition.withLock { chained = nil }
+        // Released after unlocking: releasing an uncommitted command buffer
+        // runs its completed handlers.
+        let dropped = condition.withLock {
+            defer { chained = nil }
+            return chained
+        }
+        withExtendedLifetime(dropped) {}
     }
 
     private func committedSerial() -> UInt64 { condition.withLock { committedSliceSerial } }
@@ -380,6 +386,9 @@ final class ViewportRenderLoop: @unchecked Sendable {
         commandBuffer.encodeSignalEvent(sliceEvent, value: serial)
         let trace = ViewportFrameTrace.shared, committed = ViewportFrameTrace.now
         commandBuffer.addCompletedHandler { [weak self] buffer in
+            // Metal also calls completed handlers when it releases a command
+            // buffer that was never committed, such as a dropped chained slice.
+            guard buffer.status == .completed || buffer.status == .error else { return }
             if ViewportFrameTrace.enabled {
                 var covered = 0
                 if case .slice(_, _, let count, _) = record { covered = count }
