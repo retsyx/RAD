@@ -389,26 +389,36 @@ final class CADViewportPasses: @unchecked Sendable {
     static let sampleCount = 4
     /// GPU seconds of exact geometry a frame draws itself.
     static let frameBudget = 0.004
-    /// GPU seconds of a job's first exact slice; each later one may take
-    /// twice its predecessor's, up to `sliceBudget`, and hold twice its
-    /// blocks (two at first), whatever the cost estimate says. A newer frame
-    /// waits for the tiles in flight: about one per core while a slice holds
-    /// a few blocks, several once it spans the frame. Small slices right
-    /// after navigation ends, when it is likeliest to resume, keep that wait
-    /// near the heaviest tile's; later slices are large, since every pass
-    /// ends with its slowest tile while the other cores idle.
+    /// A newer frame waits for the exact tiles in flight: about one per core
+    /// while a slice holds a few blocks, several once it spans the frame,
+    /// and each pass also ends with its slowest tile while the other cores
+    /// idle. So a job's slices start small, when navigation is likeliest to
+    /// resume, and grow: each may take twice its predecessor's time (from
+    /// `firstSliceBudget` up to `sliceBudget`) and hold twice its blocks
+    /// (from `firstSliceBlocks`), whatever the cost estimate says. A design
+    /// whose small slices already outlast two frames
+    /// (`CADExactCost.isFloorBound`) keeps small slices: larger ones would
+    /// only add slow tiles in flight beside a newer frame, and tiles slowed
+    /// that much can fail as GPU hangs.
     static let firstSliceBudget = 0.004
     static let sliceBudget = 0.064
     static let firstSliceBlocks = 2
 
-    /// The budget of a job's slice after `slices` earlier ones.
-    static func sliceBudget(after slices: Int) -> Double {
-        min(sliceBudget, firstSliceBudget * Double(1 << min(max(0, slices), 16)))
+    /// GPU seconds and blocks of a design's next slice after `slices`
+    /// earlier ones of its job.
+    static func sliceLimits(after slices: Int, floorBound: Bool) -> (seconds: Double, blocks: Int) {
+        if floorBound { return (firstSliceBudget, CADExactCost.smallSliceBlocks) }
+        let doublings = min(max(0, slices), 24)
+        return (min(sliceBudget, firstSliceBudget * Double(1 << min(doublings, 16))), firstSliceBlocks << doublings)
     }
 
-    /// The most blocks a job's slice after `slices` earlier ones may hold.
-    static func sliceBlocks(after slices: Int) -> Int {
-        firstSliceBlocks << min(max(0, slices), 24)
+    static func sliceLimits(_ job: CADExactJob) -> (seconds: Double, blocks: Int) {
+        sliceLimits(after: job.encoded, floorBound: CADExactCost.shared.isFloorBound(job.costKey))
+    }
+
+    /// Outline coverage slices: budgets double from the first, by count.
+    static func maskSliceBudget(after slices: Int) -> Double {
+        min(sliceBudget, firstSliceBudget * Double(1 << min(max(0, slices), 16)))
     }
 
     /// Exact work encoded by these passes (diagnostics and tests).

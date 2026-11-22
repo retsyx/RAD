@@ -82,7 +82,7 @@ final class CADViewportCapture: @unchecked Sendable {
             // one that fails or takes far too long ends exact faces of the
             // design in this mode (display meshes instead).
             var waited = 0, gpuEnd = 0.0, slow = false
-            var covered: [Int] = [0]
+            var covered: [Int] = [0], blocks: [Int] = [0], budgets: [Double] = [.infinity]
             func settle(keeping ahead: Int) {
                 while committed.count - waited > ahead {
                     let buffer = committed[waited]
@@ -92,28 +92,31 @@ final class CADViewportCapture: @unchecked Sendable {
                     if buffer.status != .completed || seconds > CADExactCost.failingSliceSeconds {
                         if CADExactCost.shared.recordStrike(job.costKey) || buffer.status != .completed { slow = true }
                     } else {
-                        CADExactCost.shared.recordSlice(job.costKey, seconds: seconds, covered: covered[waited])
+                        CADExactCost.shared.recordSlice(job.costKey, seconds: seconds, covered: covered[waited],
+                                                        blocks: blocks[waited], budget: budgets[waited])
                     }
                     waited += 1
                 }
             }
-            func slices(_ encode: (any MTLCommandBuffer) -> Int?) throws {
+            func slices(_ encode: (any MTLCommandBuffer) -> (covered: Int, blocks: Int, budget: Double)?) throws {
                 while !slow {
                     try Task.checkCancellation()
                     guard let slice = queue.makeCommandBuffer() else {
                         throw RADError.message("RAD could not render the design image.")
                     }
-                    guard let pixels = encode(slice) else { return }
+                    guard let encoded = encode(slice) else { return }
                     slice.commit()
                     committed.append(slice)
-                    covered.append(pixels)
+                    covered.append(encoded.covered)
+                    blocks.append(encoded.blocks)
+                    budgets.append(encoded.budget)
                     settle(keeping: 1)
                 }
             }
             try slices {
-                passes.encodeSlice(job, budget: sliceBudget ?? CADViewportPasses.sliceBudget(after: job.encoded),
-                                   blocks: sliceBudget == nil ? CADViewportPasses.sliceBlocks(after: job.encoded) : .max,
-                                   commandBuffer: $0)?.covered
+                let limits = sliceBudget.map { (seconds: $0, blocks: Int.max) } ?? CADViewportPasses.sliceLimits(job)
+                return passes.encodeSlice(job, budget: limits.seconds, blocks: limits.blocks, commandBuffer: $0)
+                    .map { ($0.covered, $0.blocks, limits.seconds) }
             }
             job.completed = job.encoded
             passes.prepareMasks(job, frame: frame)
@@ -121,9 +124,8 @@ final class CADViewportCapture: @unchecked Sendable {
             var masks = 0
             try slices {
                 defer { masks += 1 }
-                return passes.encodeMaskSlice(job, budget: sliceBudget ?? CADViewportPasses.sliceBudget(after: masks),
-                                              blocks: sliceBudget == nil ? CADViewportPasses.sliceBlocks(after: masks) : .max,
-                                              commandBuffer: $0) != nil ? 0 : nil
+                return passes.encodeMaskSlice(job, budget: sliceBudget ?? CADViewportPasses.maskSliceBudget(after: masks),
+                                              commandBuffer: $0) != nil ? (0, Int.max, .infinity) : nil
             }
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
             settle(keeping: 0)

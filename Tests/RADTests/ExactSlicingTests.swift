@@ -99,22 +99,50 @@ final class ExactSlicingTests: XCTestCase {
 
     /// A job's slices start at the first budget and two blocks; budgets
     /// double up to the cap and so do block counts, so a cost estimate that
-    /// is too low cannot make an early slice large.
-    func testSliceBudgetsStartSmallAndGrow() {
-        let first = CADViewportPasses.firstSliceBudget, cap = CADViewportPasses.sliceBudget
-        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 0), first)
-        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 1), 2 * first)
-        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 2), 4 * first)
-        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 100), cap)
-        XCTAssertTrue((0..<30).map { CADViewportPasses.sliceBudget(after: $0) }.allSatisfy { $0 <= cap })
-        XCTAssertEqual((0..<4).map { CADViewportPasses.sliceBlocks(after: $0) }, [2, 4, 8, 16])
-        XCTAssertGreaterThan(CADViewportPasses.sliceBlocks(after: 100), 1_000_000)
-        // Two blocks at most, however cheap the estimate.
+    /// is too low cannot make an early slice large. Designs whose small
+    /// slices outlast two frames keep small slices; a small slice slower
+    /// than the floor threshold marks its design.
+    func testSliceLimitsStartSmallAndGrow() {
+        typealias Passes = CADViewportPasses
+        let first = Passes.firstSliceBudget, cap = Passes.sliceBudget
+        let limits = (0..<30).map { Passes.sliceLimits(after: $0, floorBound: false) }
+        XCTAssertEqual(limits[0].seconds, first)
+        XCTAssertEqual(limits[1].seconds, 2 * first)
+        XCTAssertEqual(limits[2].seconds, 4 * first)
+        XCTAssertEqual(limits[29].seconds, cap)
+        XCTAssertTrue(limits.allSatisfy { $0.seconds <= cap })
+        XCTAssertEqual(limits.prefix(4).map(\.blocks), [2, 4, 8, 16])
+        XCTAssertGreaterThan(limits[29].blocks, 1_000_000)
+        for slices in [0, 5, 100] {
+            let bound = Passes.sliceLimits(after: slices, floorBound: true)
+            XCTAssertEqual(bound.seconds, first)
+            XCTAssertEqual(bound.blocks, CADExactCost.smallSliceBlocks)
+        }
+        // Two blocks at most, however cheap the estimate; then the rest of the row; then whole rows.
         var plan = CADSlicePlan(width: 1_000, height: 1_000, rects: [nil])
-        let slice = try? XCTUnwrap(plan.next(budget: .max, blocks: 2))
+        let slice = plan.next(budget: .max, blocks: 2)
         XCTAssertEqual(slice?.rects, [SIMD4(0, 0, 256, 128)])
+        XCTAssertEqual(slice?.blocks, 2)
         XCTAssertEqual(plan.next(budget: .max, blocks: 8)?.rects, [SIMD4(256, 0, 1_000, 128)], "the rest of the row")
-        XCTAssertEqual(plan.next(budget: .max, blocks: 16)?.rects, [SIMD4(0, 128, 1_000, 384)], "two whole rows")
+        let strip = plan.next(budget: .max, blocks: 16)
+        XCTAssertEqual(strip?.rects, [SIMD4(0, 128, 1_000, 384)], "two whole rows")
+        XCTAssertEqual(strip?.blocks, 16)
+        // Floor-bound designs.
+        let cost = CADExactCost()
+        let key = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: false)
+        cost.recordSlice(key, seconds: 0.2, covered: 100_000, blocks: CADExactCost.smallSliceBlocks + 1)
+        XCTAssertFalse(cost.isFloorBound(key), "a large slice may take long")
+        cost.recordSlice(key, seconds: CADExactCost.floorSeconds / 2, covered: 100_000, blocks: 1)
+        XCTAssertFalse(cost.isFloorBound(key))
+        cost.recordSlice(key, seconds: 0.1, covered: 100_000, blocks: 100, budget: 0.064)
+        XCTAssertFalse(cost.isFloorBound(key), "a large slice within twice its budget")
+        cost.recordSlice(key, seconds: 2 * CADExactCost.floorSeconds, covered: 100, blocks: 1)
+        XCTAssertTrue(cost.isFloorBound(key), "one small slice that outlasts two frames")
+        cost.forget(ObjectIdentifier(Self.self))
+        XCTAssertFalse(cost.isFloorBound(key))
+        cost.recordSlice(key, seconds: 0.2, covered: 100_000, blocks: 100, budget: 0.064)
+        XCTAssertTrue(cost.isFloorBound(key), "a slice over twice its budget")
+        cost.forget(ObjectIdentifier(Self.self))
     }
 
     /// Slices plan with an average of recent measured costs weighed by their

@@ -145,6 +145,8 @@ struct CADSlicePlan: Sendable {
         var covered: Int
         /// The slice holds every block of the plan, so it needs no scissor.
         var whole = false
+        /// Reached blocks in the slice.
+        var blocks = 0
     }
 
     let width: Int
@@ -210,7 +212,7 @@ struct CADSlicePlan: Sendable {
             remaining -= sum
             let rect = SIMD4(x0, Int32(rows[first.row].index) * size, min(Int32(width), x1),
                              min(Int32(height), Int32(rows[row - 1].index + 1) * size))
-            return Slice(rects: [rect], covered: sum, whole: first.row == 0 && row == rows.count)
+            return Slice(rects: [rect], covered: sum, whole: first.row == 0 && row == rows.count, blocks: count)
         }
         // A run of the current row's blocks.
         let blocks = rows[row].blocks
@@ -231,7 +233,8 @@ struct CADSlicePlan: Sendable {
             column = 0
         }
         remaining -= sum
-        return Slice(rects: [rect], covered: sum, whole: first.row == 0 && first.column == 0 && row == rows.count)
+        return Slice(rects: [rect], covered: sum, whole: first.row == 0 && first.column == 0 && row == rows.count,
+                     blocks: count)
     }
 
     /// The covered-pixel budget that splits the remaining blocks into
@@ -262,6 +265,13 @@ final class CADExactCost: @unchecked Sendable {
     /// Each slice's measurement weighs this much less after the next one.
     static let decay = 0.7
 
+    /// A slice of at most this many blocks that takes longer than
+    /// `floorSeconds`, or any slice that takes more than twice its budget and
+    /// twice that time, shows that the design's slowest tiles alone outlast
+    /// two frames: its slices stay small (`CADViewportPasses.sliceLimits`).
+    static let smallSliceBlocks = 4
+    static let floorSeconds = 0.032
+
     /// A slice the GPU fails, or one slower than this, is a strike against
     /// exact faces of its design in that display mode; three end them for the
     /// session: such geometry would stall or reset the GPU on every view,
@@ -281,6 +291,7 @@ final class CADExactCost: @unchecked Sendable {
     private var frames: [Key: Double] = [:]
     private var failures = Set<Failure>()
     private var strikes: [Failure: Int] = [:]
+    private var floorBound = Set<Key>()
 
     /// Records a failed or far too slow slice; returns whether exact faces of
     /// the design in this mode have now failed.
@@ -320,7 +331,14 @@ final class CADExactCost: @unchecked Sendable {
     /// Measured before: plans of unmeasured geometry start with a small slice.
     func hasSliceRate(_ key: Key) -> Bool { lock.withLock { slices[key] != nil } }
 
-    func recordSlice(_ key: Key, seconds: Double, covered: Int) {
+    /// Whether the design's slowest tiles outlast small slices' budgets.
+    func isFloorBound(_ key: Key) -> Bool { lock.withLock { floorBound.contains(key) } }
+
+    func recordSlice(_ key: Key, seconds: Double, covered: Int, blocks: Int = .max, budget: Double = .infinity) {
+        if seconds.isFinite, seconds > Self.floorSeconds,
+           blocks <= Self.smallSliceBlocks || seconds > 2 * max(budget, Self.floorSeconds) {
+            _ = lock.withLock { floorBound.insert(key) }
+        }
         guard covered >= Self.minimumCovered, seconds.isFinite, seconds > 0 else { return }
         lock.withLock {
             let sums = slices[key] ?? (seconds: 0, covered: 0)
@@ -341,6 +359,7 @@ final class CADExactCost: @unchecked Sendable {
             frames = frames.filter { $0.key.resources != resources }
             failures = failures.filter { $0.resources != resources }
             strikes = strikes.filter { $0.key.resources != resources }
+            floorBound = floorBound.filter { $0.resources != resources }
         }
     }
 }

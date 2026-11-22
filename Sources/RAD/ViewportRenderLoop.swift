@@ -12,7 +12,7 @@ import SceneKit
 /// geometry identity (`CADExactKey`). A design whose exact geometry fits the
 /// frame budget draws it in the frame that shows it. Heavier geometry is
 /// drawn in screen slices that start small and grow
-/// (`CADViewportPasses.sliceBudget(after:)`), each its own command buffer on
+/// (`CADViewportPasses.sliceLimits`), each its own command buffer on
 /// a separate queue: one runs while the next is encoded behind it and
 /// committed by its completion, so the GPU does not wait for this thread and
 /// at most one slice is committed when a newer view abandons the job. The
@@ -59,7 +59,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private var releaseRequested = false
     /// GPU completions of slices, applied by the render thread.
     private enum Finished {
-        case slice(CADExactJob, seconds: Double, covered: Int)
+        case slice(CADExactJob, seconds: Double, covered: Int, blocks: Int, budget: Double)
         case mask(CADExactJob, CADMaskCoverage)
         /// The GPU failed a slice or took far too long for it.
         case struck(CADExactJob)
@@ -189,10 +189,11 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private func apply(_ completed: [Finished]) {
         for item in completed {
             switch item {
-            case .slice(let owner, let seconds, let covered):
+            case .slice(let owner, let seconds, let covered, let blocks, let budget):
                 owner.completed += 1
                 owner.gpuSeconds += seconds
-                CADExactCost.shared.recordSlice(owner.costKey, seconds: seconds, covered: covered)
+                CADExactCost.shared.recordSlice(owner.costKey, seconds: seconds, covered: covered, blocks: blocks,
+                                                budget: budget)
                 if owner === job, owner.isComplete {
                     // Only whole frames measure what one frame can draw at once.
                     if owner.encoded == 1 {
@@ -350,9 +351,9 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 let chain = running > 0
                 guard !chain || !waiting else { break }
                 let encoded = encodeSlice(job, chain: chain) { commandBuffer in
-                    passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget(after: job.encoded),
-                                       blocks: CADViewportPasses.sliceBlocks(after: job.encoded), commandBuffer: commandBuffer)
-                        .map { .slice(job, seconds: 0, covered: $0.covered) }
+                    let limits = CADViewportPasses.sliceLimits(job)
+                    return passes.encodeSlice(job, budget: limits.seconds, blocks: limits.blocks, commandBuffer: commandBuffer)
+                        .map { .slice(job, seconds: 0, covered: $0.covered, blocks: $0.blocks, budget: limits.seconds) }
                 }
                 if !encoded { break }
             }
@@ -367,8 +368,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
               job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
             let encoded = encodeSlice(job) { commandBuffer in
                 let slices = job.masks.values.reduce(0) { $0 + $1.encoded }
-                return passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget(after: slices),
-                                              blocks: CADViewportPasses.sliceBlocks(after: slices), commandBuffer: commandBuffer)
+                return passes.encodeMaskSlice(job, budget: CADViewportPasses.maskSliceBudget(after: slices),
+                                              commandBuffer: commandBuffer)
                     .map { .mask(job, $0) }
             }
             if !encoded { break }
@@ -395,7 +396,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
             guard buffer.status == .completed || buffer.status == .error else { return }
             if ViewportFrameTrace.enabled {
                 var covered = 0
-                if case .slice(_, _, let count) = record { covered = count }
+                if case .slice(_, _, let count, _, _) = record { covered = count }
                 trace.addSlice(.init(job: ObjectIdentifier(job), mask: { if case .mask = record { return true }; return false }(),
                                      covered: covered, committed: committed, gpuStart: buffer.gpuStartTime,
                                      gpuEnd: buffer.gpuEndTime))
@@ -406,7 +407,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
             self.sliceGPUEnd = max(self.sliceGPUEnd, buffer.gpuEndTime)
             var result: Finished
             switch record {
-            case .slice(let owner, _, let covered): result = .slice(owner, seconds: seconds, covered: covered)
+            case .slice(let owner, _, let covered, let blocks, let budget):
+                result = .slice(owner, seconds: seconds, covered: covered, blocks: blocks, budget: budget)
             case .mask, .struck: result = record
             }
             if buffer.status == .error || seconds > CADExactCost.failingSliceSeconds {
