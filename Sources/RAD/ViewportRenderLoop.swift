@@ -37,9 +37,6 @@ final class ViewportRenderLoop: @unchecked Sendable {
         var geometrySeconds: Double?
     }
 
-    /// Exact slices in flight at once: the GPU stays busy between slices
-    /// while a newer frame waits for at most about one of them.
-    static let slicesInFlight = 2
 
     let layer: CAMetalLayer
     let renderer: SCNRenderer
@@ -58,7 +55,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private var releaseRequested = false
     /// GPU completions of slices, applied by the render thread.
     private enum Finished {
-        case slice(CADExactJob, seconds: Double, covered: Int)
+        case slice(CADExactJob, seconds: Double, covered: Int, blocks: Int)
         case mask(CADExactJob, CADMaskCoverage)
         /// The GPU failed a slice or took far too long for it.
         case failed(CADExactJob)
@@ -173,19 +170,21 @@ final class ViewportRenderLoop: @unchecked Sendable {
     /// the condition locked.
     private func hasJobWork() -> Bool {
         guard let job else { return false }
-        if job.hasSlicesToEncode { return slicesRunning < Self.slicesInFlight }
+        let limit = CADExactCost.shared.slicesInFlight(job.costKey)
+        if job.hasSlicesToEncode { return slicesRunning < limit }
         guard job.isComplete else { return false }
         if needsComposite, latest != nil { return true }
-        return slicesRunning < Self.slicesInFlight && job.masks.values.contains { !$0.cleared || !$0.plan.isDone }
+        return slicesRunning < limit && job.masks.values.contains { !$0.cleared || !$0.plan.isDone }
     }
 
     private func apply(_ completed: [Finished]) {
         for item in completed {
             switch item {
-            case .slice(let owner, let seconds, let covered):
+            case .slice(let owner, let seconds, let covered, let blocks):
                 owner.completed += 1
                 owner.gpuSeconds += seconds
                 CADExactCost.shared.recordSlice(owner.costKey, seconds: seconds, covered: covered)
+                CADExactCost.shared.recordBlocks(owner.costKey, side: owner.plan.block, seconds: seconds, count: blocks)
                 if owner === job, owner.isComplete {
                     // Only whole frames measure what one frame can draw at once.
                     if owner.encoded == 1 {
@@ -329,11 +328,12 @@ final class ViewportRenderLoop: @unchecked Sendable {
     /// composite, then outline coverage slices.
     private func advance() {
         guard let job else { return }
+        let limit = CADExactCost.shared.slicesInFlight(job.costKey)
         if job.hasSlicesToEncode {
-            while job.hasSlicesToEncode, running() < Self.slicesInFlight {
+            while job.hasSlicesToEncode, running() < limit {
                 let encoded = encodeSlice(job) { commandBuffer in
                     passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
-                        .map { .slice(job, seconds: 0, covered: $0.covered) }
+                        .map { .slice(job, seconds: 0, covered: $0.covered, blocks: $0.blocks) }
                 }
                 if !encoded { break }
             }
@@ -344,7 +344,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
             composite()
             return
         }
-        while running() < Self.slicesInFlight, job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
+        while running() < limit, job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
             let encoded = encodeSlice(job) { commandBuffer in
                 passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
                     .map { .mask(job, $0) }
@@ -369,7 +369,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
         commandBuffer.addCompletedHandler { [weak self] buffer in
             if ViewportFrameTrace.enabled {
                 var covered = 0
-                if case .slice(_, _, let count) = record { covered = count }
+                if case .slice(_, _, let count, _) = record { covered = count }
                 trace.addSlice(.init(job: ObjectIdentifier(job), mask: { if case .mask = record { return true }; return false }(),
                                      covered: covered, committed: committed, gpuStart: buffer.gpuStartTime,
                                      gpuEnd: buffer.gpuEndTime))
@@ -380,7 +380,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
             self.sliceGPUEnd = max(self.sliceGPUEnd, buffer.gpuEndTime)
             var result: Finished
             switch record {
-            case .slice(let owner, _, let covered): result = .slice(owner, seconds: seconds, covered: covered)
+            case .slice(let owner, _, let covered, let blocks): result = .slice(owner, seconds: seconds, covered: covered, blocks: blocks)
             case .mask, .failed: result = record
             }
             if buffer.status == .error || seconds > CADExactCost.failingSliceSeconds { result = .failed(job) }

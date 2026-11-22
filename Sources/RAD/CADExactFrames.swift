@@ -121,15 +121,19 @@ final class CADExactTargets: @unchecked Sendable {
     }
 }
 
-/// Screen slices of one exact frame's geometry: square blocks of 256 pixels
-/// that some proxy reaches, in row order, grouped into slices whose
-/// estimated covered pixels (each proxy's projected bounds, counted per
-/// proxy) stay within a budget, at least one block each. Small scissored
-/// regions cost the GPU far more per pixel than one pass over the frame, so
-/// a block is the smallest slice. Blocks no proxy reaches get no slice;
-/// their stored layers keep the clear.
+/// Screen slices of one exact frame's geometry: square blocks that some
+/// proxy reaches, in row order, grouped into slices whose estimated covered
+/// pixels (each proxy's projected bounds, counted per proxy) stay within a
+/// budget, at least one block each. Small scissored regions cost the GPU far
+/// more per pixel than one pass over the frame, so a block is the smallest
+/// slice: 256 pixels for opaque layers, 64 for translucent ones, whose every
+/// pixel marches all its layers, halved for designs whose measured blocks
+/// take too long (`CADExactCost.blockSide`). Blocks no proxy reaches get no
+/// slice; their stored layers keep the clear.
 struct CADSlicePlan: Sendable {
     static let block = 256
+    static let translucentBlock = 64
+    static let smallestBlock = 64
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
@@ -139,6 +143,8 @@ struct CADSlicePlan: Sendable {
         var covered: Int
         /// The slice holds every block of the plan, so it needs no scissor.
         var whole = false
+        /// Blocks in the slice.
+        var blocks = 0
     }
 
     let width: Int
@@ -216,7 +222,7 @@ struct CADSlicePlan: Sendable {
             previous = block
         }
         rects.append(rect(row: start.row, first: start.column, last: previous.column))
-        return Slice(rects: rects, covered: sum, whole: first == 0 && next == blocks.count)
+        return Slice(rects: rects, covered: sum, whole: first == 0 && next == blocks.count, blocks: next - first)
     }
 }
 
@@ -255,6 +261,34 @@ final class CADExactCost: @unchecked Sendable {
     private var slices: [Key: Double] = [:]
     private var frames: [Key: Double] = [:]
     private var failures = Set<Failure>()
+    /// Block side and the largest measured GPU seconds of one such block.
+    private var blocks: [Key: (side: Int, seconds: Double)] = [:]
+
+    /// The block side of new slice plans: halved, down to the smallest
+    /// block, once a measured block takes more than eight slice budgets.
+    func blockSide(_ key: Key) -> Int {
+        lock.withLock { blocks[key]?.side } ?? (key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block)
+    }
+
+    /// Slices in flight: one once measured blocks take more than two slice
+    /// budgets, so a newer frame shares the GPU with at most one of them.
+    func slicesInFlight(_ key: Key) -> Int {
+        (lock.withLock { blocks[key]?.seconds } ?? 0) > 2 * CADViewportPasses.sliceBudget ? 1 : 2
+    }
+
+    func recordBlocks(_ key: Key, side: Int, seconds: Double, count: Int) {
+        guard count > 0, seconds.isFinite, seconds > 0 else { return }
+        let perBlock = seconds / Double(count)
+        lock.withLock {
+            var entry = blocks[key] ?? (side: key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block, seconds: 0)
+            guard entry.side == side else { return }
+            entry.seconds = max(entry.seconds, perBlock)
+            if entry.seconds > 8 * CADViewportPasses.sliceBudget, entry.side > CADSlicePlan.smallestBlock {
+                entry = (side: entry.side / 2, seconds: 0)
+            }
+            blocks[key] = entry
+        }
+    }
 
     func recordFailure(_ key: Key) {
         lock.withLock { _ = failures.insert(Failure(resources: key.resources, translucent: key.translucent)) }
@@ -294,6 +328,7 @@ final class CADExactCost: @unchecked Sendable {
             slices = slices.filter { $0.key.resources != resources }
             frames = frames.filter { $0.key.resources != resources }
             failures = failures.filter { $0.resources != resources }
+            blocks = blocks.filter { $0.key.resources != resources }
         }
     }
 }
@@ -377,7 +412,8 @@ final class CADExactJob: @unchecked Sendable {
         draws = field.resources.draws(field.instances, view: view, projection: projection, width: width, height: height,
                                       contacts: !key.translucent)
         costKey = .init(resources: key.resources, width: width, height: height, translucent: key.translucent)
-        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect))
+        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect),
+                            block: CADExactCost.shared.blockSide(costKey))
     }
 
     var isComplete: Bool { cleared && plan.isDone && completed == encoded }
