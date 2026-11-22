@@ -121,117 +121,96 @@ final class CADExactTargets: @unchecked Sendable {
     }
 }
 
-/// Screen slices of one exact frame's geometry: square blocks that some
-/// proxy reaches, in row order, grouped into slices whose estimated covered
-/// pixels (each proxy's projected bounds, counted per proxy) stay within a
-/// budget, at least one block each. Small scissored regions cost the GPU far
-/// more per pixel than one pass over the frame, so a block is the smallest
-/// slice: 256 pixels for opaque layers, 64 for translucent ones, whose every
-/// pixel marches all its layers, halved for designs whose measured blocks
-/// take too long (`CADExactCost.blockSide`). Blocks no proxy reaches get no
-/// slice; their stored layers keep the clear.
+/// Screen slices of one exact frame's geometry: horizontal strips of the
+/// rows some proxy reaches, top to bottom, each one rectangle (the reached
+/// columns of its rows), whose estimated covered pixels (each proxy's
+/// projected bounds, counted per proxy) stay within a budget, at least one
+/// band of rows each. A pass ends when its slowest tile does, while the
+/// other cores idle, and another queue's frame waits for the tiles in
+/// flight whatever the pass's size; so slices are few and large, and every
+/// slice spans whole rows of many tiles. One rectangle per slice: each
+/// scissor of a viewport array draws every proxy again. Bands no proxy
+/// reaches get no slice; their stored layers keep the clear.
 struct CADSlicePlan: Sendable {
-    static let block = 256
-    static let translucentBlock = 64
-    /// Opaque blocks halve no further: smaller ones make the exact image
-    /// several times slower to complete.
-    static let smallestBlock = 128
+    /// Rows join in bands of this many pixels: an even number keeps pixel
+    /// quads whole.
+    static let band = 16
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
-        /// the slice's blocks, adjacent blocks of a row joined; empty when
-        /// the slice only clears.
+        /// the slice; empty when the slice only clears.
         var rects: [SIMD4<Int32>]
         var covered: Int
-        /// The slice holds every block of the plan, so it needs no scissor.
+        /// The slice holds every band of the plan, so it needs no scissor.
         var whole = false
-        /// Blocks in the slice.
-        var blocks = 0
     }
 
     let width: Int
     let height: Int
-    /// Block side in pixels.
-    let block: Int
-    let columns: Int
-    let rows: Int
-    /// Reached blocks (row, column, estimated covered pixels) in row order.
-    private let blocks: [(row: Int, column: Int, covered: Int)]
+    /// Reached bands (index, estimated covered pixels, reached columns) top to bottom.
+    private let bands: [(index: Int, covered: Int, x0: Int32, x1: Int32)]
     private var next = 0
     /// Estimated covered pixels of the whole frame.
     let total: Int
     private(set) var remaining: Int
 
     /// `rects` are proxies' pixel rectangles; nil covers the whole frame.
-    init(width: Int, height: Int, rects: [SIMD4<Int32>?], block size: Int = Self.block) {
+    init(width: Int, height: Int, rects: [SIMD4<Int32>?]) {
         self.width = max(0, width)
         self.height = max(0, height)
-        block = size
-        columns = (self.width + size - 1) / size
-        rows = (self.height + size - 1) / size
-        var covered = [Int](repeating: 0, count: columns * rows)
+        let size = Self.band
+        let count = (self.height + size - 1) / size
+        var covered = [Int](repeating: 0, count: count)
+        var low = [Int32](repeating: .max, count: count), high = [Int32](repeating: 0, count: count)
         let full = SIMD4<Int32>(0, 0, Int32(self.width), Int32(self.height))
         for rect in rects {
             let r = rect ?? full
             let x0 = Int(max(0, r.x)), y0 = Int(max(0, r.y))
             let x1 = Int(min(Int32(self.width), r.z)), y1 = Int(min(Int32(self.height), r.w))
             guard x0 < x1, y0 < y1 else { continue }
-            for by in (y0 / size)...((y1 - 1) / size) {
-                let h = min(y1, (by + 1) * size) - max(y0, by * size)
-                for bx in (x0 / size)...((x1 - 1) / size) {
-                    covered[by * columns + bx] += (min(x1, (bx + 1) * size) - max(x0, bx * size)) * h
-                }
+            for band in (y0 / size)...((y1 - 1) / size) {
+                covered[band] += (x1 - x0) * (min(y1, (band + 1) * size) - max(y0, band * size))
+                low[band] = min(low[band], Int32(x0))
+                high[band] = max(high[band], Int32(x1))
             }
         }
-        let columns = self.columns
-        blocks = covered.enumerated().filter { $0.element > 0 }
-            .map { (row: $0.offset / columns, column: $0.offset % columns, covered: $0.element) }
-        total = blocks.reduce(0) { $0 + $1.covered }
+        bands = covered.indices.filter { covered[$0] > 0 }.map { (index: $0, covered: covered[$0], x0: low[$0], x1: high[$0]) }
+        total = bands.reduce(0) { $0 + $1.covered }
         remaining = total
     }
 
-    var isDone: Bool { next >= blocks.count }
-
-    /// The pixel rectangle of the blocks of `row` from `first` through `last`.
-    private func rect(row: Int, first: Int, last: Int) -> SIMD4<Int32> {
-        let size = block
-        return SIMD4(Int32(first * size), Int32(row * size), Int32(min(width, (last + 1) * size)),
-                     Int32(min(height, (row + 1) * size)))
-    }
+    var isDone: Bool { next >= bands.count }
 
     /// The next slice whose estimated covered pixels stay within `budget`,
-    /// at least one block, or nil when every reached block has its slice.
+    /// at least one band, or nil when every reached band has its slice.
     mutating func next(budget: Int) -> Slice? {
-        guard next < blocks.count else { return nil }
+        guard next < bands.count else { return nil }
         let first = next
-        var sum = blocks[next].covered
+        var sum = bands[next].covered, x0 = bands[next].x0, x1 = bands[next].x1
         next += 1
-        while next < blocks.count, sum + blocks[next].covered <= budget {
-            sum += blocks[next].covered
+        while next < bands.count, sum + bands[next].covered <= budget {
+            sum += bands[next].covered
+            x0 = min(x0, bands[next].x0)
+            x1 = max(x1, bands[next].x1)
             next += 1
         }
         remaining -= sum
-        var rects: [SIMD4<Int32>] = []
-        var start = blocks[first]
-        var previous = start
-        for block in blocks[(first + 1)..<next] {
-            if block.row == previous.row, block.column == previous.column + 1 {
-                previous = block
-                continue
-            }
-            rects.append(rect(row: start.row, first: start.column, last: previous.column))
-            start = block
-            previous = block
-        }
-        rects.append(rect(row: start.row, first: start.column, last: previous.column))
-        return Slice(rects: rects, covered: sum, whole: first == 0 && next == blocks.count, blocks: next - first)
+        let rect = SIMD4(x0, Int32(bands[first].index * Self.band), x1,
+                         Int32(min(height, (bands[next - 1].index + 1) * Self.band)))
+        return Slice(rects: [rect], covered: sum, whole: first == 0 && next == bands.count)
+    }
+
+    /// The covered-pixel budget that splits the remaining bands into
+    /// `slices` slices of about equal estimates.
+    func budget(slices: Int) -> Int {
+        max(1, (remaining + max(1, slices) - 1) / max(1, slices))
     }
 }
 
 /// Measured exact costs, kept per field resources, frame size and display
-/// mode: the largest GPU seconds per estimated covered pixel of a slice
-/// (slices plan with it, so they stay within their budget) and of a complete
-/// frame's geometry (whether one frame can draw it at once).
+/// mode: GPU seconds per estimated covered pixel, as a running average of
+/// slices (slices plan with it) and as the largest of complete frames drawn
+/// at once (whether one frame can draw the geometry).
 final class CADExactCost: @unchecked Sendable {
     struct Key: Hashable, Sendable {
         var resources: ObjectIdentifier
@@ -244,16 +223,17 @@ final class CADExactCost: @unchecked Sendable {
     /// Before any measurement: conservative rates per covered pixel.
     static let defaultOpaqueRate = 600e-9
     static let defaultTranslucentRate = 3e-6
-    /// A slice's fixed cost, excluded from its rate.
-    static let sliceOverhead = 40e-6
     /// Slices covering fewer pixels do not change the rate.
     static let minimumCovered = 4_096
+    /// The weight of a new slice in the running average.
+    static let averaging = 0.5
 
-    /// A slice slower than this, or one the GPU fails, is a strike against
+    /// A slice the GPU fails, or one slower than this, is a strike against
     /// exact faces of its design in that display mode; three end them for the
     /// session: such geometry would stall or reset the GPU on every view,
-    /// while another process's stall or GPU reset strikes only once.
-    static let failingSliceSeconds = 0.25
+    /// while another process's stall or GPU reset strikes only once. (A
+    /// tile the GPU cannot finish within about a second fails as a hang.)
+    static let failingSliceSeconds = 1.5
     static let strikesToFail = 3
 
     struct Failure: Hashable, Sendable {
@@ -266,35 +246,6 @@ final class CADExactCost: @unchecked Sendable {
     private var frames: [Key: Double] = [:]
     private var failures = Set<Failure>()
     private var strikes: [Failure: Int] = [:]
-    /// Block side and the largest measured GPU seconds of one such block.
-    private var blocks: [Key: (side: Int, seconds: Double)] = [:]
-
-    /// The block side of new slice plans: opaque blocks halve, down to the
-    /// smallest block, once a measured block takes more than eight slice
-    /// budgets.
-    func blockSide(_ key: Key) -> Int {
-        lock.withLock { blocks[key]?.side } ?? (key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block)
-    }
-
-    /// Slices in flight: one once measured blocks take more than two slice
-    /// budgets, so a newer frame shares the GPU with at most one of them.
-    func slicesInFlight(_ key: Key) -> Int {
-        (lock.withLock { blocks[key]?.seconds } ?? 0) > 2 * CADViewportPasses.sliceBudget ? 1 : 2
-    }
-
-    func recordBlocks(_ key: Key, side: Int, seconds: Double, count: Int) {
-        guard count > 0, seconds.isFinite, seconds > 0 else { return }
-        let perBlock = seconds / Double(count)
-        lock.withLock {
-            var entry = blocks[key] ?? (side: key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block, seconds: 0)
-            guard entry.side == side else { return }
-            entry.seconds = max(entry.seconds, perBlock)
-            if entry.seconds > 8 * CADViewportPasses.sliceBudget, !key.translucent, entry.side > CADSlicePlan.smallestBlock {
-                entry = (side: entry.side / 2, seconds: 0)
-            }
-            blocks[key] = entry
-        }
-    }
 
     /// Records a failed or far too slow slice; returns whether exact faces of
     /// the design in this mode have now failed.
@@ -315,19 +266,27 @@ final class CADExactCost: @unchecked Sendable {
     /// Rates never fall below this: a frame's covered pixels are always worth some time.
     static let smallestRate = 1e-10
 
+    private static func initial(_ key: Key) -> Double {
+        key.translucent ? defaultTranslucentRate : defaultOpaqueRate
+    }
+
     func sliceRate(_ key: Key) -> Double {
-        max(Self.smallestRate, lock.withLock { slices[key] } ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate))
+        max(Self.smallestRate, lock.withLock { slices[key] } ?? Self.initial(key))
     }
 
     func frameRate(_ key: Key) -> Double {
-        max(Self.smallestRate, lock.withLock { frames[key] ?? slices[key] }
-            ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate))
+        max(Self.smallestRate, lock.withLock { frames[key] ?? slices[key] } ?? Self.initial(key))
     }
+
+    /// Measured before: plans of unmeasured geometry start with a small slice.
+    func hasSliceRate(_ key: Key) -> Bool { lock.withLock { slices[key] != nil } }
 
     func recordSlice(_ key: Key, seconds: Double, covered: Int) {
         guard covered >= Self.minimumCovered, seconds.isFinite, seconds > 0 else { return }
-        let rate = max(0, seconds - Self.sliceOverhead) / Double(covered)
-        lock.withLock { slices[key] = max(slices[key] ?? 0, rate) }
+        let rate = seconds / Double(covered)
+        lock.withLock {
+            slices[key] = slices[key].map { $0 + Self.averaging * (rate - $0) } ?? rate
+        }
     }
 
     func recordFrame(_ key: Key, seconds: Double, covered: Int) {
@@ -343,7 +302,6 @@ final class CADExactCost: @unchecked Sendable {
             frames = frames.filter { $0.key.resources != resources }
             failures = failures.filter { $0.resources != resources }
             strikes = strikes.filter { $0.key.resources != resources }
-            blocks = blocks.filter { $0.key.resources != resources }
         }
     }
 }
@@ -433,8 +391,7 @@ final class CADExactJob: @unchecked Sendable {
         self.targets = targets
         self.draws = draws
         costKey = .init(resources: key.resources, width: width, height: height, translucent: key.translucent)
-        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect),
-                            block: CADExactCost.shared.blockSide(costKey))
+        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect))
     }
 
     var isComplete: Bool { cleared && plan.isDone && completed == encoded }

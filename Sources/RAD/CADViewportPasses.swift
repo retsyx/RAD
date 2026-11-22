@@ -387,8 +387,12 @@ final class CADViewportFrameProbe: NSObject, SCNNodeRendererDelegate, @unchecked
 final class CADViewportPasses: @unchecked Sendable {
     static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
     static let sampleCount = 4
-    /// GPU seconds of one exact slice: new input waits at most about this long.
-    static let sliceBudget = 0.004
+    /// GPU seconds of exact geometry a frame draws itself.
+    static let frameBudget = 0.004
+    /// GPU seconds of one exact slice. A newer frame waits for the tiles in
+    /// flight, not for the slice; a slice bounds the work committed when a
+    /// newer view abandons the job.
+    static let sliceBudget = 0.05
     /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
     nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
 
@@ -497,7 +501,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// been encoded.
     @discardableResult
     func encodeSlice(_ job: CADExactJob, budget: Double, commandBuffer: any MTLCommandBuffer) -> CADSlicePlan.Slice? {
-        let covered = Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey))
+        let covered = Self.evenBudget(job.plan, Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey)))
         var next = job.plan.next(budget: covered)
         if next == nil {
             guard !job.cleared else { return nil }
@@ -527,6 +531,15 @@ final class CADViewportPasses: @unchecked Sendable {
         } else {
             encodeOpaqueSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
         }
+    }
+
+    /// A covered-pixel budget that splits a plan's remaining bands into
+    /// slices of about equal estimates within 1.25 times `covered`, so no
+    /// small remainder slice pays a pass of its own.
+    static func evenBudget(_ plan: CADSlicePlan, _ covered: Int) -> Int {
+        guard covered < Int.max / 4, plan.remaining > covered else { return covered }
+        let slices = (Double(plan.remaining) / (1.25 * Double(covered))).rounded(.up)
+        return plan.budget(slices: Int(min(slices, Double(Int32.max))))
     }
 
     /// Covered pixels a slice of `budget` GPU seconds may estimate.
@@ -732,7 +745,7 @@ final class CADViewportPasses: @unchecked Sendable {
             .sorted { ($0.key.rect.y, $0.key.rect.x) < ($1.key.rect.y, $1.key.rect.x) }
         guard let coverage = pending.first else { return nil }
         let resources = job.field.resources
-        let covered = Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey))
+        let covered = Self.evenBudget(coverage.plan, Self.coveredBudget(budget, rate: CADExactCost.shared.sliceRate(job.costKey)))
         guard let slice = coverage.plan.next(budget: covered) ?? (coverage.cleared ? nil : .init(rects: [], covered: 0)) else {
             return nil
         }

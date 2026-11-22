@@ -76,10 +76,12 @@ final class CADViewportCapture: @unchecked Sendable {
             costKey = job.costKey
             commandBuffer.commit()
             committed.append(commandBuffer)
-            // One queue orders the slices before the composite. A few slices
-            // run ahead; one that fails or takes far too long ends exact
-            // faces of the design in this mode (display meshes instead).
+            // One queue orders the slices before the composite. One slice
+            // runs ahead, and each measures the design's cost for the next;
+            // one that fails or takes far too long ends exact faces of the
+            // design in this mode (display meshes instead).
             var waited = 0, gpuEnd = 0.0, slow = false
+            var covered: [Int] = [0]
             func settle(keeping ahead: Int) {
                 while committed.count - waited > ahead {
                     let buffer = committed[waited]
@@ -88,26 +90,30 @@ final class CADViewportCapture: @unchecked Sendable {
                     gpuEnd = max(gpuEnd, buffer.gpuEndTime)
                     if buffer.status != .completed || seconds > CADExactCost.failingSliceSeconds {
                         if CADExactCost.shared.recordStrike(job.costKey) || buffer.status != .completed { slow = true }
+                    } else {
+                        CADExactCost.shared.recordSlice(job.costKey, seconds: seconds, covered: covered[waited])
                     }
                     waited += 1
                 }
             }
-            func slices(_ encode: (any MTLCommandBuffer) -> Bool) throws {
+            func slices(_ encode: (any MTLCommandBuffer) -> Int?) throws {
                 while !slow {
                     try Task.checkCancellation()
                     guard let slice = queue.makeCommandBuffer() else {
                         throw RADError.message("RAD could not render the design image.")
                     }
-                    guard encode(slice) else { return }
+                    guard let pixels = encode(slice) else { return }
                     slice.commit()
                     committed.append(slice)
-                    settle(keeping: 4)
+                    covered.append(pixels)
+                    settle(keeping: 1)
                 }
             }
-            try slices { passes.encodeSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
+            try slices { passes.encodeSlice(job, budget: sliceBudget, commandBuffer: $0)?.covered }
             job.completed = job.encoded
             passes.prepareMasks(job, frame: frame)
-            try slices { passes.encodeMaskSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
+            // Outline coverage marches far fewer pixels: its slices do not measure.
+            try slices { passes.encodeMaskSlice(job, budget: sliceBudget, commandBuffer: $0) != nil ? 0 : nil }
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
             settle(keeping: 0)
             if slow {

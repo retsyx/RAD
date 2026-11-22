@@ -273,7 +273,7 @@ final class Probe: @unchecked Sendable {
                 }
                 let buffer = try XCTUnwrap(queue.makeCommandBuffer())
                 // Scissored to the rectangle (a one-block plan would count as the whole frame).
-                passes.encode(job, slice: CADSlicePlan.Slice(rects: [rect], covered: 1, whole: false, blocks: 1),
+                passes.encode(job, slice: CADSlicePlan.Slice(rects: [rect], covered: 1, whole: false),
                               commandBuffer: buffer)
                 buffer.commit()
                 buffers.append(buffer)
@@ -293,7 +293,7 @@ final class Probe: @unchecked Sendable {
     private func clearedJob() throws -> CADExactJob {
         let setup = try XCTUnwrap(queue.makeCommandBuffer())
         let job = try newJob(setup)
-        job.plan = CADSlicePlan(width: width, height: height, rects: [], block: 32)
+        job.plan = CADSlicePlan(width: width, height: height, rects: [])
         passes.encodeSlice(job, budget: 1e-12, commandBuffer: setup)
         setup.commit()
         setup.waitUntilCompleted()
@@ -363,7 +363,7 @@ final class Probe: @unchecked Sendable {
         switch spec.first ?? "whole" {
         case "blocks":
             let block = Int(spec[1])!
-            return reachedBlocks(job, block: block).map { CADSlicePlan.Slice(rects: [$0], covered: 1, blocks: 1) }
+            return reachedBlocks(job, block: block).map { CADSlicePlan.Slice(rects: [$0], covered: 1) }
         case "scatter":
             let k = Int(spec[1])!, block = Int(spec[2])!
             var groups = [[SIMD4<Int32>]](repeating: [], count: k)
@@ -373,7 +373,18 @@ final class Probe: @unchecked Sendable {
                 let h = (bx &* 7 &+ by &* 3 &+ ((bx / k) ^ (by / k)) &* 5) % k
                 groups[h].append(r)
             }
-            return groups.filter { !$0.isEmpty }.map { CADSlicePlan.Slice(rects: $0, covered: 1, blocks: $0.count) }
+            return groups.filter { !$0.isEmpty }.map { CADSlicePlan.Slice(rects: $0, covered: 1) }
+        case "plan":
+            // The live plan: slices of D ms by the design's measured average rate (even budgets).
+            let seconds = Double(spec[1])! / 1000
+            var plan = CADSlicePlan(width: width, height: height, rects: job.draws.map(\.rect))
+            var result: [CADSlicePlan.Slice] = []
+            let rate = CADExactCost.shared.sliceRate(job.costKey)
+            while let slice = plan.next(budget: CADViewportPasses.evenBudget(plan, CADViewportPasses.coveredBudget(seconds, rate: rate))) {
+                result.append(slice)
+            }
+            if result.count == 1 { result[0].whole = true }
+            return result
         case "bands":
             // Full-width bands of B rows, band j in slice j mod K (only the reached x-range).
             let k = Int(spec[1])!, band = Int(spec[2])!
@@ -384,9 +395,9 @@ final class Probe: @unchecked Sendable {
             for (row, span) in rows.sorted(by: { $0.key < $1.key }) {
                 groups[row % k].append(SIMD4(span.0, Int32(row * band), span.1, Int32(min(height, (row + 1) * band))))
             }
-            return groups.filter { !$0.isEmpty }.map { CADSlicePlan.Slice(rects: $0, covered: 1, blocks: $0.count) }
+            return groups.filter { !$0.isEmpty }.map { CADSlicePlan.Slice(rects: $0, covered: 1) }
         default:
-            return [CADSlicePlan.Slice(rects: [], covered: 1, whole: true, blocks: 1)]
+            return [CADSlicePlan.Slice(rects: [], covered: 1, whole: true)]
         }
     }
 
@@ -541,18 +552,14 @@ final class Probe: @unchecked Sendable {
         return String(format: "exact pass %.1f ms beside frames; ", busy.min()!) + Self.summary(waits)
     }
 
-    /// The live loop's slicing (e3d5f4f rules: budget, block halving, slices in flight, chained commits
-    /// emulated by committing the next slice as soon as fewer than the limit run), measuring each slice.
+    /// The live loop's slicing: slices of the slice budget by the measured average rate, one running and
+    /// the next one queued behind it; `cold` forgets the design's measurements first.
     private func runSliced(cold: Bool, beside: Bool) throws -> (busy: Double, slices: [Double], waits: [Double], count: Int) {
         let setup = try XCTUnwrap(queue.makeCommandBuffer())
         let job = try newJob(setup)
-        if cold {
-            CADExactCost.shared.forget(job.costKey.resources)
-            job.plan = CADSlicePlan(width: width, height: height, rects: job.draws.map(\.rect),
-                                    block: CADExactCost.shared.blockSide(job.costKey))
-        }
+        if cold { CADExactCost.shared.forget(job.costKey.resources) }
         setup.commit()
-        var committed: [(buffer: any MTLCommandBuffer, covered: Int, blocks: Int, side: Int)] = []
+        var committed: [(buffer: any MTLCommandBuffer, covered: Int)] = []
         var done = false
         let lock = NSLock()
         var waits: [Double] = []
@@ -575,17 +582,15 @@ final class Probe: @unchecked Sendable {
                 gpuEnd = max(gpuEnd, item.buffer.gpuEndTime)
                 measured.append(seconds * 1000)
                 CADExactCost.shared.recordSlice(job.costKey, seconds: seconds, covered: item.covered)
-                CADExactCost.shared.recordBlocks(job.costKey, side: item.side, seconds: seconds, count: item.blocks)
                 settled += 1
             }
         }
         while job.hasSlicesToEncode {
-            let limit = CADExactCost.shared.slicesInFlight(job.costKey)
-            settle(keeping: limit - 1)
+            settle(keeping: 1)
             let buffer = try XCTUnwrap(queue.makeCommandBuffer())
             guard let slice = passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: buffer) else { break }
             buffer.commit()
-            committed.append((buffer, slice.covered, slice.blocks, job.plan.block))
+            committed.append((buffer, slice.covered))
         }
         settle(keeping: 0)
         lock.withLock { done = true }
