@@ -106,10 +106,11 @@ publishes its outputs, each written to a temporary name and renamed:
   gradient at its centroid and corners while f decreases through it along
   its normal). The part's `shell` = 1.1 × max(δ, largest sampled f) + that
   float32 margin: the app's march misses only once f rises above it. Parts
-  share 1,000,000 proxy triangles by their preview triangle counts; a proxy
-  over its share is meshed once at twice the cell, one failing a check once
-  at half the tolerance, and otherwise the part has none. Proxies never fail
-  a build.
+  share 1,000,000 proxy triangles by their preview triangle counts. A part's
+  offset mesh may refine to four times its share before simplification; a
+  proxy whose simplified mesh exceeds its share is meshed once at twice the
+  cell, one failing a check once at half the tolerance, and otherwise the
+  part has none. Proxies never fail a build.
 - `field.bin`: the GPU field program of every part (`sdf_field.py`,
   SDF-DESIGN.md "GPU field programs"): little-endian 32-bit words that the
   app uploads as one Metal buffer and evaluates per pixel. Top bricks are 8

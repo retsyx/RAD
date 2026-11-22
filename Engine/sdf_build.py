@@ -63,7 +63,8 @@ PREVIEW_BASE_SHARE = 0.75
 # large triangles) and no triangle is flipped; its shell is
 # PROXY_SHELL_FACTOR times the larger of delta and the largest sampled f,
 # plus that float32 margin. All parts' proxies share PROXY_TRIANGLE_BUDGET
-# triangles.
+# triangles once simplified; before simplification a part's offset mesh may
+# refine to PROXY_REFINE_FACTOR times its share.
 PROXY_CELL_FACTOR = 2.0
 PROXY_OFFSET_CELLS = 0.5
 PROXY_TOLERANCE_FRACTION = 1 / 3
@@ -71,6 +72,7 @@ PROXY_MINIMUM_FRACTION = 0.1
 PROXY_SHELL_FACTOR = 1.1
 PROXY_FLOAT_ULPS = 16
 PROXY_TRIANGLE_BUDGET = 1_000_000
+PROXY_REFINE_FACTOR = 4
 PROXY_DEPTH = PREVIEW_DEPTH
 PROXY_SIMPLIFY_FRACTION = 0.6
 PROXY_SAMPLE_SPACING = 0.5  # of delta: the largest spacing of field samples on a proxy triangle
@@ -1355,17 +1357,22 @@ def checked_proxy(graph, root, mesh, distance, threads):
 
 
 def mesh_proxy(graph, node, cell, tolerance, budget, threads):
-    """The adaptive mesh of an offset node (no display creases)."""
+    """The simplified adaptive mesh of an offset node (no display creases).
+    Refinement may reach PROXY_REFINE_FACTOR times `budget` (None: no
+    limit), since only the simplified mesh must fit the budget: refinement
+    stopped at the budget itself leaves offset surfaces with many creases
+    too coarse, and their simplified proxies fold."""
     simplify = PROXY_SIMPLIFY_FRACTION * tolerance / PROXY_TOLERANCE_FRACTION
+    limit = None if budget is None else PROXY_REFINE_FACTOR * budget
     return graph.native_mesh(node, cell_size=cell, crease_angle=180.0, threads=threads, tolerance=tolerance,
-                             max_depth=PROXY_DEPTH, max_triangles=budget).mesh(simplify or None)
+                             max_depth=PROXY_DEPTH, max_triangles=limit).mesh(simplify or None)
 
 
 def proxy_part(graph, root, node, distance, cell, budget, threads):
     """(result entry without the solid, (positions, triangles) or None) of
-    one part's proxy. A proxy over its triangle budget is meshed once more
-    at twice the cell; one that fails checked_proxy once more at half the
-    tolerance."""
+    one part's proxy. A proxy whose simplified mesh exceeds its triangle
+    budget is meshed once more at twice the cell; one that fails
+    checked_proxy once more at half the tolerance."""
     import radsdf
     tolerance = PROXY_TOLERANCE_FRACTION * distance
     coarsened = retried = False
