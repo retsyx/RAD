@@ -1053,8 +1053,8 @@ fragment CADFieldGeometryOut cad_field_geometry(CADFieldVarying in [[stage_in]],
     if (r.mask == 0 || r.shaded == CAD_FIELD_NONE) discard_fragment();
     CADFieldGeometryOut out;
     const int debug = int(u.projection.w);
-    if (debug == 1) {
-        out.normal = float2(saturate(float(r.steps) / 32.0f), 0.0f);
+    if (debug == 1 || debug == 5) {
+        out.normal = float2(saturate(float(r.steps) / (debug == 5 ? 1024.0f : 32.0f)), 0.0f);
     } else if (debug == 3) {
         out.normal = float2(traced ? 1.0f : 0.0f, 0.0f);
     } else {

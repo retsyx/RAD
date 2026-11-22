@@ -415,8 +415,15 @@ final class CADExactJob: @unchecked Sendable {
     /// Whether a composite of this geometry has reported its total cost.
     var reported = false
 
+    convenience init(key: CADExactKey, field: CADFieldFrame, view: simd_float4x4, projection: simd_float4x4,
+                     width: Int, height: Int, targets: CADExactTargets) {
+        self.init(key: key, field: field, view: view, projection: projection, width: width, height: height, targets: targets,
+                  draws: field.resources.draws(field.instances, view: view, projection: projection, width: width,
+                                               height: height, contacts: !key.translucent))
+    }
+
     init(key: CADExactKey, field: CADFieldFrame, view: simd_float4x4, projection: simd_float4x4,
-         width: Int, height: Int, targets: CADExactTargets) {
+         width: Int, height: Int, targets: CADExactTargets, draws: [CADFieldDraw]) {
         self.key = key
         self.field = field
         self.view = view
@@ -424,8 +431,7 @@ final class CADExactJob: @unchecked Sendable {
         self.width = width
         self.height = height
         self.targets = targets
-        draws = field.resources.draws(field.instances, view: view, projection: projection, width: width, height: height,
-                                      contacts: !key.translucent)
+        self.draws = draws
         costKey = .init(resources: key.resources, width: width, height: height, translucent: key.translucent)
         plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect),
                             block: CADExactCost.shared.blockSide(costKey))
@@ -663,7 +669,7 @@ final class CADExactPipelines: @unchecked Sendable {
         if (part == 0) discard_fragment();
         const int debug = int(u.frame.w);
         float3 color;
-        if (debug == 1) {
+        if (debug == 1 || debug == 5) {
             color = float3(e.x);
         } else if (debug == 2) {
             color = n * 0.5f + 0.5f;

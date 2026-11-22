@@ -389,6 +389,8 @@ final class CADViewportPasses: @unchecked Sendable {
     static let sampleCount = 4
     /// GPU seconds of one exact slice: new input waits at most about this long.
     static let sliceBudget = 0.004
+    /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
+    nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
 
     /// Exact work encoded by these passes (diagnostics and tests).
     struct Statistics: Equatable, Sendable {
@@ -514,6 +516,19 @@ final class CADViewportPasses: @unchecked Sendable {
         return slice
     }
 
+    /// Encodes a given slice of a job (the first one encoded also clears the stored layers).
+    func encode(_ job: CADExactJob, slice: CADSlicePlan.Slice, commandBuffer: any MTLCommandBuffer) {
+        let clear = !job.cleared
+        job.cleared = true
+        job.encoded += 1
+        count { $0.geometrySlices += 1 }
+        if job.key.translucent {
+            encodeTranslucentSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
+        } else {
+            encodeOpaqueSlice(job, slice: slice, clear: clear, commandBuffer: commandBuffer)
+        }
+    }
+
     /// Covered pixels a slice of `budget` GPU seconds may estimate.
     static func coveredBudget(_ budget: Double, rate: Double) -> Int {
         let pixels = budget / rate
@@ -559,6 +574,7 @@ final class CADViewportPasses: @unchecked Sendable {
         pass.depthAttachment.loadAction = clear ? .clear : .load
         pass.depthAttachment.clearDepth = 0
         pass.depthAttachment.storeAction = .store
+        Self.experimentPassHook?(pass)
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
         encoder.label = "RAD exact geometry"
         let resources = job.field.resources
