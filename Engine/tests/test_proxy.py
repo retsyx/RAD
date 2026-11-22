@@ -182,6 +182,29 @@ class ProxyBuildTests(unittest.TestCase):
             self.assertEqual(one[name].tobytes(), three[name].tobytes())
 
 
+class ProxyRefinementTests(unittest.TestCase):
+    def test_refinement_may_exceed_the_budget_before_simplification(self):
+        calls = []
+
+        class Native:
+            def mesh(self, simplify):
+                calls[-1]["simplify"] = simplify
+                return "simplified"
+
+        class Graph:
+            def native_mesh(self, node, **options):
+                calls.append(options)
+                return Native()
+
+        self.assertEqual(sdf_build.mesh_proxy(Graph(), 7, 0.5, 0.03, 2500, 2), "simplified")
+        self.assertEqual(calls[-1]["max_triangles"], sdf_build.PROXY_REFINE_FACTOR * 2500)
+        self.assertGreater(sdf_build.PROXY_REFINE_FACTOR, 1)
+        self.assertAlmostEqual(calls[-1]["simplify"],
+                               sdf_build.PROXY_SIMPLIFY_FRACTION * 0.03 / sdf_build.PROXY_TOLERANCE_FRACTION)
+        sdf_build.mesh_proxy(Graph(), 7, 0.5, 0.03, None, 2)
+        self.assertIsNone(calls[-1]["max_triangles"])
+
+
 @unittest.skipUnless(kernel_available(), "the native SDF kernel is not available")
 class ProxyGeometryTests(unittest.TestCase):
     DELTA = 0.1
