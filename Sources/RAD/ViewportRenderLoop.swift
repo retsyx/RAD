@@ -60,6 +60,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
     private enum Finished {
         case slice(CADExactJob, seconds: Double, covered: Int)
         case mask(CADExactJob, CADMaskCoverage)
+        /// The GPU failed a slice or took far too long for it.
+        case failed(CADExactJob)
     }
     private var finished: [Finished] = []
     private var slicesRunning = 0
@@ -194,6 +196,13 @@ final class ViewportRenderLoop: @unchecked Sendable {
             case .mask(let owner, let coverage):
                 coverage.completed += 1
                 if owner === job, coverage.isComplete { needsComposite = true }
+            case .failed(let owner):
+                CADExactCost.shared.recordFailure(owner.costKey)
+                if owner === job, let latest {
+                    // Display meshes from now on; show the newest state with them.
+                    abandonJob()
+                    requeue(latest)
+                }
             }
         }
     }
@@ -214,10 +223,10 @@ final class ViewportRenderLoop: @unchecked Sendable {
     /// The decision for `frame` given the current job's key and progress and
     /// the presentation revision of the newest presented frame.
     static func action(for frame: CADViewportFrame, job: (key: CADExactKey, complete: Bool)?,
-                       presented: UInt64?) -> Action {
-        // No exact faces (`key` comes with `field`): wireframe, or resources
-        // still preparing.
-        guard let key = frame.key else { return .meshes }
+                       presented: UInt64?, failed: Bool = false) -> Action {
+        // No exact faces (`key` comes with `field`): wireframe, resources
+        // still preparing, or exact layers the GPU could not draw.
+        guard let key = frame.key, !failed else { return .meshes }
         if let job, job.key == key {
             return job.complete ? .composite : .keep(standIn: frame.presentation != presented)
         }
@@ -225,7 +234,11 @@ final class ViewportRenderLoop: @unchecked Sendable {
     }
 
     private func handle(_ request: Request) {
-        switch Self.action(for: request.frame, job: job.map { ($0.key, $0.isComplete) }, presented: presentedRevision) {
+        let failed = request.frame.key.map {
+            CADExactCost.shared.hasFailed(resources: $0.resources, translucent: $0.translucent)
+        } ?? false
+        switch Self.action(for: request.frame, job: job.map { ($0.key, $0.isComplete) }, presented: presentedRevision,
+                           failed: failed) {
         case .meshes:
             abandonJob()
             _ = presentMesh(request, final: true)
@@ -298,7 +311,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
             needsComposite = false
             let covered = job.plan.total, costKey = job.costKey
             commit(commandBuffer, drawable: drawable, request: request, kind: "single",
-                   outcome: Outcome(exact: true, final: true, geometrySeconds: 0)) { seconds in
+                   outcome: Outcome(exact: true, final: true, geometrySeconds: 0), geometry: job) { seconds in
                 CADExactCost.shared.recordFrame(costKey, seconds: seconds, covered: covered)
                 CADExactCost.shared.recordSlice(costKey, seconds: seconds, covered: covered)
             }
@@ -365,11 +378,12 @@ final class ViewportRenderLoop: @unchecked Sendable {
             self.condition.lock()
             let seconds = max(0, buffer.gpuEndTime - max(buffer.gpuStartTime, self.sliceGPUEnd))
             self.sliceGPUEnd = max(self.sliceGPUEnd, buffer.gpuEndTime)
-            let result: Finished
+            var result: Finished
             switch record {
             case .slice(let owner, _, let covered): result = .slice(owner, seconds: seconds, covered: covered)
-            case .mask: result = record
+            case .mask, .failed: result = record
             }
+            if buffer.status == .error || seconds > CADExactCost.failingSliceSeconds { result = .failed(job) }
             self.slicesRunning -= 1
             self.finished.append(result)
             self.condition.signal()
@@ -466,8 +480,9 @@ final class ViewportRenderLoop: @unchecked Sendable {
     }
 
     /// Presents and commits a frame; `measured` receives its GPU seconds.
+    /// A frame that also drew `geometry` fails it when the GPU fails the frame.
     private func commit(_ commandBuffer: any MTLCommandBuffer, drawable: any CAMetalDrawable, request: Request, kind: String,
-                        outcome: Outcome, measured: (@Sendable (Double) -> Void)? = nil) {
+                        outcome: Outcome, geometry: CADExactJob? = nil, measured: (@Sendable (Double) -> Void)? = nil) {
         let trace = ViewportFrameTrace.shared, generation = request.generation
         trace.update(generation) { $0.afterEncode = ViewportFrameTrace.now; $0.kind = kind; $0.exact = outcome.exact }
         if ViewportFrameTrace.enabled {
@@ -479,8 +494,14 @@ final class ViewportRenderLoop: @unchecked Sendable {
         presentedRevision = request.frame.presentation
         commandBuffer.present(drawable)
         let completion = completion, inFlight = inFlight
-        commandBuffer.addCompletedHandler { buffer in
+        commandBuffer.addCompletedHandler { [weak self] buffer in
             inFlight.signal()
+            if buffer.status == .error, let geometry, let self {
+                self.condition.withLock {
+                    self.finished.append(.failed(geometry))
+                    self.condition.signal()
+                }
+            }
             let seconds = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
             let start = buffer.gpuStartTime, end = buffer.gpuEndTime
             trace.update(generation) { $0.gpuStart = start; $0.gpuEnd = end }

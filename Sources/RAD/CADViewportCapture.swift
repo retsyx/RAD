@@ -69,7 +69,11 @@ final class CADViewportCapture: @unchecked Sendable {
             throw RADError.message("RAD could not allocate the design image.")
         }
         var committed: [any MTLCommandBuffer] = []
-        if frame.field != nil, let job = passes.makeJob(frame, source: source, renderer: renderer, commandBuffer: commandBuffer) {
+        let failed = frame.key.map { CADExactCost.shared.hasFailed(resources: $0.resources, translucent: $0.translucent) } ?? false
+        var costKey: CADExactCost.Key?
+        if frame.field != nil, !failed,
+           let job = passes.makeJob(frame, source: source, renderer: renderer, commandBuffer: commandBuffer) {
+            costKey = job.costKey
             commandBuffer.commit()
             committed.append(commandBuffer)
             // One queue orders the slices before the composite.
@@ -102,6 +106,15 @@ final class CADViewportCapture: @unchecked Sendable {
             committed.append(commandBuffer)
         }
         committed.last?.waitUntilCompleted()
+        if let costKey, committed.contains(where: { $0.status != .completed }) {
+            // Exact layers the GPU could not draw: display meshes from now on.
+            CADExactCost.shared.recordFailure(costKey)
+            var meshes = frame
+            meshes.field = nil
+            meshes.key = nil
+            return try image(of: meshes, source: source, renderer: renderer, passes: passes, sliceBudget: sliceBudget,
+                             statistics: statistics)
+        }
         var busy = 0.0, cursor = 0.0
         for buffer in committed.sorted(by: { $0.gpuStartTime < $1.gpuStartTime }) {
             buffer.waitUntilCompleted()

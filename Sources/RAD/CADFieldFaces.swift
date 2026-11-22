@@ -269,7 +269,7 @@ final class CADFieldResources: @unchecked Sendable {
         _ = try pipeline(.visibility, colors: [.r16Float], depth: Self.depthFormat, samples: samples)
         _ = try pipeline(.revealage, colors: [.r16Float], depth: Self.depthFormat, samples: samples)
         _ = try pipeline(.accumulation, colors: [.rgba16Float], depth: .invalid, samples: samples)
-        _ = try pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: 1)
+        _ = try pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: samples)
     }
 
     /// The pipeline for a mode and pass formats, compiled on first use.

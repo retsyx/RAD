@@ -726,7 +726,8 @@ final class CADViewportPasses: @unchecked Sendable {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return coverage }
         encoder.label = "RAD exact outline coverage"
         if slice.covered > 0,
-           let pipeline = try? resources.pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: 1) {
+           let pipeline = try? resources.pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid,
+                                                  samples: CADFieldResources.sampleCount) {
             var uniforms = fieldUniforms(job)
             encoder.setRenderPipelineState(pipeline)
             encoder.setCullMode(.back)
@@ -1331,9 +1332,13 @@ final class CADViewportPasses: @unchecked Sendable {
 
     fragment float4 cad_mask_fragment(constant CADMaskUniforms &u [[buffer(1)]]) { return u.channel; }
 
-    // Stored exact coverage of a batch, texel for pixel.
-    fragment float4 cad_stored_coverage(CADQuadOut in [[stage_in]], texture2d<float, access::read> coverage [[texture(0)]]) {
-        return coverage.read(uint2(in.position.xy));
+    // Stored exact coverage of a batch, pixel for pixel: the average of its
+    // samples, which the batch pass resolves to the same coverage.
+    fragment float4 cad_stored_coverage(CADQuadOut in [[stage_in]], texture2d_ms<float, access::read> coverage [[texture(0)]]) {
+        const uint2 p = uint2(in.position.xy);
+        float4 sum = 0;
+        for (uint i = 0; i < coverage.get_num_samples(); ++i) sum += coverage.read(p, i);
+        return sum / float(coverage.get_num_samples());
     }
 
     // Coverage minus its four-neighbor interior is the projected outline.

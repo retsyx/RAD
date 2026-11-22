@@ -258,9 +258,28 @@ final class CADExactCost: @unchecked Sendable {
     /// Slices covering fewer pixels do not change the rate.
     static let minimumCovered = 4_096
 
+    /// A slice slower than this, or one the GPU fails, ends exact faces of
+    /// its design in that display mode for the session: such geometry would
+    /// stall or reset the GPU on every view.
+    static let failingSliceSeconds = 0.25
+
+    struct Failure: Hashable, Sendable {
+        var resources: ObjectIdentifier
+        var translucent: Bool
+    }
+
     private let lock = NSLock()
     private var slices: [Key: Double] = [:]
     private var frames: [Key: Double] = [:]
+    private var failures = Set<Failure>()
+
+    func recordFailure(_ key: Key) {
+        lock.withLock { _ = failures.insert(Failure(resources: key.resources, translucent: key.translucent)) }
+    }
+
+    func hasFailed(resources: ObjectIdentifier, translucent: Bool) -> Bool {
+        lock.withLock { failures.contains(Failure(resources: resources, translucent: translucent)) }
+    }
 
     func sliceRate(_ key: Key) -> Double {
         lock.withLock { slices[key] } ?? (key.translucent ? Self.defaultTranslucentRate : Self.defaultOpaqueRate)
@@ -287,6 +306,7 @@ final class CADExactCost: @unchecked Sendable {
         lock.withLock {
             slices = slices.filter { $0.key.resources != resources }
             frames = frames.filter { $0.key.resources != resources }
+            failures = failures.filter { $0.resources != resources }
         }
     }
 }
@@ -318,8 +338,11 @@ final class CADMaskCoverage: @unchecked Sendable {
     init?(key: Key, items: [(draw: CADFieldDraw, selected: Bool)], device: any MTLDevice) {
         let width = Int(key.rect.z - key.rect.x), height = Int(key.rect.w - key.rect.y)
         guard width > 0, height > 0 else { return nil }
+        // Multisample like the batch's own coverage pass, which resolves it.
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height,
                                                                   mipmapped: false)
+        descriptor.textureType = .type2DMultisample
+        descriptor.sampleCount = CADFieldResources.sampleCount
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .private
         guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
