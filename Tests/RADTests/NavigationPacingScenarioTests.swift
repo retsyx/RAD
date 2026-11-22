@@ -4,16 +4,20 @@ import XCTest
 @testable import RAD
 
 /// Measurement tool (RAD_NAV_SCENARIO): replays orbit, hover and zoom input in
-/// a live viewport window and records each frame's timeline.
+/// a live viewport window and records each frame's and exact slice's timeline.
+/// The scenario JSON names `designs` (build specs), `output`, window `sizes`
+/// in points, display `modes` and `phases`.
 @MainActor
 final class NavigationPacingScenarioTests: XCTestCase {
     struct Scenario: Decodable {
         var designs: [String]
         var output: String
         var sizes: [[Double]]
-        var mode: String?
+        var modes: [String]?
         var phases: [String]?
     }
+
+    static let allPhases = ["hover-rest", "hover-orbit", "drag-release", "wheel", "trackpad"]
 
     func testNavigationPacing() async throws {
         guard let path = ProcessInfo.processInfo.environment["RAD_NAV_SCENARIO"] else {
@@ -36,18 +40,20 @@ final class NavigationPacingScenarioTests: XCTestCase {
             let name = URL(fileURLWithPath: designPath).deletingPathExtension().lastPathComponent
             print("NAV \(name): build \(String(format: "%.1f", buildSeconds)) s, \(preview.triangleCount) triangles, proxy \(preview.proxySolids?.count ?? 0)")
             for size in scenario.sizes {
-                let result = try await measure(preview: preview, name: name, width: size[0], height: size[1],
-                                               mode: ViewportDisplayMode(rawValue: scenario.mode ?? "shaded") ?? .shaded,
-                                               phases: scenario.phases ?? ["hover-orbit", "drag-release", "wheel", "trackpad"])
-                var entry = result
-                entry["design"] = name
-                entry["build"] = buildSeconds
-                entry["triangles"] = preview.triangleCount
-                report.append(entry)
+                for mode in scenario.modes ?? ["shaded"] {
+                    var entry = try await measure(preview: preview, name: name, width: size[0], height: size[1],
+                                                  mode: ViewportDisplayMode(rawValue: mode) ?? .shaded,
+                                                  phases: scenario.phases ?? Self.allPhases)
+                    entry["design"] = name
+                    entry["mode"] = mode
+                    entry["build"] = buildSeconds
+                    entry["triangles"] = preview.triangleCount
+                    report.append(entry)
+                    let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                    try data.write(to: output.appendingPathComponent("report.json"))
+                }
             }
         }
-        let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: output.appendingPathComponent("report.json"))
     }
 
     private func measure(preview: PreviewMesh, name: String, width: Double, height: Double,
@@ -65,12 +71,19 @@ final class NavigationPacingScenarioTests: XCTestCase {
         window.orderFrontRegardless()
         view.layout()
         _ = try await view.waitForCaptureResources(until: .now + .seconds(120))
-        func settle() async throws {
-            let deadline = ContinuousClock.now + .seconds(10)
+        func settle(_ limit: Duration = .seconds(30)) async throws {
+            let deadline = ContinuousClock.now + limit
             while view.hasPendingFrames, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         }
-        try await settle()
-        try await Task.sleep(for: .milliseconds(500))
+        // The first exact image of the design.
+        ViewportFrameTrace.enabled = true
+        let firstStart = CACurrentMediaTime()
+        try await settle(.seconds(120))
+        let firstExact = CACurrentMediaTime() - firstStart
+        ViewportFrameTrace.enabled = false
+        _ = ViewportFrameTrace.shared.take()
+        _ = ViewportFrameTrace.shared.takeSlices()
+        try await Task.sleep(for: .milliseconds(300))
         try await settle()
         _ = frames
         let center = NSPoint(x: width / 2, y: height / 2)
@@ -84,7 +97,9 @@ final class NavigationPacingScenarioTests: XCTestCase {
         let heartbeat = Timer(timeInterval: 0.001, repeats: true) { _ in heartbeats.append(CACurrentMediaTime()) }
         RunLoop.main.add(heartbeat, forMode: .common)
         defer { heartbeat.invalidate() }
-        var results: [String: Any] = ["size": [width, height], "pixels": Int(view.convertToBacking(view.bounds).size.width * view.convertToBacking(view.bounds).size.height)]
+        let backing = view.convertToBacking(view.bounds).size
+        var results: [String: Any] = ["size": [width, height], "pixels": Int(backing.width * backing.height),
+                                      "firstExactSeconds": firstExact]
         var handlerTimes: [Double] = []
         func timed(_ block: () -> Void) {
             let t = CACurrentMediaTime()
@@ -96,8 +111,20 @@ final class NavigationPacingScenarioTests: XCTestCase {
             let wait = next - CACurrentMediaTime()
             if wait > 0 { try await Task.sleep(for: .microseconds(Int(wait * 1_000_000))) } else { await Task.yield() }
         }
+        func scroll(_ delta: Double, phase: Int64, momentum: Int64) {
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: 0, wheel2: 0, wheel3: 0)!
+            event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: delta)
+            event.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: delta)
+            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
+            event.location = window.convertPoint(toScreen: view.convert(center, to: nil))
+            let ns = NSEvent(cgEvent: event)!
+            timed { view.scrollWheel(with: ns) }
+        }
         for phase in phases {
             _ = ViewportFrameTrace.shared.take()
+            _ = ViewportFrameTrace.shared.takeSlices()
             heartbeats.removeAll()
             handlerTimes.removeAll()
             ViewportFrameTrace.enabled = true
@@ -105,6 +132,14 @@ final class NavigationPacingScenarioTests: XCTestCase {
             let t0 = CACurrentMediaTime()
             var navigationStart = t0, navigationEnd = t0
             switch phase {
+            case "hover-rest":
+                // Hover across the design at rest: composites of stored layers.
+                for i in 0..<60 {
+                    let p = NSPoint(x: center.x - 120 + Double(i) * 4, y: center.y + 40 * sin(Double(i) / 6))
+                    timed { view.mouseMoved(with: mouse(.mouseMoved, p)) }
+                    try await pace(i, t0, 60)
+                }
+                navigationEnd = CACurrentMediaTime()
             case "hover-orbit":
                 // Hover across the model at 60 Hz, then orbit at 120 Hz.
                 for i in 0..<45 {
@@ -124,6 +159,8 @@ final class NavigationPacingScenarioTests: XCTestCase {
                 timed { view.rightMouseUp(with: mouse(.rightMouseUp, center)) }
                 navigationEnd = CACurrentMediaTime()
             case "drag-release":
+                // Short drags with pauses shorter than heavy designs' exact
+                // layers (abandoned in progress), then a final release.
                 navigationStart = CACurrentMediaTime()
                 for drag in 0..<5 {
                     timed { view.rightMouseDown(with: mouse(.rightMouseDown, center)) }
@@ -134,43 +171,45 @@ final class NavigationPacingScenarioTests: XCTestCase {
                         try await pace(i, start, 120)
                     }
                     timed { view.rightMouseUp(with: mouse(.rightMouseUp, center)) }
-                    try await Task.sleep(for: .milliseconds(150))
+                    navigationEnd = CACurrentMediaTime()
+                    if drag < 4 { try await Task.sleep(for: .milliseconds(150)) }
                 }
-                navigationEnd = CACurrentMediaTime()
             case "wheel":
-                // A mouse wheel: line ticks without phases, in bursts with pauses.
+                // A mouse wheel: line ticks without phases, in bursts with
+                // pauses longer than the settle delay.
                 navigationStart = CACurrentMediaTime()
                 for burst in 0..<4 {
-                    for tick in 0..<5 {
+                    for _ in 0..<5 {
                         let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1,
                                             wheel1: burst < 2 ? 1 : -1, wheel2: 0, wheel3: 0)!
                         event.location = window.convertPoint(toScreen: view.convert(center, to: nil))
                         let ns = NSEvent(cgEvent: event)!
                         timed { view.scrollWheel(with: ns) }
-                        _ = tick
                         try await Task.sleep(for: .milliseconds(45))
                     }
-                    try await Task.sleep(for: .milliseconds(350))
+                    navigationEnd = CACurrentMediaTime() + ViewportNavigationPolicy.wheelSettle.seconds
+                    if burst < 3 { try await Task.sleep(for: .milliseconds(350)) }
                 }
-                navigationEnd = CACurrentMediaTime()
             case "trackpad":
-                // Two-finger scrolling with phases at 120 Hz, in and out.
+                // Two-finger scrolling at 120 Hz with momentum: about 2x in,
+                // then back out.
                 navigationStart = CACurrentMediaTime()
-                for direction in [1, -1] {
-                    let start = CACurrentMediaTime()
-                    for i in 0..<120 {
-                        let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                                            wheel1: Int32(direction * 6), wheel2: 0, wheel3: 0)!
-                        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-                        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: i == 0 ? 1 : (i == 119 ? 4 : 2))
-                        event.location = window.convertPoint(toScreen: view.convert(center, to: nil))
-                        let ns = NSEvent(cgEvent: event)!
-                        timed { view.scrollWheel(with: ns) }
+                for direction in [1.0, -1.0] {
+                    var start = CACurrentMediaTime()
+                    for i in 0..<60 {
+                        scroll(direction * 1.2, phase: i == 0 ? 1 : 2, momentum: 0)
                         try await pace(i, start, 120)
                     }
-                    try await Task.sleep(for: .milliseconds(200))
+                    scroll(0, phase: 4, momentum: 0)
+                    start = CACurrentMediaTime()
+                    for i in 0..<40 {
+                        scroll(direction * 1.2 * Double(40 - i) / 40, phase: 0, momentum: i == 0 ? 1 : 2)
+                        try await pace(i, start, 120)
+                    }
+                    scroll(0, phase: 0, momentum: 3)
+                    navigationEnd = CACurrentMediaTime()
+                    if direction > 0 { try await Task.sleep(for: .milliseconds(200)) }
                 }
-                navigationEnd = CACurrentMediaTime()
             default: continue
             }
             try await Task.sleep(for: .milliseconds(400))
@@ -178,6 +217,7 @@ final class NavigationPacingScenarioTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(300))
             ViewportFrameTrace.enabled = false
             let trace = ViewportFrameTrace.shared.take()
+            let slices = ViewportFrameTrace.shared.takeSlices()
             let gaps = zip(heartbeats.dropFirst(), heartbeats).map { $0 - $1 }.sorted()
             let policyAfter = (view.navigationPolicy.exactFrames, view.navigationPolicy.meshFrames)
             var entry: [String: Any] = [
@@ -190,14 +230,26 @@ final class NavigationPacingScenarioTests: XCTestCase {
                 "events": handlerTimes.count,
             ]
             entry["frames"] = trace.map { f -> [String: Any] in
-                ["g": f.generation, "exact": f.exact, "px": f.pixels, "pub": f.published, "start": f.drawStart,
+                ["g": f.generation, "kind": f.kind, "exact": f.exact, "px": f.pixels, "pub": f.published, "start": f.drawStart,
                  "inflight": f.afterInFlight, "drawable": f.afterDrawable, "encoded": f.afterEncode,
                  "committed": f.committed, "gpuStart": f.gpuStart, "gpuEnd": f.gpuEnd, "main": f.completedOnMain,
                  "presented": f.presented]
             }
+            entry["slices"] = slices.map { s -> [String: Any] in
+                ["job": s.job.hashValue, "mask": s.mask, "covered": s.covered, "committed": s.committed,
+                 "gpuStart": s.gpuStart, "gpuEnd": s.gpuEnd]
+            }
             results[phase] = entry
-            print("NAV \(name) \(Int(width))x\(Int(height)) \(phase): frames \(trace.count) exact \(entry["exactFrames"]!) mesh \(entry["meshFrames"]!) main max gap \(String(format: "%.1f", (gaps.last ?? 0) * 1000)) ms")
+            print("NAV \(name) \(Int(width))x\(Int(height)) \(mode.rawValue) \(phase): frames \(trace.count) slices \(slices.count) exact \(entry["exactFrames"]!) mesh \(entry["meshFrames"]!) main max gap \(String(format: "%.1f", (gaps.last ?? 0) * 1000)) ms")
+        }
+        if let statistics = view.exactStatistics {
+            results["statistics"] = ["geometrySlices": statistics.geometrySlices, "maskSlices": statistics.maskSlices,
+                                     "composites": statistics.composites, "storedBytes": statistics.storedBytes]
         }
         return results
     }
+}
+
+private extension Duration {
+    var seconds: Double { Double(components.seconds) + Double(components.attoseconds) * 1e-18 }
 }

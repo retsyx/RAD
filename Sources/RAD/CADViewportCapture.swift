@@ -24,6 +24,13 @@ final class CADViewportCapture: @unchecked Sendable {
     var width: Int { frame.width }
     var height: Int { frame.height }
 
+    /// GPU busy time (union of the command buffers' execution) and command
+    /// buffers of a capture, for measurements.
+    struct Statistics {
+        var gpuSeconds = 0.0
+        var commandBuffers = 0
+    }
+
     /// Renders on the calling thread and waits for the GPU. Cancellation of
     /// the calling task stops preparation before any frame is encoded.
     func image() throws -> CGImage {
@@ -35,7 +42,9 @@ final class CADViewportCapture: @unchecked Sendable {
     /// layers are drawn in the viewport's slices, each its own command buffer
     /// so other GPU work interleaves, then composited; the call waits for all.
     static func image(of frame: CADViewportFrame, source: CADViewportSceneSource,
-                      renderer existing: SCNRenderer? = nil, passes existingPasses: CADViewportPasses? = nil) throws -> CGImage {
+                      renderer existing: SCNRenderer? = nil, passes existingPasses: CADViewportPasses? = nil,
+                      sliceBudget: Double = CADViewportPasses.sliceBudget,
+                      statistics: UnsafeMutablePointer<Statistics>? = nil) throws -> CGImage {
         try Task.checkCancellation()
         guard let device = existing?.device ?? MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             throw RADError.message("Metal is unavailable, so RAD cannot render a design image.")
@@ -75,10 +84,10 @@ final class CADViewportCapture: @unchecked Sendable {
                     committed.append(slice)
                 }
             }
-            try slices { passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: $0) != nil }
+            try slices { passes.encodeSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
             job.completed = job.encoded
             passes.prepareMasks(job, frame: frame)
-            try slices { passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: $0) != nil }
+            try slices { passes.encodeMaskSlice(job, budget: sliceBudget, commandBuffer: $0) != nil }
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
             guard let composite = queue.makeCommandBuffer(),
                   passes.encodeComposite(frame, job: job, source: source, renderer: renderer, into: target,
@@ -93,10 +102,17 @@ final class CADViewportCapture: @unchecked Sendable {
             committed.append(commandBuffer)
         }
         committed.last?.waitUntilCompleted()
-        for buffer in committed {
+        var busy = 0.0, cursor = 0.0
+        for buffer in committed.sorted(by: { $0.gpuStartTime < $1.gpuStartTime }) {
             buffer.waitUntilCompleted()
             if buffer.status != .completed { throw RADError.message("RAD could not render the design image.") }
+            if buffer.gpuEndTime > cursor {
+                busy += buffer.gpuEndTime - max(buffer.gpuStartTime, cursor)
+                cursor = buffer.gpuEndTime
+            }
         }
+        statistics?.pointee.gpuSeconds = busy
+        statistics?.pointee.commandBuffers = committed.count
         let bytesPerRow = width * 4
         var pixels = Data(count: bytesPerRow * height)
         pixels.withUnsafeMutableBytes { raw in

@@ -395,6 +395,8 @@ final class CADViewportPasses: @unchecked Sendable {
         var geometrySlices = 0
         var maskSlices = 0
         var composites = 0
+        /// Bytes of the stored exact layers.
+        var storedBytes = 0
     }
 
     let device: any MTLDevice
@@ -414,11 +416,11 @@ final class CADViewportPasses: @unchecked Sendable {
     var statistics: Statistics { statisticsLock.withLock { counts } }
     private func count(_ change: (inout Statistics) -> Void) { statisticsLock.withLock { change(&counts) } }
 
-    /// Bytes of the stored exact layers.
-    var storedBytes: Int { stored?.bytes ?? 0 }
-
     /// Releases the stored exact layers; GPU work already encoded keeps its own.
-    func releaseStoredLayers() { stored = nil }
+    func releaseStoredLayers() {
+        stored = nil
+        count { $0.storedBytes = 0 }
+    }
 
     // MARK: Complete frames
 
@@ -479,23 +481,25 @@ final class CADViewportPasses: @unchecked Sendable {
             stored = nil
             stored = CADExactTargets(device: device, width: frame.width, height: frame.height, translucent: key.translucent,
                                      revealage: revealage)
+            let bytes = stored?.bytes ?? 0
+            count { $0.storedBytes = bytes }
         }
         guard let layers = stored else { return nil }
         return CADExactJob(key: key, field: field, view: matrices.view, projection: matrices.projection,
                            width: frame.width, height: frame.height, targets: layers)
     }
 
-    /// Encodes a job's next slice: its geometry within a screen rectangle
-    /// whose estimated GPU time stays within `budget` seconds (the first
-    /// slice also clears the stored layers). Returns it, or nil when every
-    /// slice has been encoded.
+    /// Encodes a job's next slice: its geometry within screen blocks whose
+    /// estimated GPU time stays within `budget` seconds (the first slice also
+    /// clears the stored layers). Returns it, or nil when every slice has
+    /// been encoded.
     @discardableResult
     func encodeSlice(_ job: CADExactJob, budget: Double, commandBuffer: any MTLCommandBuffer) -> CADSlicePlan.Slice? {
         let covered = budget.isFinite ? max(1, Int(budget / CADExactCost.shared.sliceRate(job.costKey))) : Int.max
         var next = job.plan.next(budget: covered)
         if next == nil {
             guard !job.cleared else { return nil }
-            next = CADSlicePlan.Slice(rect: .zero, covered: 0)
+            next = CADSlicePlan.Slice(rects: [], covered: 0)
         }
         guard let slice = next else { return nil }
         let clear = !job.cleared
@@ -516,8 +520,21 @@ final class CADViewportPasses: @unchecked Sendable {
                                    sampleOffsets: job.field.resources.sampleOffsets)
     }
 
-    private func scissor(slice rect: SIMD4<Int32>) -> MTLScissorRect {
+    private static func scissor(_ rect: SIMD4<Int32>) -> MTLScissorRect {
         MTLScissorRect(x: Int(rect.x), y: Int(rect.y), width: Int(rect.z - rect.x), height: Int(rect.w - rect.y))
+    }
+
+    /// Encodes a slice's draws into a pass whose target holds the frame's
+    /// pixels at `origin`: every rectangle in its own scissor, or the whole
+    /// pass for a slice holding every block.
+    private func encodeDraws(_ draws: [CADFieldDraw], resources: CADFieldResources, slice: CADSlicePlan.Slice,
+                             width: Int, height: Int, origin: SIMD2<Int32> = .zero, encoder: any MTLRenderCommandEncoder) {
+        let frameViewport = MTLViewport(originX: Double(-origin.x), originY: Double(-origin.y), width: Double(width),
+                                        height: Double(height), znear: 0, zfar: 1)
+        encoder.setViewport(frameViewport)
+        resources.encode(draws, rects: slice.whole ? nil : slice.rects, viewport: { _, _ in frameViewport },
+                         scissor: { tile, _ in Self.scissor(tile &- SIMD4(origin.x, origin.y, origin.x, origin.y)) },
+                         encoder: encoder)
     }
 
     /// Opaque geometry: each sample's normal, part and depth.
@@ -547,17 +564,17 @@ final class CADViewportPasses: @unchecked Sendable {
             encoder.setDepthStencilState(resources.depthWrite)
             encoder.setCullMode(.back)
             encoder.setFrontFacing(.counterClockwise)
-            encoder.setScissorRect(scissor(slice: slice.rect))
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
-            resources.encode(job.draws, within: slice.rect, encoder: encoder)
+            encodeDraws(job.draws, resources: resources, slice: slice, width: job.width, height: job.height, encoder: encoder)
         }
         encoder.endEncoding()
     }
 
     /// Translucent layers: visibility depth and transmittance per sample in
-    /// the stored targets, accumulated color resolved within the slice and
-    /// copied into the stored accumulation.
+    /// the stored targets; accumulated color per tile in an atlas whose
+    /// viewports place each tile on its own cell, resolved and copied into
+    /// the stored accumulation.
     private func encodeTranslucentSlice(_ job: CADExactJob, slice: CADSlicePlan.Slice, clear: Bool,
                                         commandBuffer: any MTLCommandBuffer) {
         let layers = job.targets, resources = job.field.resources
@@ -580,21 +597,21 @@ final class CADViewportPasses: @unchecked Sendable {
         let colors: [MTLPixelFormat] = layers.revealage == nil ? [] : [.r16Float]
         if slice.covered > 0, let visibility = try? resources.pipeline(.visibility, colors: colors,
                                                                       depth: CADFieldResources.depthFormat, samples: samples) {
-            encoder.setScissorRect(scissor(slice: slice.rect))
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
             encoder.setFrontFacing(.counterClockwise)
             encoder.setRenderPipelineState(visibility)
             encoder.setDepthStencilState(resources.depthWrite)
             encoder.setCullMode(.back)
-            resources.encode(job.draws, within: slice.rect, encoder: encoder)
+            encodeDraws(job.draws, resources: resources, slice: slice, width: job.width, height: job.height, encoder: encoder)
             if layers.revealage != nil, let revealage = try? resources.pipeline(.revealage, colors: [.r16Float],
                                                                                depth: CADFieldResources.depthFormat,
                                                                                samples: samples) {
                 encoder.setRenderPipelineState(revealage)
                 encoder.setDepthStencilState(resources.depthIgnored)
                 encoder.setCullMode(.none)
-                resources.encode(job.draws, within: slice.rect, encoder: encoder)
+                encodeDraws(job.draws, resources: resources, slice: slice, width: job.width, height: job.height,
+                            encoder: encoder)
             }
         }
         encoder.endEncoding()
@@ -607,31 +624,47 @@ final class CADViewportPasses: @unchecked Sendable {
             reset.colorAttachments[0].storeAction = .store
             commandBuffer.makeRenderCommandEncoder(descriptor: reset)?.endEncoding()
         }
-        let width = Int(slice.rect.z - slice.rect.x), height = Int(slice.rect.w - slice.rect.y)
-        guard slice.covered > 0, width > 0, height > 0, let targets = targets(width: job.width, height: job.height),
-              let multisample = targets.multisampleHalf4(),
-              let resolved = targets.areaTexture("exact.accumulated", .rgba16Float, width: width, height: height),
+        guard slice.covered > 0, !slice.rects.isEmpty,
               let pipeline = try? resources.pipeline(.accumulation, colors: [.rgba16Float], depth: .invalid, samples: samples)
         else { return }
-        // The slice's rectangle maps onto the pass, pixel for pixel.
-        let accumulation = restrictedPass(resolved, width: width, height: height, multisample: multisample)
+        // Rectangle i occupies an atlas row of its own, at its height.
+        var offsets: [Int] = [], atlasWidth = 1, atlasHeight = 0
+        for rect in slice.rects {
+            offsets.append(atlasHeight)
+            atlasWidth = max(atlasWidth, Int(rect.z - rect.x))
+            atlasHeight += Int(rect.w - rect.y)
+        }
+        guard let targets = targets(width: job.width, height: job.height),
+              let multisample = targets.atlas(.rgba16Float, width: atlasWidth, height: atlasHeight, multisample: true),
+              let resolved = targets.atlas(.rgba16Float, width: atlasWidth, height: atlasHeight, multisample: false) else { return }
+        let accumulation = restrictedPass(resolved, width: atlasWidth, height: atlasHeight, multisample: multisample)
         guard let layer = commandBuffer.makeRenderCommandEncoder(descriptor: accumulation) else { return }
         layer.label = "RAD exact accumulation"
-        layer.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(width), height: Double(height), znear: 0, zfar: 1))
-        uniforms.remap = remap(x: Int(slice.rect.x), y: Int(slice.rect.y), width: width, height: height,
-                               frameWidth: job.width, frameHeight: job.height)
         layer.setRenderPipelineState(pipeline)
         layer.setCullMode(.none)
         layer.setFrontFacing(.counterClockwise)
         layer.setVertexBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
         layer.setFragmentBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
-        resources.encode(job.draws, within: slice.rect, encoder: layer)
+        func cell(_ index: Int) -> SIMD2<Int32> { SIMD2(0, Int32(offsets[index])) }
+        let width = Double(job.width), height = Double(job.height)
+        resources.encode(job.draws, rects: slice.rects, viewport: { rect, index in
+            let at = cell(index)
+            return MTLViewport(originX: Double(at.x - rect.x), originY: Double(at.y - rect.y), width: width, height: height,
+                               znear: 0, zfar: 1)
+        }, scissor: { rect, index in
+            let at = cell(index)
+            return MTLScissorRect(x: Int(at.x), y: Int(at.y), width: Int(rect.z - rect.x), height: Int(rect.w - rect.y))
+        }, encoder: layer)
         layer.endEncoding()
         guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
         blit.label = "RAD exact accumulation copy"
-        blit.copy(from: resolved, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                  sourceSize: MTLSize(width: width, height: height, depth: 1), to: accumulated, destinationSlice: 0,
-                  destinationLevel: 0, destinationOrigin: MTLOrigin(x: Int(slice.rect.x), y: Int(slice.rect.y), z: 0))
+        for (index, rect) in slice.rects.enumerated() {
+            let at = cell(index)
+            blit.copy(from: resolved, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: Int(at.x), y: Int(at.y), z: 0),
+                      sourceSize: MTLSize(width: Int(rect.z - rect.x), height: Int(rect.w - rect.y), depth: 1),
+                      to: accumulated, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: Int(rect.x), y: Int(rect.y), z: 0))
+        }
         blit.endEncoding()
     }
 
@@ -643,9 +676,13 @@ final class CADViewportPasses: @unchecked Sendable {
             guard let key = maskKey(batch, frame: frame) else { continue }
             used.insert(key)
             guard job.masks[key] == nil else { continue }
-            let masks = batch.masks.filter { $0.field != nil }
-            let rects = masks.flatMap { mask in mask.field.map { job.rects(of: [$0.solid]) } ?? [] }
-            job.masks[key] = CADMaskCoverage(key: key, masks: masks, device: device, rects: rects)
+            let items = batch.masks.compactMap { mask -> (draw: CADFieldDraw, selected: Bool)? in
+                guard let field = mask.field else { return nil }
+                let instance = CADFieldInstance(solid: field.solid, model: mask.model, albedo: .zero, emission: .zero)
+                return job.field.resources.draws([instance], view: job.view, projection: job.projection, width: job.width,
+                                                 height: job.height, contacts: false).first.map { ($0, mask.selected) }
+            }
+            job.masks[key] = CADMaskCoverage(key: key, items: items, device: device)
         }
         job.masks = job.masks.filter { used.contains($0.key) }
     }
@@ -674,7 +711,7 @@ final class CADViewportPasses: @unchecked Sendable {
         guard let coverage = pending.first else { return nil }
         let resources = job.field.resources
         let covered = budget.isFinite ? max(1, Int(budget / CADExactCost.shared.sliceRate(job.costKey))) : Int.max
-        guard let slice = coverage.plan.next(budget: covered) ?? (coverage.cleared ? nil : .init(rect: .zero, covered: 0)) else {
+        guard let slice = coverage.plan.next(budget: covered) ?? (coverage.cleared ? nil : .init(rects: [], covered: 0)) else {
             return nil
         }
         let clear = !coverage.cleared
@@ -688,27 +725,23 @@ final class CADViewportPasses: @unchecked Sendable {
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return coverage }
         encoder.label = "RAD exact outline coverage"
-        let origin = SIMD4(coverage.key.rect.x, coverage.key.rect.y, coverage.key.rect.x, coverage.key.rect.y)
         if slice.covered > 0,
            let pipeline = try? resources.pipeline(.mask, colors: [.rgba8Unorm], depth: .invalid, samples: 1) {
-            let width = Int(coverage.key.rect.z - coverage.key.rect.x), height = Int(coverage.key.rect.w - coverage.key.rect.y)
             var uniforms = fieldUniforms(job)
-            uniforms.remap = remap(x: Int(coverage.key.rect.x), y: Int(coverage.key.rect.y), width: width, height: height,
-                                   frameWidth: job.width, frameHeight: job.height)
             encoder.setRenderPipelineState(pipeline)
             encoder.setCullMode(.back)
             encoder.setFrontFacing(.counterClockwise)
-            encoder.setScissorRect(scissor(slice: slice.rect))
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CADFieldResources.Uniforms>.stride, index: 1)
-            for mask in coverage.masks {
-                guard let field = mask.field else { continue }
-                var channel: SIMD4<Float> = mask.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0)
+            // The coverage texture holds the batch's pixels; its blocks are local.
+            let origin = SIMD2(coverage.key.rect.x, coverage.key.rect.y)
+            let local = CADSlicePlan.Slice(rects: slice.rects.map { $0 &+ SIMD4(origin.x, origin.y, origin.x, origin.y) },
+                                           covered: slice.covered, whole: slice.whole)
+            for item in coverage.items {
+                var channel: SIMD4<Float> = item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0)
                 encoder.setFragmentBytes(&channel, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
-                let draws = resources.draws([CADFieldInstance(solid: field.solid, model: mask.model, albedo: .zero, emission: .zero)],
-                                            view: job.view, projection: job.projection, width: job.width, height: job.height,
-                                            contacts: false)
-                resources.encode(draws, within: slice.rect &+ origin, encoder: encoder)
+                encodeDraws([item.draw], resources: resources, slice: local, width: job.width, height: job.height,
+                            origin: origin, encoder: encoder)
             }
         }
         encoder.endEncoding()
@@ -875,11 +908,7 @@ final class CADViewportPasses: @unchecked Sendable {
 
     /// The NDC rectangle of a top-left-origin pixel rectangle.
     private func remap(x: Int, y: Int, width: Int, height: Int, frame: CADViewportFrame) -> SIMD4<Float> {
-        remap(x: x, y: y, width: width, height: height, frameWidth: frame.width, frameHeight: frame.height)
-    }
-
-    private func remap(x: Int, y: Int, width: Int, height: Int, frameWidth: Int, frameHeight: Int) -> SIMD4<Float> {
-        let fw = Float(frameWidth), fh = Float(frameHeight)
+        let fw = Float(frame.width), fh = Float(frame.height)
         return SIMD4(Float(x) / fw * 2 - 1, 1 - Float(y + height) / fh * 2,
                      Float(x + width) / fw * 2 - 1, 1 - Float(y) / fh * 2)
     }
@@ -1055,6 +1084,18 @@ final class CADViewportPasses: @unchecked Sendable {
         }
 
         func multisampleHalf4() -> (any MTLTexture)? { texture("ms.rgba16f", .rgba16Float, multisample: true) }
+
+        /// An exact slice's tile atlas at least `width`×`height` (memoryless
+        /// when multisample), kept while slices fit it.
+        func atlas(_ format: MTLPixelFormat, width: Int, height: Int, multisample: Bool) -> (any MTLTexture)? {
+            let key = "atlas.\(format.rawValue).\(multisample)"
+            if let texture = cache[key], texture.width >= width, texture.height >= height { return texture }
+            let size = (max(width, cache[key]?.width ?? 0), max(height, cache[key]?.height ?? 0))
+            cache[key] = nil
+            let texture = Self.make(device, format, size.0, size.1, multisample: multisample)
+            cache[key] = texture
+            return texture
+        }
         func multisampleHalf1() -> (any MTLTexture)? { texture("ms.r16f", .r16Float, multisample: true) }
         func multisampleMask() -> (any MTLTexture)? { texture("ms.mask", .rgba8Unorm, multisample: true) }
         func decorations() -> (any MTLTexture)? { texture("decorations", CADViewportPasses.colorFormat) }

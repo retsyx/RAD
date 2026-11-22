@@ -1,0 +1,334 @@
+import AppKit
+import Metal
+import SceneKit
+import simd
+import XCTest
+@testable import RAD
+
+/// Exact layers drawn in screen slices and composited: slice planning, the
+/// geometry identity that keeps or abandons exact work, the navigation
+/// estimate, and equivalence of sliced, single-slice and reused layers.
+/// Engine-backed tests build small designs.
+@MainActor
+final class ExactSlicingTests: XCTestCase {
+    // MARK: Slice planning
+
+    private struct Generator: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return state >> 11
+        }
+    }
+
+    /// Every block a proxy reaches belongs to exactly one slice, in row
+    /// order; a slice's estimate stays within the budget unless it is a
+    /// single block; adjacent blocks of a row share one rectangle; blocks no
+    /// proxy reaches get no slice.
+    func testSlicePlanCoversEveryReachedBlockOnceWithinItsBudget() {
+        var random = Generator(state: 7)
+        let size = CADSlicePlan.block
+        for _ in 0..<200 {
+            let width = Int.random(in: 1...2_400, using: &random), height = Int.random(in: 1...1_600, using: &random)
+            let rects: [SIMD4<Int32>?] = (0..<Int.random(in: 0...6, using: &random)).map { _ in
+                if Int.random(in: 0..<12, using: &random) == 0 { return nil }
+                let x0 = Int32.random(in: -60...Int32(width + 20), using: &random)
+                let y0 = Int32.random(in: -60...Int32(height + 20), using: &random)
+                return SIMD4(x0, y0, x0 + Int32.random(in: 0...1_200, using: &random), y0 + Int32.random(in: 0...900, using: &random))
+            }
+            var plan = CADSlicePlan(width: width, height: height, rects: rects)
+            // The reference coverage of each block.
+            var expected = [Int](repeating: 0, count: plan.columns * plan.rows)
+            for rect in rects {
+                let r = rect ?? SIMD4(0, 0, Int32(width), Int32(height))
+                for by in 0..<plan.rows {
+                    for bx in 0..<plan.columns {
+                        let w = min(Int(r.z), min(width, (bx + 1) * size)) - max(Int(r.x), bx * size)
+                        let h = min(Int(r.w), min(height, (by + 1) * size)) - max(Int(r.y), by * size)
+                        if w > 0, h > 0 { expected[by * plan.columns + bx] += w * h }
+                    }
+                }
+            }
+            XCTAssertEqual(plan.total, expected.reduce(0, +))
+            let budget = Int.random(in: 1...300_000, using: &random)
+            var owners = [Int](repeating: -1, count: expected.count)
+            var index = 0, sum = 0, lastBlock = -1
+            while let slice = plan.next(budget: budget) {
+                var covered = 0, blocks = 0
+                for r in slice.rects {
+                    XCTAssertEqual(Int(r.x) % size, 0)
+                    XCTAssertEqual(Int(r.y) % size, 0)
+                    XCTAssertTrue(Int(r.z) % size == 0 || Int(r.z) == width)
+                    XCTAssertEqual(Int(r.w), min(height, Int(r.y) + size), "a rectangle spans one block row")
+                    for bx in (Int(r.x) / size)..<((Int(r.z) + size - 1) / size) {
+                        let at = Int(r.y) / size * plan.columns + bx
+                        XCTAssertEqual(owners[at], -1, "a block belongs to one slice")
+                        XCTAssertGreaterThan(at, lastBlock, "slices follow row order")
+                        XCTAssertGreaterThan(expected[at], 0, "only reached blocks")
+                        owners[at] = index
+                        lastBlock = at
+                        covered += expected[at]
+                        blocks += 1
+                    }
+                }
+                XCTAssertEqual(slice.covered, covered)
+                XCTAssertTrue(slice.covered <= budget || blocks == 1, "\(slice.covered) over \(budget)")
+                XCTAssertEqual(slice.whole, index == 0 && plan.isDone)
+                sum += slice.covered
+                index += 1
+            }
+            XCTAssertTrue(plan.isDone)
+            XCTAssertEqual(sum, plan.total)
+            for (block, value) in expected.enumerated() {
+                XCTAssertEqual(owners[block] != -1, value > 0, "exactly the reached blocks have slices")
+            }
+        }
+    }
+
+    // MARK: Geometry identity
+
+    private func key(camera: simd_float4x4 = matrix_identity_float4x4, width: Int = 100,
+                     instances: [CADExactKey.Instance] = [.init(solid: 0, model: matrix_identity_float4x4)],
+                     translucent: Bool = false) -> CADExactKey {
+        CADExactKey(camera: camera, projection: SIMD2(38, 0), width: width, height: 80,
+                    resources: ObjectIdentifier(Self.self), instances: instances, translucent: translucent,
+                    complete: false, debug: 0)
+    }
+
+    private func frame(_ key: CADExactKey?, presentation: UInt64 = 1, navigating: Bool = false,
+                       fits: Bool = true) -> CADViewportFrame {
+        var frame = CADViewportFrame(width: 100, height: 80, referenceHeight: 80, translucent: false,
+                                     palette: CADSceneView.highlightPalette)
+        frame.key = key
+        frame.presentation = presentation
+        frame.navigating = navigating
+        frame.exactFitsBudget = fits
+        return frame
+    }
+
+    /// A newer frame with the same geometry identity keeps the job and only
+    /// changes what is composited; any other identity abandons it.
+    func testFramesKeepOrAbandonExactWorkByGeometryIdentity() {
+        let resting = key()
+        typealias Loop = ViewportRenderLoop
+        XCTAssertEqual(Loop.action(for: frame(nil), job: (resting, false), presented: 1), .meshes, "no exact faces")
+        XCTAssertEqual(Loop.action(for: frame(resting), job: nil, presented: nil), .start)
+        XCTAssertEqual(Loop.action(for: frame(resting, navigating: true, fits: false), job: nil, presented: nil), .meshes,
+                       "heavy designs move with display meshes")
+        XCTAssertEqual(Loop.action(for: frame(resting, navigating: true, fits: true), job: nil, presented: nil), .start)
+        XCTAssertEqual(Loop.action(for: frame(resting), job: (resting, true), presented: 1), .composite)
+        XCTAssertEqual(Loop.action(for: frame(resting, navigating: true, fits: false), job: (resting, true), presented: 1),
+                       .composite, "complete layers of an unchanged view composite even while navigating")
+        XCTAssertEqual(Loop.action(for: frame(resting, presentation: 1), job: (resting, false), presented: 1),
+                       .keep(standIn: false), "the screen already shows this state")
+        XCTAssertEqual(Loop.action(for: frame(resting, presentation: 2), job: (resting, false), presented: 1),
+                       .keep(standIn: true), "a hover change shows display meshes until the layers are complete")
+        var moved = matrix_identity_float4x4
+        moved.columns.3 = SIMD4(0, 0, 5, 1)
+        XCTAssertEqual(Loop.action(for: frame(key(camera: moved)), job: (resting, false), presented: 1), .start)
+        XCTAssertEqual(Loop.action(for: frame(key(width: 101)), job: (resting, true), presented: 1), .start)
+        XCTAssertEqual(Loop.action(for: frame(key(instances: [])), job: (resting, true), presented: 1), .start,
+                       "hiding a part draws the layers again")
+        var placed = CADExactKey.Instance(solid: 0, model: matrix_identity_float4x4)
+        placed.model.columns.3 = SIMD4(1, 0, 0, 1)
+        XCTAssertEqual(Loop.action(for: frame(key(instances: [placed])), job: (resting, true), presented: 1), .start)
+
+        // Opaque layers store parts, not colors: selection and color changes
+        // composite again. Translucent layers bake their colors.
+        let plain = CADFieldInstance(solid: 3, model: matrix_identity_float4x4, albedo: SIMD3(0.5, 0.5, 0.5), emission: .zero)
+        var selected = plain
+        selected.albedo = SIMD3(0.9, 0.6, 0.2)
+        selected.emission = SIMD3(0.1, 0.05, 0)
+        XCTAssertEqual(CADExactKey.instances([plain], translucent: false), CADExactKey.instances([selected], translucent: false))
+        XCTAssertNotEqual(CADExactKey.instances([plain], translucent: true), CADExactKey.instances([selected], translucent: true))
+    }
+
+    // MARK: Navigation estimate
+
+    /// The estimate is the largest exact cost measured since the resources
+    /// or the frame size changed: a cheap view never makes a gesture draw
+    /// exact frames that a costlier view would stall.
+    func testNavigationEstimateKeepsTheLargestCostUntilResourcesOrSizeChange() {
+        let first = NSObject(), second = NSObject()
+        let pixels = 1_000_000, interval = 1.0 / 120
+        var policy = ViewportNavigationPolicy()
+        policy.setContext(resources: ObjectIdentifier(first), pixels: pixels)
+        policy.begin(.drag)
+        XCTAssertFalse(policy.drawsExactFaces(pixels: pixels, interval: interval), "unmeasured")
+        policy.record(exact: true, gpuSeconds: 0.002, pixels: pixels)
+        XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "a cheap design stays exact")
+        policy.record(exact: true, gpuSeconds: 0.030, pixels: pixels)
+        XCTAssertFalse(policy.drawsExactFaces(pixels: pixels, interval: interval))
+        policy.record(exact: true, gpuSeconds: 0.001, pixels: pixels)
+        XCTAssertFalse(policy.drawsExactFaces(pixels: pixels, interval: interval), "a cheaper view keeps the largest cost")
+        policy.record(exact: true, gpuSeconds: 0.5, pixels: pixels, geometry: false)
+        policy.record(exact: false, gpuSeconds: 0.5, pixels: pixels)
+        XCTAssertEqual(policy.exactSecondsPerPixel, 0.030 / Double(pixels), "composites and meshes do not measure geometry")
+        policy.setContext(resources: ObjectIdentifier(first), pixels: pixels)
+        XCTAssertEqual(policy.exactSecondsPerPixel, 0.030 / Double(pixels), "an unchanged context keeps it")
+        policy.setContext(resources: ObjectIdentifier(second), pixels: pixels)
+        XCTAssertNil(policy.exactSecondsPerPixel, "new resources forget it")
+        policy.record(exact: true, gpuSeconds: 0.002, pixels: pixels)
+        policy.setContext(resources: ObjectIdentifier(second), pixels: pixels / 2)
+        XCTAssertNil(policy.exactSecondsPerPixel, "a new frame size forgets it")
+        XCTAssertTrue(policy.end(.drag))
+        XCTAssertTrue(policy.drawsExactFaces(pixels: pixels, interval: interval), "exact at rest")
+    }
+
+    // MARK: Engine-backed fixtures
+
+    private static var previews: [String: PreviewMesh] = [:]
+
+    private func preview(_ script: String) async throws -> PreviewMesh {
+        guard ProcessInfo.processInfo.environment["RAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set RAD_RUN_ENGINE_TESTS=1 to build designs with exact faces.")
+        }
+        guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("No Metal device.") }
+        if let preview = Self.previews[script] { return preview }
+        let preview = try await EngineService().buildPreview(
+            ModelSpec(title: "Exact slicing", summary: "Exact slicing test.", units: "mm", script: script),
+            python: EngineService.defaultPython, threads: 4)
+        Self.previews[script] = preview
+        return preview
+    }
+
+    private func capture(_ preview: PreviewMesh, display: ViewportDisplayMode, selected: Set<Int> = [],
+                         width: Int = 480, height: Int = 360) async throws -> CADViewportCapture {
+        let surface = CADSceneView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        surface.preparesRendererResources = false
+        surface.update(mesh: preview, mode: display, grid: true, command: nil, selectedSolids: selected, hiddenSolids: [],
+                       projection: .perspective)
+        var prepared = try await surface.waitForCaptureResources(until: .now + .seconds(60))
+        XCTAssertTrue(prepared)
+        try surface.configureAgentView(named: "isometric")
+        surface.layout()
+        prepared = try await surface.waitForCaptureResources(until: .now + .seconds(60))
+        XCTAssertTrue(prepared)
+        return try CADViewportCapture(view: surface, width: width, height: height)
+    }
+
+    private func pixels(_ image: CGImage) -> [UInt8] {
+        var data = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        data.withUnsafeMutableBytes { raw in
+            let context = CGContext(data: raw.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,
+                                    bytesPerRow: image.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        return data
+    }
+
+    // MARK: Equivalence
+
+    /// Slices never split a pixel quad and each slice draws exactly the
+    /// fragments of its own pixels, so tile-by-tile layers composite to the
+    /// same image as layers drawn at once, opaque and translucent, with
+    /// grid, crease strokes and exact selection outlines over them.
+    /// Translucent accumulation maps each slice onto its own pass, which
+    /// rounds clip coordinates differently: a few pixels may differ by 2/255.
+    func testSlicedLayersCompositeLikeLayersDrawnAtOnce() async throws {
+        // Two parts in contact (contact curves) and a hollow part (translucent layers).
+        let preview = try await preview("result = [sphere(5), box((30, 30, 1)), difference(sphere(3), sphere(2.5)).translate((9, 0, 4))]")
+        for display in [ViewportDisplayMode.edges, .translucent] {
+            let capture = try await capture(preview, display: display, selected: [0])
+            XCTAssertNotNil(capture.frame.field)
+            let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+            let singlePasses = try CADViewportPasses(device: device), slicedPasses = try CADViewportPasses(device: device)
+            let single = pixels(try CADViewportCapture.image(of: capture.frame, source: capture.source, passes: singlePasses,
+                                                             sliceBudget: .infinity))
+            let sliced = pixels(try CADViewportCapture.image(of: capture.frame, source: capture.source, passes: slicedPasses,
+                                                             sliceBudget: 1e-12))
+            XCTAssertEqual(singlePasses.statistics.geometrySlices, 1)
+            XCTAssertGreaterThan(slicedPasses.statistics.geometrySlices, 1, "one block per slice")
+            XCTAssertGreaterThanOrEqual(slicedPasses.statistics.maskSlices, 1, "the outline coverage is stored")
+            var largest = 0, differing = 0
+            for index in stride(from: 0, to: single.count, by: 4) {
+                let difference = (0..<3).map { abs(Int(single[index + $0]) - Int(sliced[index + $0])) }.max()!
+                largest = max(largest, difference)
+                if difference > 0 { differing += 1 }
+            }
+            if display == .translucent {
+                XCTAssertLessThanOrEqual(largest, 3, "\(display): \(differing) pixels differ")
+                XCTAssertLessThan(differing, single.count / 4 / 1_000)
+            } else {
+                XCTAssertLessThanOrEqual(largest, 1, "\(display): \(differing) pixels differ")
+            }
+        }
+    }
+
+    /// In a live window, hover and selection changes at rest composite the
+    /// stored layers without marching; outline coverage is marched once per
+    /// selection; moving the camera draws the layers again.
+    func testHoverAndSelectionAtRestCompositeStoredLayers() async throws {
+        let preview = try await preview("result = [sphere(5), box((30, 30, 1))]")
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
+        let application = NSApplication.shared
+        _ = application.setActivationPolicy(.accessory)
+        application.finishLaunching()
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        let frames = ViewportRenderCounter(view)
+        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 480, height: 360), styleMask: [.titled],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        window.contentView = view
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
+        view.update(mesh: preview, mode: .edges, grid: true, command: nil, selectedSolids: [], hiddenSolids: [])
+        window.orderFrontRegardless()
+        view.layout()
+        let prepared = try await view.waitForCaptureResources(until: .now + .seconds(30))
+        XCTAssertTrue(prepared)
+        func settle(after previous: Int) async throws {
+            let deadline = ContinuousClock.now + .seconds(10)
+            while (frames.count <= previous || view.hasPendingFrames), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertGreaterThan(frames.count, previous, "a frame completes")
+            XCTAssertFalse(view.hasPendingFrames)
+        }
+        try await settle(after: 0)
+        XCTAssertTrue(view.renderedExactFaces)
+        let rested = try XCTUnwrap(view.exactStatistics)
+        XCTAssertGreaterThan(rested.geometrySlices, 0)
+
+        func mouse(_ type: NSEvent.EventType, _ x: Double, _ y: Double) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: view.convert(NSPoint(x: x, y: y), to: nil),
+                                             modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+                                             context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
+        }
+        // Hover over the design.
+        var before = frames.count
+        view.mouseMoved(with: try mouse(.mouseMoved, 240, 180))
+        try await settle(after: before)
+        let hovered = try XCTUnwrap(view.exactStatistics)
+        XCTAssertEqual(hovered.geometrySlices, rested.geometrySlices, "hovering composites the stored layers")
+        XCTAssertGreaterThan(hovered.composites, rested.composites)
+        XCTAssertTrue(view.renderedExactFaces)
+
+        // Select the sphere: exact again at once, its outline marched once.
+        before = frames.count
+        view.update(mesh: preview, mode: .edges, grid: true, command: nil, selectedSolids: [0], hiddenSolids: [])
+        try await settle(after: before)
+        let selected = try XCTUnwrap(view.exactStatistics)
+        XCTAssertEqual(selected.geometrySlices, rested.geometrySlices, "selection composites the stored layers")
+        XCTAssertGreaterThan(selected.maskSlices, hovered.maskSlices, "the exact outline is marched")
+        XCTAssertTrue(view.renderedExactFaces)
+
+        before = frames.count
+        view.mouseMoved(with: try mouse(.mouseMoved, 200, 150))
+        try await settle(after: before)
+        let rehovered = try XCTUnwrap(view.exactStatistics)
+        XCTAssertEqual(rehovered.geometrySlices, rested.geometrySlices)
+        XCTAssertEqual(rehovered.maskSlices, selected.maskSlices, "hover reuses the stored outline coverage")
+
+        // Moving the camera draws the layers again.
+        before = frames.count
+        view.rightMouseDown(with: try mouse(.rightMouseDown, 200, 200))
+        view.rightMouseDragged(with: try mouse(.rightMouseDragged, 240, 220))
+        view.rightMouseUp(with: try mouse(.rightMouseUp, 240, 220))
+        try await settle(after: before)
+        let orbited = try XCTUnwrap(view.exactStatistics)
+        XCTAssertGreaterThan(orbited.geometrySlices, rehovered.geometrySlices)
+        XCTAssertTrue(view.renderedExactFaces)
+    }
+}

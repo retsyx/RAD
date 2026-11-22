@@ -346,9 +346,6 @@ final class CADFieldResources: @unchecked Sendable {
         var lightColor1: SIMD4<Float>
         /// Footprint per unit view depth (perspective) or per pixel, orthographic flag, alpha, debug mode.
         var projection: SIMD4<Float>
-        /// The frame's NDC sub-rectangle mapped onto the pass (slices into
-        /// their own targets and highlight masks); the whole frame otherwise.
-        var remap = SIMD4<Float>(-1, -1, 1, 1)
         var samples01: SIMD4<Float>
         var samples23: SIMD4<Float>
         /// Maximum march steps per ray, hit tolerance as a fraction of the pixel footprint.
@@ -526,19 +523,45 @@ final class CADFieldResources: @unchecked Sendable {
         return rect
     }
 
-    /// Encodes the draws whose rectangles meet `rect` (all of them when nil),
-    /// with the bound pipeline and per-pass uniforms.
-    func encode(_ draws: [CADFieldDraw], within rect: SIMD4<Int32>?, encoder: any MTLRenderCommandEncoder) {
+    /// Viewports and scissor rectangles per draw: each instance of a draw
+    /// uses the pair of its instance index.
+    static let maximumViewports = 16
+
+    /// Encodes the draws with the bound pipeline and per-pass uniforms. With
+    /// `rects`, each draw meeting some of them is instanced over groups of up
+    /// to 16 rectangles, each instance clipped to its rectangle's scissor and
+    /// placed by `viewport` (the frame's viewport for stored layers, an
+    /// offset one for targets that hold the rectangle elsewhere); `scissor`
+    /// maps a rectangle to the target. Without, every draw covers the pass once.
+    func encode(_ draws: [CADFieldDraw], rects tiles: [SIMD4<Int32>]?, viewport: (SIMD4<Int32>, Int) -> MTLViewport,
+                scissor: (SIMD4<Int32>, Int) -> MTLScissorRect, encoder: any MTLRenderCommandEncoder) {
         encoder.setVertexBuffer(positions, offset: 0, index: 0)
         encoder.setFragmentBuffer(program, offset: 0, index: 3)
-        for draw in draws {
-            if let rect, let bounds = draw.rect,
-               bounds.x >= rect.z || bounds.z <= rect.x || bounds.y >= rect.w || bounds.w <= rect.y { continue }
+        func meets(_ draw: CADFieldDraw, _ rect: SIMD4<Int32>) -> Bool {
+            guard let bounds = draw.rect else { return true }
+            return bounds.x < rect.z && bounds.z > rect.x && bounds.y < rect.w && bounds.w > rect.y
+        }
+        func encode(_ draw: CADFieldDraw, instances: Int) {
             var values = draw.values
             encoder.setVertexBytes(&values, length: MemoryLayout<Instance>.stride, index: 2)
             encoder.setFragmentBytes(&values, length: MemoryLayout<Instance>.stride, index: 2)
             encoder.drawIndexedPrimitives(type: .triangle, indexCount: draw.indexCount, indexType: .uint32,
-                                          indexBuffer: indices, indexBufferOffset: draw.indexStart * 4)
+                                          indexBuffer: indices, indexBufferOffset: draw.indexStart * 4,
+                                          instanceCount: instances)
+        }
+        guard let tiles else {
+            for draw in draws { encode(draw, instances: 1) }
+            return
+        }
+        var start = 0
+        while start < tiles.count {
+            let group = Array(tiles[start..<min(tiles.count, start + Self.maximumViewports)])
+            encoder.setViewports(group.enumerated().map { viewport($0.element, start + $0.offset) })
+            encoder.setScissorRects(group.enumerated().map { scissor($0.element, start + $0.offset) })
+            for draw in draws where group.contains(where: { meets(draw, $0) }) {
+                encode(draw, instances: group.count)
+            }
+            start += group.count
         }
     }
 }
@@ -593,7 +616,6 @@ struct CADFieldUniforms {
     float4 lightColor0;
     float4 lightColor1;
     float4 projection;   // footprint scale, orthographic, alpha, debug
-    float4 remap;        // NDC sub-rectangle mapped onto the pass (masks)
     float4 samples01;    // sample offsets from the pixel center, in pixels
     float4 samples23;
     float4 march;        // maximum steps per ray, hit tolerance (fraction of the footprint)
@@ -614,23 +636,21 @@ struct CADFieldInstance {
 struct CADFieldVarying {
     float4 position [[position]];
     float3 partPosition;
+    uint viewport [[viewport_array_index]];
 };
 
-// Passes into their own targets (translucent slices, highlight masks) map
-// a frame's NDC sub-rectangle onto the pass; the identity remap leaves clip
-// coordinates unchanged.
+// Slices draw each instance into its own viewport and scissor rectangle
+// (one per tile); viewports place a tile in its target without changing
+// clip coordinates.
 vertex CADFieldVarying cad_field_vertex(const device packed_float3 *positions [[buffer(0)]],
                                         constant CADFieldUniforms &u [[buffer(1)]],
                                         constant CADFieldInstance &instance [[buffer(2)]],
-                                        uint vid [[vertex_id]]) {
+                                        uint vid [[vertex_id]], uint instanceIndex [[instance_id]]) {
     const float3 p = float3(positions[vid]);
-    float4 clip = u.viewProjection * (instance.worldFromPart * float4(p, 1.0f));
-    const float2 center = (u.remap.xy + u.remap.zw) * 0.5f;
-    const float2 extent = (u.remap.zw - u.remap.xy) * 0.5f;
-    clip.xy = (clip.xy - center * clip.w) / extent;
     CADFieldVarying out;
-    out.position = clip;
+    out.position = u.viewProjection * (instance.worldFromPart * float4(p, 1.0f));
     out.partPosition = p;
+    out.viewport = instanceIndex;
     return out;
 }
 

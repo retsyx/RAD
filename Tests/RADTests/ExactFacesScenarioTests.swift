@@ -1,5 +1,6 @@
 import AppKit
 import Metal
+import QuartzCore
 import SceneKit
 import simd
 import XCTest
@@ -31,6 +32,9 @@ final class ExactFacesScenarioTests: XCTestCase {
             var hidden: [Int]?
             /// GPU frames to time (median reported); 0 renders once.
             var timing: Int?
+            /// Sliced captures to time (GPU busy, the union of their command
+            /// buffers' execution; the minimum is reported).
+            var slicedTiming: Int?
         }
         var design: String
         var output: String
@@ -92,6 +96,16 @@ final class ExactFacesScenarioTests: XCTestCase {
             if let frames = render.timing, frames > 0 {
                 let times = try Self.time(capture, frames: frames)
                 line += String(format: ", GPU median %.2f ms (min %.2f, max %.2f)", times[times.count / 2], times.first!, times.last!)
+            }
+            if let count = render.slicedTiming, count > 0 {
+                var busy: [Double] = [], buffers = 0
+                for _ in 0..<count {
+                    var statistics = CADViewportCapture.Statistics()
+                    _ = try CADViewportCapture.image(of: capture.frame, source: capture.source, statistics: &statistics)
+                    busy.append(statistics.gpuSeconds * 1000)
+                    buffers = statistics.commandBuffers
+                }
+                line += String(format: ", sliced GPU busy min %.2f ms (%d command buffers)", busy.min()!, buffers)
             }
             log.append(line)
         }

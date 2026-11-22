@@ -63,6 +63,9 @@ final class ViewportRenderLoop: @unchecked Sendable {
     }
     private var finished: [Finished] = []
     private var slicesRunning = 0
+    /// GPU end of the latest completed slice: slices run one after another
+    /// on their queue, so each one's own time starts no earlier.
+    private var sliceGPUEnd = 0.0
     /// Frames encoded but not yet completed by the GPU.
     private let inFlight = DispatchSemaphore(value: 2)
     private let completion: @Sendable (UInt64, Double, Outcome) -> Void
@@ -182,7 +185,10 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 owner.gpuSeconds += seconds
                 CADExactCost.shared.recordSlice(owner.costKey, seconds: seconds, covered: covered)
                 if owner === job, owner.isComplete {
-                    CADExactCost.shared.recordFrame(owner.costKey, seconds: owner.gpuSeconds, covered: owner.plan.total)
+                    // Only whole frames measure what one frame can draw at once.
+                    if owner.encoded == 1 {
+                        CADExactCost.shared.recordFrame(owner.costKey, seconds: owner.gpuSeconds, covered: owner.plan.total)
+                    }
                     needsComposite = true
                 }
             case .mask(let owner, let coverage):
@@ -192,32 +198,50 @@ final class ViewportRenderLoop: @unchecked Sendable {
         }
     }
 
+    /// What the render thread does with a newly published frame.
+    enum Action: Equatable {
+        /// Abandon any job and draw display meshes, as the frame asks.
+        case meshes
+        /// Composite the job's complete layers.
+        case composite
+        /// Keep the job in progress; display meshes stand in for the frame
+        /// when the screen does not show its content yet.
+        case keep(standIn: Bool)
+        /// Abandon any job and start one for the frame's geometry.
+        case start
+    }
+
+    /// The decision for `frame` given the current job's key and progress and
+    /// the presentation revision of the newest presented frame.
+    static func action(for frame: CADViewportFrame, job: (key: CADExactKey, complete: Bool)?,
+                       presented: UInt64?) -> Action {
+        // No exact faces (`key` comes with `field`): wireframe, or resources
+        // still preparing.
+        guard let key = frame.key else { return .meshes }
+        if let job, job.key == key {
+            return job.complete ? .composite : .keep(standIn: frame.presentation != presented)
+        }
+        return frame.navigating && !frame.exactFitsBudget ? .meshes : .start
+    }
+
     private func handle(_ request: Request) {
-        let frame = request.frame
-        guard let key = frame.key, frame.field != nil else {
-            // No exact faces: wireframe, or resources still preparing.
+        switch Self.action(for: request.frame, job: job.map { ($0.key, $0.isComplete) }, presented: presentedRevision) {
+        case .meshes:
             abandonJob()
             _ = presentMesh(request, final: true)
-            return
-        }
-        if let job, job.key == key {
+        case .composite:
             latest = request
             needsComposite = true
-            if job.isComplete {
-                composite()
-            } else if frame.presentation != presentedRevision {
-                // The screen does not show this state yet: display meshes
-                // stand in until the exact layers are complete.
-                _ = presentMesh(request, final: false)
-            }
-            return
+            composite()
+        case .keep(let standIn):
+            latest = request
+            needsComposite = true
+            // Display meshes stand in until the exact layers are complete.
+            if standIn { _ = presentMesh(request, final: false) }
+        case .start:
+            abandonJob()
+            start(request)
         }
-        abandonJob()
-        if frame.navigating, !frame.exactFitsBudget {
-            _ = presentMesh(request, final: true)
-            return
-        }
-        start(request)
     }
 
     private func abandonJob() {
@@ -330,7 +354,6 @@ final class ViewportRenderLoop: @unchecked Sendable {
         condition.withLock { slicesRunning += 1 }
         let trace = ViewportFrameTrace.shared, committed = ViewportFrameTrace.now
         commandBuffer.addCompletedHandler { [weak self] buffer in
-            let seconds = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
             if ViewportFrameTrace.enabled {
                 var covered = 0
                 if case .slice(_, _, let count) = record { covered = count }
@@ -339,12 +362,14 @@ final class ViewportRenderLoop: @unchecked Sendable {
                                      gpuEnd: buffer.gpuEndTime))
             }
             guard let self else { return }
+            self.condition.lock()
+            let seconds = max(0, buffer.gpuEndTime - max(buffer.gpuStartTime, self.sliceGPUEnd))
+            self.sliceGPUEnd = max(self.sliceGPUEnd, buffer.gpuEndTime)
             let result: Finished
             switch record {
             case .slice(let owner, _, let covered): result = .slice(owner, seconds: seconds, covered: covered)
             case .mask: result = record
             }
-            self.condition.lock()
             self.slicesRunning -= 1
             self.finished.append(result)
             self.condition.signal()

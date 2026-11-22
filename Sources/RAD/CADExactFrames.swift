@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import simd
 
@@ -25,21 +26,6 @@ struct CADExactKey: Equatable, @unchecked Sendable {
     var complete: Bool
     var debug: Int
 
-    init(field: CADFieldFrame, camera: simd_float4x4, projection: SIMD2<Float>, width: Int, height: Int, translucent: Bool) {
-        self.camera = camera
-        self.projection = projection
-        self.width = width
-        self.height = height
-        resources = ObjectIdentifier(field.resources)
-        instances = field.instances.map {
-            translucent ? Instance(solid: $0.solid, model: $0.model, albedo: $0.albedo, emission: $0.emission)
-                : Instance(solid: $0.solid, model: $0.model)
-        }
-        self.translucent = translucent
-        complete = translucent && field.complete
-        debug = field.debug
-    }
-
     /// Whether a scene pass with `view` and `projection` draws the view of
     /// layers drawn with `view0` and `projection0`. Depth ranges may differ:
     /// the composite maps stored depth into the pass's range.
@@ -48,6 +34,24 @@ struct CADExactKey: Equatable, @unchecked Sendable {
         view == view0 && projection.columns.0 == projection0.columns.0 && projection.columns.1 == projection0.columns.1
             && projection.columns.2.x == projection0.columns.2.x && projection.columns.2.y == projection0.columns.2.y
             && projection.columns.2.w == projection0.columns.2.w && projection.columns.3.w == projection0.columns.3.w
+    }
+}
+
+extension CADExactKey {
+    init(field: CADFieldFrame, camera: simd_float4x4, projection: SIMD2<Float>, width: Int, height: Int, translucent: Bool) {
+        self.init(camera: camera, projection: projection, width: width, height: height,
+                  resources: ObjectIdentifier(field.resources),
+                  instances: Self.instances(field.instances, translucent: translucent), translucent: translucent,
+                  complete: translucent && field.complete, debug: field.debug)
+    }
+
+    /// The key's solids: opaque layers store parts, not colors, so selection
+    /// and color changes composite them again; translucent layers bake colors.
+    static func instances(_ instances: [CADFieldInstance], translucent: Bool) -> [Instance] {
+        instances.map {
+            translucent ? Instance(solid: $0.solid, model: $0.model, albedo: $0.albedo, emission: $0.emission)
+                : Instance(solid: $0.solid, model: $0.model)
+        }
     }
 }
 
@@ -117,29 +121,37 @@ final class CADExactTargets: @unchecked Sendable {
     }
 }
 
-/// Screen slices of one exact frame's geometry: 32-pixel tiles grouped,
-/// in row order, into rectangles whose estimated covered pixels (each
-/// proxy's projected bounds, counted per proxy) stay within a budget.
-/// Tiles no proxy reaches are skipped; their stored layers keep the clear.
+/// Screen slices of one exact frame's geometry: square blocks of 8 × 8
+/// tiles of 32 pixels that some proxy reaches, in row order, grouped into
+/// slices whose estimated covered pixels (each proxy's projected bounds,
+/// counted per proxy) stay within a budget, at least one block each. Small
+/// or scattered scissored regions cost the GPU far more per pixel than one
+/// pass over the frame (it shades each tile on one core, and its cache
+/// holds the field programs of neighboring pixels), so a block is the
+/// smallest slice. Blocks no proxy reaches get no slice; their stored
+/// layers keep the clear.
 struct CADSlicePlan: Sendable {
     static let tile = 32
+    static let blockTiles = 8
+    static var block: Int { tile * blockTiles }
 
     struct Slice: Equatable, Sendable {
-        /// Pixel rectangle (x0, y0, x1, y1 exclusive, top-left origin).
-        var rect: SIMD4<Int32>
+        /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
+        /// the slice's blocks, adjacent blocks of a row joined; empty when
+        /// the slice only clears.
+        var rects: [SIMD4<Int32>]
         var covered: Int
+        /// The slice holds every block of the plan, so it needs no scissor.
+        var whole = false
     }
 
     let width: Int
     let height: Int
     let columns: Int
     let rows: Int
-    private var covered: [Int]
-    private var rowTotals: [Int]
-    private var firstColumn: [Int]
-    private var lastColumn: [Int]
-    private var row = 0
-    private var column = 0
+    /// Reached blocks (row, column, estimated covered pixels) in row order.
+    private let blocks: [(row: Int, column: Int, covered: Int)]
+    private var next = 0
     /// Estimated covered pixels of the whole frame.
     let total: Int
     private(set) var remaining: Int
@@ -148,8 +160,9 @@ struct CADSlicePlan: Sendable {
     init(width: Int, height: Int, rects: [SIMD4<Int32>?]) {
         self.width = max(0, width)
         self.height = max(0, height)
-        columns = (self.width + Self.tile - 1) / Self.tile
-        rows = (self.height + Self.tile - 1) / Self.tile
+        let size = Self.block
+        columns = (self.width + size - 1) / size
+        rows = (self.height + size - 1) / size
         var covered = [Int](repeating: 0, count: columns * rows)
         let full = SIMD4<Int32>(0, 0, Int32(self.width), Int32(self.height))
         for rect in rects {
@@ -157,67 +170,55 @@ struct CADSlicePlan: Sendable {
             let x0 = Int(max(0, r.x)), y0 = Int(max(0, r.y))
             let x1 = Int(min(Int32(self.width), r.z)), y1 = Int(min(Int32(self.height), r.w))
             guard x0 < x1, y0 < y1 else { continue }
-            for ty in (y0 / Self.tile)...((y1 - 1) / Self.tile) {
-                let tileY0 = ty * Self.tile, tileY1 = min(self.height, tileY0 + Self.tile)
-                let h = min(y1, tileY1) - max(y0, tileY0)
-                for tx in (x0 / Self.tile)...((x1 - 1) / Self.tile) {
-                    let tileX0 = tx * Self.tile, tileX1 = min(self.width, tileX0 + Self.tile)
-                    covered[ty * columns + tx] += (min(x1, tileX1) - max(x0, tileX0)) * h
+            for by in (y0 / size)...((y1 - 1) / size) {
+                let h = min(y1, (by + 1) * size) - max(y0, by * size)
+                for bx in (x0 / size)...((x1 - 1) / size) {
+                    covered[by * columns + bx] += (min(x1, (bx + 1) * size) - max(x0, bx * size)) * h
                 }
             }
         }
-        self.covered = covered
-        let columns = self.columns, rows = self.rows
-        let totals = (0..<rows).map { r in covered[(r * columns)..<((r + 1) * columns)].reduce(0, +) }
-        rowTotals = totals
-        firstColumn = (0..<rows).map { r in (0..<columns).first { covered[r * columns + $0] > 0 } ?? columns }
-        lastColumn = (0..<rows).map { r in (0..<columns).last { covered[r * columns + $0] > 0 } ?? -1 }
-        total = totals.reduce(0, +)
+        let columns = self.columns
+        blocks = covered.enumerated().filter { $0.element > 0 }
+            .map { (row: $0.offset / columns, column: $0.offset % columns, covered: $0.element) }
+        total = blocks.reduce(0) { $0 + $1.covered }
         remaining = total
     }
 
-    var isDone: Bool { remaining == 0 }
+    var isDone: Bool { next >= blocks.count }
 
-    /// The next slice whose estimated covered pixels stay within `budget`
-    /// (at least one tile), or nil when every covered tile has its slice.
+    /// The pixel rectangle of the blocks of `row` from `first` through `last`.
+    private func rect(row: Int, first: Int, last: Int) -> SIMD4<Int32> {
+        let size = Self.block
+        return SIMD4(Int32(first * size), Int32(row * size), Int32(min(width, (last + 1) * size)),
+                     Int32(min(height, (row + 1) * size)))
+    }
+
+    /// The next slice whose estimated covered pixels stay within `budget`,
+    /// at least one block, or nil when every reached block has its slice.
     mutating func next(budget: Int) -> Slice? {
-        while row < rows {
-            if column < firstColumn[row] { column = firstColumn[row] }
-            while column <= lastColumn[row], covered[row * columns + column] == 0 { column += 1 }
-            if column > lastColumn[row] { row += 1; column = 0; continue }
-            break
+        guard next < blocks.count else { return nil }
+        let first = next
+        var sum = blocks[next].covered
+        next += 1
+        while next < blocks.count, sum + blocks[next].covered <= budget {
+            sum += blocks[next].covered
+            next += 1
         }
-        guard row < rows else { return nil }
-        let tile = Int32(Self.tile)
-        if column == firstColumn[row] {
-            // Whole rows, as one band, while they fit.
-            var sum = 0, end = row, low = columns, high = -1
-            while end < rows, sum + rowTotals[end] <= budget {
-                sum += rowTotals[end]
-                if rowTotals[end] > 0 { low = min(low, firstColumn[end]); high = max(high, lastColumn[end]) }
-                end += 1
-            }
-            if end > row, sum > 0 {
-                let rect = SIMD4<Int32>(Int32(low) * tile, Int32(row) * tile, min(Int32(width), Int32(high + 1) * tile),
-                                        min(Int32(height), Int32(end) * tile))
-                row = end
-                column = 0
-                remaining -= sum
-                return Slice(rect: rect, covered: sum)
-            }
-        }
-        // Part of a row: consecutive tiles while they fit.
-        var sum = covered[row * columns + column], end = column + 1
-        while end <= lastColumn[row], sum + covered[row * columns + end] <= budget {
-            sum += covered[row * columns + end]
-            end += 1
-        }
-        let rect = SIMD4<Int32>(Int32(column) * tile, Int32(row) * tile, min(Int32(width), Int32(end) * tile),
-                                min(Int32(height), Int32(row + 1) * tile))
-        column = end
-        if column > lastColumn[row] { row += 1; column = 0 }
         remaining -= sum
-        return Slice(rect: rect, covered: sum)
+        var rects: [SIMD4<Int32>] = []
+        var start = blocks[first]
+        var previous = start
+        for block in blocks[(first + 1)..<next] {
+            if block.row == previous.row, block.column == previous.column + 1 {
+                previous = block
+                continue
+            }
+            rects.append(rect(row: start.row, first: start.column, last: previous.column))
+            start = block
+            previous = block
+        }
+        rects.append(rect(row: start.row, first: start.column, last: previous.column))
+        return Slice(rects: rects, covered: sum, whole: first == 0 && next == blocks.count)
     }
 }
 
@@ -291,15 +292,15 @@ final class CADMaskCoverage: @unchecked Sendable {
 
     let key: Key
     let texture: any MTLTexture
-    /// Exact masks of the batch, in its pass order.
-    let masks: [CADViewportFrame.Mask]
+    /// The batch's exact parts: their proxy draws and outline channels.
+    let items: [(draw: CADFieldDraw, selected: Bool)]
     var plan: CADSlicePlan
     var cleared = false
     var encoded = 0
     var completed = 0
     var isComplete: Bool { plan.isDone && completed == encoded && cleared }
 
-    init?(key: Key, masks: [CADViewportFrame.Mask], device: any MTLDevice, rects: [SIMD4<Int32>?]) {
+    init?(key: Key, items: [(draw: CADFieldDraw, selected: Bool)], device: any MTLDevice) {
         let width = Int(key.rect.z - key.rect.x), height = Int(key.rect.w - key.rect.y)
         guard width > 0, height > 0 else { return nil }
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height,
@@ -309,12 +310,10 @@ final class CADMaskCoverage: @unchecked Sendable {
         guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
         self.key = key
         self.texture = texture
-        self.masks = masks
+        self.items = items
         // Plan in the batch's own pixels.
-        let local = rects.map { rect in
-            rect.map { SIMD4($0.x - key.rect.x, $0.y - key.rect.y, $0.z - key.rect.x, $0.w - key.rect.y) }
-        }
-        plan = CADSlicePlan(width: width, height: height, rects: local)
+        let origin = SIMD4(key.rect.x, key.rect.y, key.rect.x, key.rect.y)
+        plan = CADSlicePlan(width: width, height: height, rects: items.map { $0.draw.rect.map { $0 &- origin } })
     }
 }
 
