@@ -123,16 +123,13 @@ final class CADExactTargets: @unchecked Sendable {
 
 /// Screen slices of one exact frame's geometry over square blocks that
 /// some proxy reaches: a slice is one rectangle, either a run of blocks of
-/// one block row or, once a budget holds whole rows, a strip of complete
+/// one block row or, once its limits hold whole rows, a strip of complete
 /// rows (their reached columns), top to bottom, whose estimated covered
-/// pixels (each proxy's projected bounds, counted per proxy) stay within the
-/// budget, at least one block each. Another queue's frame waits for the
-/// tiles in flight, about a tile per core while a slice is a few blocks and
-/// several while it spans the frame; every pass also ends with its slowest
-/// tile while other cores idle. So budgets start small and grow (see
-/// `CADViewportPasses.sliceBudget`). One rectangle per slice: each scissor of
-/// a viewport array draws every proxy again. Blocks no proxy reaches get no
-/// slice; their stored layers keep the clear.
+/// pixels (each proxy's projected bounds, counted per proxy) and block count
+/// stay within its limits, at least one block each. The limits start small
+/// and grow (`CADViewportPasses.sliceLimits`). One rectangle per slice: each
+/// scissor of a viewport array draws every proxy again. Blocks no proxy
+/// reaches get no slice; their stored layers keep the clear.
 struct CADSlicePlan: Sendable {
     /// Block side in pixels (an even number keeps pixel quads whole).
     static let block = 128
@@ -265,12 +262,14 @@ final class CADExactCost: @unchecked Sendable {
     /// Each slice's measurement weighs this much less after the next one.
     static let decay = 0.7
 
-    /// A slice of at most this many blocks that takes longer than
-    /// `floorSeconds`, or any slice that takes more than twice its budget and
-    /// twice that time, shows that the design's slowest tiles alone outlast
-    /// two frames: its slices stay small (`CADViewportPasses.sliceLimits`).
-    static let smallSliceBlocks = 4
-    static let floorSeconds = 0.032
+    /// A slice of at most this many blocks (two to four tiles per core) that
+    /// takes longer than `floorSeconds` shows that the design's slowest tiles
+    /// outlast several frames: its slices stay small
+    /// (`CADViewportPasses.sliceLimits`).
+    static let smallSliceBlocks = 16
+    static let floorSeconds = 0.048
+    /// Blocks of the small slices of such designs.
+    static let floorSliceBlocks = 4
 
     /// A slice the GPU fails, or one slower than this, is a strike against
     /// exact faces of its design in that display mode; three end them for the
@@ -334,9 +333,8 @@ final class CADExactCost: @unchecked Sendable {
     /// Whether the design's slowest tiles outlast small slices' budgets.
     func isFloorBound(_ key: Key) -> Bool { lock.withLock { floorBound.contains(key) } }
 
-    func recordSlice(_ key: Key, seconds: Double, covered: Int, blocks: Int = .max, budget: Double = .infinity) {
-        if seconds.isFinite, seconds > Self.floorSeconds,
-           blocks <= Self.smallSliceBlocks || seconds > 2 * max(budget, Self.floorSeconds) {
+    func recordSlice(_ key: Key, seconds: Double, covered: Int, blocks: Int = .max) {
+        if seconds.isFinite, seconds > Self.floorSeconds, blocks <= Self.smallSliceBlocks {
             _ = lock.withLock { floorBound.insert(key) }
         }
         guard covered >= Self.minimumCovered, seconds.isFinite, seconds > 0 else { return }

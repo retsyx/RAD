@@ -396,7 +396,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// resume, and grow: each may take twice its predecessor's time (from
     /// `firstSliceBudget` up to `sliceBudget`) and hold twice its blocks
     /// (from `firstSliceBlocks`), whatever the cost estimate says. A design
-    /// whose small slices already outlast two frames
+    /// whose small slices already outlast several frames
     /// (`CADExactCost.isFloorBound`) keeps small slices: larger ones would
     /// only add slow tiles in flight beside a newer frame, and tiles slowed
     /// that much can fail as GPU hangs.
@@ -407,7 +407,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// GPU seconds and blocks of a design's next slice after `slices`
     /// earlier ones of its job.
     static func sliceLimits(after slices: Int, floorBound: Bool) -> (seconds: Double, blocks: Int) {
-        if floorBound { return (firstSliceBudget, CADExactCost.smallSliceBlocks) }
+        if floorBound { return (firstSliceBudget, CADExactCost.floorSliceBlocks) }
         let doublings = min(max(0, slices), 24)
         return (min(sliceBudget, firstSliceBudget * Double(1 << min(doublings, 16))), firstSliceBlocks << doublings)
     }
