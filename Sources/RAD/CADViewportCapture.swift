@@ -41,9 +41,10 @@ final class CADViewportCapture: @unchecked Sendable {
     /// passes, preparing a renderer of its own unless one is supplied. Exact
     /// layers are drawn in the viewport's slices, each its own command buffer
     /// so other GPU work interleaves, then composited; the call waits for all.
+    /// A `sliceBudget` replaces the viewport's growing budgets (tests).
     static func image(of frame: CADViewportFrame, source: CADViewportSceneSource,
                       renderer existing: SCNRenderer? = nil, passes existingPasses: CADViewportPasses? = nil,
-                      sliceBudget: Double = CADViewportPasses.sliceBudget,
+                      sliceBudget: Double? = nil,
                       statistics: UnsafeMutablePointer<Statistics>? = nil) throws -> CGImage {
         try Task.checkCancellation()
         guard let device = existing?.device ?? MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -109,11 +110,21 @@ final class CADViewportCapture: @unchecked Sendable {
                     settle(keeping: 1)
                 }
             }
-            try slices { passes.encodeSlice(job, budget: sliceBudget, commandBuffer: $0)?.covered }
+            try slices {
+                passes.encodeSlice(job, budget: sliceBudget ?? CADViewportPasses.sliceBudget(after: job.encoded),
+                                   blocks: sliceBudget == nil ? CADViewportPasses.sliceBlocks(after: job.encoded) : .max,
+                                   commandBuffer: $0)?.covered
+            }
             job.completed = job.encoded
             passes.prepareMasks(job, frame: frame)
             // Outline coverage marches far fewer pixels: its slices do not measure.
-            try slices { passes.encodeMaskSlice(job, budget: sliceBudget, commandBuffer: $0) != nil ? 0 : nil }
+            var masks = 0
+            try slices {
+                defer { masks += 1 }
+                return passes.encodeMaskSlice(job, budget: sliceBudget ?? CADViewportPasses.sliceBudget(after: masks),
+                                              blocks: sliceBudget == nil ? CADViewportPasses.sliceBlocks(after: masks) : .max,
+                                              commandBuffer: $0) != nil ? 0 : nil
+            }
             for coverage in job.masks.values { coverage.completed = coverage.encoded }
             settle(keeping: 0)
             if slow {

@@ -390,7 +390,7 @@ final class CADViewportPasses: @unchecked Sendable {
     /// GPU seconds of exact geometry a frame draws itself.
     static let frameBudget = 0.004
     /// GPU seconds of a job's first exact slice; each later one may take
-    /// twice its predecessor's, up to `sliceBudget`, and hold four times its
+    /// twice its predecessor's, up to `sliceBudget`, and hold twice its
     /// blocks (two at first), whatever the cost estimate says. A newer frame
     /// waits for the tiles in flight: about one per core while a slice holds
     /// a few blocks, several once it spans the frame. Small slices right
@@ -408,10 +408,8 @@ final class CADViewportPasses: @unchecked Sendable {
 
     /// The most blocks a job's slice after `slices` earlier ones may hold.
     static func sliceBlocks(after slices: Int) -> Int {
-        firstSliceBlocks << (2 * min(max(0, slices), 12))
+        firstSliceBlocks << min(max(0, slices), 24)
     }
-    /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
-    nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
 
     /// Exact work encoded by these passes (diagnostics and tests).
     struct Statistics: Equatable, Sendable {
@@ -604,7 +602,6 @@ final class CADViewportPasses: @unchecked Sendable {
         pass.depthAttachment.loadAction = clear ? .clear : .load
         pass.depthAttachment.clearDepth = 0
         pass.depthAttachment.storeAction = .store
-        Self.experimentPassHook?(pass)
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
         encoder.label = "RAD exact geometry"
         let resources = job.field.resources

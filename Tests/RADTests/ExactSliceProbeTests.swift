@@ -77,15 +77,11 @@ final class Probe: @unchecked Sendable {
     let renderer: SCNRenderer
     let passes: CADViewportPasses
     let target: any MTLTexture
-    let counters: any MTLCounterSampleBuffer
-    let counterCapacity = 4_096
     let lightPipeline: any MTLRenderPipelineState
     let lightDepth: any MTLDepthStencilState
     let lightColor: any MTLTexture
     let lightDepthTexture: any MTLTexture
     let lightResolve: any MTLTexture
-    /// Ticks per second of GPU timestamps.
-    let tickRate: Double
 
     init(capture: CADViewportCapture) throws {
         self.capture = capture
@@ -104,17 +100,6 @@ final class Probe: @unchecked Sendable {
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .private
         target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
-        let set = try XCTUnwrap(device.counterSets?.first { $0.name == MTLCommonCounterSet.timestamp.rawValue })
-        let counterDescriptor = MTLCounterSampleBufferDescriptor()
-        counterDescriptor.counterSet = set
-        counterDescriptor.sampleCount = counterCapacity
-        counterDescriptor.storageMode = .shared
-        counters = try device.makeCounterSampleBuffer(descriptor: counterDescriptor)
-        let (cpu0, gpu0) = device.sampleTimestamps()
-        usleep(200_000)
-        let (cpu1, gpu1) = device.sampleTimestamps()
-        // Both timestamps count nanoseconds on Apple GPUs; calibrate anyway.
-        tickRate = Double(gpu1 - gpu0) / (Double(cpu1 - cpu0) / 1e9)
         // Light frames: full-screen 4x MSAA memoryless pass resolved, a trivial fragment.
         let source = """
         #include <metal_stdlib>
@@ -152,42 +137,6 @@ final class Probe: @unchecked Sendable {
     var width: Int { capture.width }
     var height: Int { capture.height }
 
-    // MARK: Stage timestamps
-
-    private var nextSample = 0
-    /// Pass indices (into `counters`, 4 samples each) per experiment.
-    private func installCounters() {
-        nextSample = 0
-        let buffer = counters, capacity = counterCapacity
-        let tile = Int(ProcessInfo.processInfo.environment["RAD_SLX_TILE"] ?? "0") ?? 0
-        CADViewportPasses.experimentPassHook = { [unowned self] pass in
-            if tile > 0 { pass.tileWidth = tile; pass.tileHeight = tile }
-            guard nextSample + 4 <= capacity else { return }
-            let attachment = pass.sampleBufferAttachments[0]!
-            attachment.sampleBuffer = buffer
-            attachment.startOfVertexSampleIndex = nextSample
-            attachment.endOfVertexSampleIndex = nextSample + 1
-            attachment.startOfFragmentSampleIndex = nextSample + 2
-            attachment.endOfFragmentSampleIndex = nextSample + 3
-            nextSample += 4
-        }
-    }
-
-    private func removeCounters() {
-        let tile = Int(ProcessInfo.processInfo.environment["RAD_SLX_TILE"] ?? "0") ?? 0
-        CADViewportPasses.experimentPassHook = tile > 0 ? { pass in pass.tileWidth = tile; pass.tileHeight = tile } : nil
-    }
-
-    /// (vertex start, vertex end, fragment start, fragment end) in seconds for each recorded pass.
-    private func stages() -> [(Double, Double, Double, Double)] {
-        guard nextSample > 0, let data = try? counters.resolveCounterRange(0..<nextSample) else { return [] }
-        let values = data.withUnsafeBytes { Array($0.bindMemory(to: MTLCounterResultTimestamp.self)) }
-        return stride(from: 0, to: values.count - 3, by: 4).map { i in
-            (Double(values[i].timestamp) / tickRate, Double(values[i + 1].timestamp) / tickRate,
-             Double(values[i + 2].timestamp) / tickRate, Double(values[i + 3].timestamp) / tickRate)
-        }
-    }
-
     // MARK: Experiments
 
     func run(_ experiment: String, output: URL) throws -> String {
@@ -203,8 +152,6 @@ final class Probe: @unchecked Sendable {
             lightInterval = 0.045
             defer { lightInterval = 0.00833 }
             return try waitOnce(runs: 6)
-        case "wait-sliced": return try waitSliced(cold: parts.count > 1 && parts[1] == "cold")
-        case "sliced": return try sliced(cold: parts.count > 1 && parts[1] == "cold")
         default: return "unknown"
         }
     }
@@ -213,30 +160,20 @@ final class Probe: @unchecked Sendable {
         try XCTUnwrap(passes.makeJob(capture.frame, source: capture.source, renderer: renderer, commandBuffer: commandBuffer))
     }
 
-    /// The whole geometry in one pass (one command buffer with the probe pass): GPU and stage times.
+    /// The whole geometry in one pass (one command buffer with the probe pass): GPU milliseconds.
     func once(reps: Int) throws -> String {
         try warmUp()
-        var times: [Double] = [], fragment: [Double] = [], vertex: [Double] = []
-        for index in 0..<(reps + 2) {
-            installCounters()
+        var times: [Double] = []
+        for _ in 0..<reps {
             let buffer = try XCTUnwrap(queue.makeCommandBuffer())
             let job = try newJob(buffer)
             passes.encodeAll(job, frame: capture.frame, commandBuffer: buffer)
             buffer.commit()
             buffer.waitUntilCompleted()
-            let s = stages()
-            if index >= 2 {
-                times.append((buffer.gpuEndTime - buffer.gpuStartTime) * 1000)
-                if let first = s.first {
-                    vertex.append((first.1 - first.0) * 1000)
-                    fragment.append((first.3 - first.2) * 1000)
-                }
-            }
+            times.append((buffer.gpuEndTime - buffer.gpuStartTime) * 1000)
         }
-        removeCounters()
-        times.sort(); fragment.sort(); vertex.sort()
-        return String(format: "GPU min %.2f median %.2f ms; geometry pass vertex %.2f fragment %.2f ms (min)",
-                      times.first!, times[times.count / 2], vertex.first ?? -1, fragment.first ?? -1)
+        times.sort()
+        return String(format: "GPU min %.2f median %.2f ms", times.first!, times[times.count / 2])
     }
 
     /// Keeps the GPU busy with whole frames for about a second (clocks ramp up).
@@ -572,75 +509,5 @@ final class Probe: @unchecked Sendable {
         return String(format: "exact pass %.1f ms beside frames; ", busy.min()!) + Self.summary(waits)
     }
 
-    /// The live loop's slicing: slices of the slice budget by the measured average rate, one running and
-    /// the next one queued behind it; `cold` forgets the design's measurements first.
-    private func runSliced(cold: Bool, beside: Bool) throws -> (busy: Double, slices: [Double], waits: [Double], count: Int) {
-        let setup = try XCTUnwrap(queue.makeCommandBuffer())
-        let job = try newJob(setup)
-        if cold { CADExactCost.shared.forget(job.costKey.resources) }
-        setup.commit()
-        var committed: [(buffer: any MTLCommandBuffer, covered: Int)] = []
-        var done = false
-        let lock = NSLock()
-        var waits: [Double] = []
-        let group = DispatchGroup()
-        if beside {
-            group.enter()
-            Thread.detachNewThread { [self] in
-                waits = (try? lightFrames(until: { lock.withLock { done } }, end: { CACurrentMediaTime() + 10 })) ?? []
-                group.leave()
-            }
-        }
-        var gpuEnd = 0.0
-        var measured: [Double] = []
-        var settled = 0
-        func settle(keeping ahead: Int) {
-            while committed.count - settled > ahead {
-                let item = committed[settled]
-                item.buffer.waitUntilCompleted()
-                let seconds = item.buffer.gpuEndTime - max(item.buffer.gpuStartTime, gpuEnd)
-                gpuEnd = max(gpuEnd, item.buffer.gpuEndTime)
-                measured.append(seconds * 1000)
-                CADExactCost.shared.recordSlice(job.costKey, seconds: seconds, covered: item.covered)
-                settled += 1
-            }
-        }
-        while job.hasSlicesToEncode {
-            settle(keeping: 1)
-            let buffer = try XCTUnwrap(queue.makeCommandBuffer())
-            guard let slice = passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: buffer) else { break }
-            buffer.commit()
-            committed.append((buffer, slice.covered))
-        }
-        settle(keeping: 0)
-        lock.withLock { done = true }
-        group.wait()
-        var busy = 0.0, cursor = 0.0
-        for item in committed.sorted(by: { $0.buffer.gpuStartTime < $1.buffer.gpuStartTime }) {
-            let b = item.buffer
-            if b.gpuEndTime > cursor { busy += b.gpuEndTime - max(b.gpuStartTime, cursor); cursor = b.gpuEndTime }
-        }
-        return (busy * 1000, measured, waits, committed.count)
-    }
 
-    func sliced(cold: Bool) throws -> String {
-        var best: (busy: Double, slices: [Double], waits: [Double], count: Int)?
-        for _ in 0..<2 {
-            let result = try runSliced(cold: cold, beside: false)
-            if best == nil || result.busy < best!.busy { best = result }
-        }
-        let s = best!.slices.sorted()
-        return String(format: "sliced busy %.1f ms, %d slices, slice p50 %.1f p95 %.1f max %.1f ms",
-                      best!.busy, best!.count, s[s.count / 2], s[Int(Double(s.count - 1) * 0.95)], s.last!)
-    }
-
-    func waitSliced(cold: Bool) throws -> String {
-        var waits: [Double] = [], busy: [Double] = []
-        for _ in 0..<2 {
-            let result = try runSliced(cold: cold, beside: true)
-            waits += result.waits
-            busy.append(result.busy)
-        }
-        return String(format: "sliced busy %.1f ms beside frames; ", busy.min()!) + Self.summary(waits)
-    }
 }

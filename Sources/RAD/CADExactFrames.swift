@@ -136,6 +136,7 @@ final class CADExactTargets: @unchecked Sendable {
 struct CADSlicePlan: Sendable {
     /// Block side in pixels (an even number keeps pixel quads whole).
     static let block = 128
+    static let translucentBlock = 64
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
@@ -429,7 +430,9 @@ final class CADExactJob: @unchecked Sendable {
         self.targets = targets
         self.draws = draws
         costKey = .init(resources: key.resources, width: width, height: height, translucent: key.translucent)
-        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect))
+        // Translucent layers march every proxy layer of a pixel: smaller blocks.
+        plan = CADSlicePlan(width: width, height: height, rects: draws.map(\.rect),
+                            block: key.translucent ? CADSlicePlan.translucentBlock : CADSlicePlan.block)
     }
 
     var isComplete: Bool { cleared && plan.isDone && completed == encoded }

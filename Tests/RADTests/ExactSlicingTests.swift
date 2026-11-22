@@ -98,8 +98,8 @@ final class ExactSlicingTests: XCTestCase {
     }
 
     /// A job's slices start at the first budget and two blocks; budgets
-    /// double up to the cap and block counts quadruple, so a cost estimate
-    /// that is too low cannot make an early slice large.
+    /// double up to the cap and so do block counts, so a cost estimate that
+    /// is too low cannot make an early slice large.
     func testSliceBudgetsStartSmallAndGrow() {
         let first = CADViewportPasses.firstSliceBudget, cap = CADViewportPasses.sliceBudget
         XCTAssertEqual(CADViewportPasses.sliceBudget(after: 0), first)
@@ -107,7 +107,7 @@ final class ExactSlicingTests: XCTestCase {
         XCTAssertEqual(CADViewportPasses.sliceBudget(after: 2), 4 * first)
         XCTAssertEqual(CADViewportPasses.sliceBudget(after: 100), cap)
         XCTAssertTrue((0..<30).map { CADViewportPasses.sliceBudget(after: $0) }.allSatisfy { $0 <= cap })
-        XCTAssertEqual((0..<4).map { CADViewportPasses.sliceBlocks(after: $0) }, [2, 8, 32, 128])
+        XCTAssertEqual((0..<4).map { CADViewportPasses.sliceBlocks(after: $0) }, [2, 4, 8, 16])
         XCTAssertGreaterThan(CADViewportPasses.sliceBlocks(after: 100), 1_000_000)
         // Two blocks at most, however cheap the estimate.
         var plan = CADSlicePlan(width: 1_000, height: 1_000, rects: [nil])
