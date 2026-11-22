@@ -21,15 +21,15 @@ final class ExactSlicingTests: XCTestCase {
         }
     }
 
-    /// Every band of rows a proxy reaches belongs to exactly one slice, top
-    /// to bottom; a slice is one rectangle spanning its bands' reached
-    /// columns, tight to its first and last reached band; a slice's estimate
-    /// stays within the budget unless it is a single band; bands no proxy
+    /// Every block a proxy reaches belongs to exactly one slice, in row
+    /// order; a slice is one rectangle: a run of one block row's blocks, or
+    /// a strip of whole rows spanning their reached columns; its estimate
+    /// stays within the budget unless it is a single block; blocks no proxy
     /// reaches get no slice.
-    func testSlicePlanCoversEveryReachedBandOnceWithinItsBudget() {
+    func testSlicePlanCoversEveryReachedBlockOnceWithinItsBudget() {
         var random = Generator(state: 7)
-        let size = CADSlicePlan.band
-        for _ in 0..<200 {
+        let size = CADSlicePlan.block
+        for trial in 0..<300 {
             let width = Int.random(in: 1...2_400, using: &random), height = Int.random(in: 1...1_600, using: &random)
             let rects: [SIMD4<Int32>?] = (0..<Int.random(in: 0...6, using: &random)).map { _ in
                 if Int.random(in: 0..<12, using: &random) == 0 { return nil }
@@ -38,48 +38,52 @@ final class ExactSlicingTests: XCTestCase {
                 return SIMD4(x0, y0, x0 + Int32.random(in: 0...1_200, using: &random), y0 + Int32.random(in: 0...900, using: &random))
             }
             var plan = CADSlicePlan(width: width, height: height, rects: rects)
-            // The reference coverage and reached columns of each band.
-            let bands = (height + size - 1) / size
-            var expected = [Int](repeating: 0, count: bands)
-            var low = [Int32](repeating: .max, count: bands), high = [Int32](repeating: 0, count: bands)
+            let columns = (width + size - 1) / size, rows = (height + size - 1) / size
+            // The reference coverage of each block.
+            var expected = [Int](repeating: 0, count: columns * rows)
             for rect in rects {
                 let r = rect ?? SIMD4(0, 0, Int32(width), Int32(height))
-                let x0 = max(0, Int(r.x)), x1 = min(width, Int(r.z))
-                for band in 0..<bands {
-                    let h = min(Int(r.w), min(height, (band + 1) * size)) - max(Int(r.y), band * size)
-                    if x1 > x0, h > 0 {
-                        expected[band] += (x1 - x0) * h
-                        low[band] = min(low[band], Int32(x0))
-                        high[band] = max(high[band], Int32(x1))
+                for by in 0..<rows {
+                    for bx in 0..<columns {
+                        let w = min(Int(r.z), min(width, (bx + 1) * size)) - max(Int(r.x), bx * size)
+                        let h = min(Int(r.w), min(height, (by + 1) * size)) - max(Int(r.y), by * size)
+                        if w > 0, h > 0 { expected[by * columns + bx] += w * h }
                     }
                 }
             }
             XCTAssertEqual(plan.total, expected.reduce(0, +))
-            let budget = Int.random(in: 1...300_000, using: &random)
-            var owners = [Int](repeating: -1, count: bands)
-            var index = 0, sum = 0, lastBand = -1
+            // Small budgets give runs of blocks, large ones strips of rows.
+            let budget = trial % 3 == 0 ? Int.random(in: 100_000...4_000_000, using: &random) : Int.random(in: 1...300_000, using: &random)
+            var owners = [Int](repeating: -1, count: expected.count)
+            var index = 0, sum = 0, lastBlock = -1
             while let slice = plan.next(budget: budget) {
                 XCTAssertEqual(slice.rects.count, 1, "one rectangle per slice")
                 let r = slice.rects[0]
+                XCTAssertEqual(Int(r.x) % size, 0)
                 XCTAssertEqual(Int(r.y) % size, 0)
+                XCTAssertTrue(Int(r.z) % size == 0 || Int(r.z) == width)
                 XCTAssertTrue(Int(r.w) % size == 0 || Int(r.w) == height)
-                XCTAssertGreaterThan(expected[Int(r.y) / size], 0, "the rectangle starts at a reached band")
-                XCTAssertGreaterThan(expected[(Int(r.w) - 1) / size], 0, "and ends at one")
-                var covered = 0, count = 0, x0 = Int32.max, x1 = Int32(0)
-                for band in (Int(r.y) / size)..<((Int(r.w) + size - 1) / size) where expected[band] > 0 {
-                    XCTAssertEqual(owners[band], -1, "a band belongs to one slice")
-                    XCTAssertGreaterThan(band, lastBand, "slices run top to bottom")
-                    owners[band] = index
-                    lastBand = band
-                    covered += expected[band]
-                    count += 1
-                    x0 = min(x0, low[band])
-                    x1 = max(x1, high[band])
+                let firstRow = Int(r.y) / size, lastRow = (Int(r.w) - 1) / size
+                var covered = 0, blocks = 0
+                for by in firstRow...lastRow {
+                    let reached = (0..<columns).filter { expected[by * columns + $0] > 0 }
+                    if lastRow > firstRow {
+                        XCTAssertFalse(reached.isEmpty, "a strip's rows are reached")
+                        XCTAssertTrue(reached.allSatisfy { owners[by * columns + $0] == -1 }, "a strip holds whole rows")
+                    }
+                    for bx in (Int(r.x) / size)..<((Int(r.z) + size - 1) / size) where expected[by * columns + bx] > 0 {
+                        let at = by * columns + bx
+                        XCTAssertEqual(owners[at], -1, "a block belongs to one slice")
+                        XCTAssertGreaterThan(at, lastBlock, "slices follow row order")
+                        owners[at] = index
+                        lastBlock = at
+                        covered += expected[at]
+                        blocks += 1
+                    }
                 }
-                XCTAssertEqual(r.x, x0, "the rectangle spans the reached columns")
-                XCTAssertEqual(r.z, x1)
+                XCTAssertGreaterThan(blocks, 0)
                 XCTAssertEqual(slice.covered, covered)
-                XCTAssertTrue(slice.covered <= budget || count == 1, "\(slice.covered) over \(budget)")
+                XCTAssertTrue(slice.covered <= budget || blocks == 1, "\(slice.covered) over \(budget)")
                 XCTAssertEqual(slice.whole, index == 0 && plan.isDone)
                 sum += slice.covered
                 index += 1
@@ -87,16 +91,26 @@ final class ExactSlicingTests: XCTestCase {
             XCTAssertTrue(plan.isDone)
             XCTAssertEqual(sum, plan.total)
             XCTAssertEqual(plan.remaining, 0)
-            for (band, value) in expected.enumerated() {
-                XCTAssertEqual(owners[band] != -1, value > 0, "exactly the reached bands have slices")
+            for (block, value) in expected.enumerated() {
+                XCTAssertEqual(owners[block] != -1, value > 0, "exactly the reached blocks have slices")
             }
         }
     }
 
+    /// A job's slices start at the first budget and double up to the cap.
+    func testSliceBudgetsStartSmallAndGrow() {
+        let first = CADViewportPasses.firstSliceBudget, cap = CADViewportPasses.sliceBudget
+        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 0), first)
+        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 1), 2 * first)
+        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 2), 4 * first)
+        XCTAssertEqual(CADViewportPasses.sliceBudget(after: 100), cap)
+        XCTAssertTrue((0..<30).map { CADViewportPasses.sliceBudget(after: $0) }.allSatisfy { $0 <= cap })
+    }
+
     /// Slices plan with an average of recent measured costs weighed by their
     /// pixels (a dense strip does not make every later slice small); whether a frame draws its
-    /// geometry itself uses the largest cost of frames drawn at once. Budgets
-    /// split the remaining bands evenly, so no small remainder pays a pass.
+    /// geometry itself uses the largest cost of frames drawn at once. A last
+    /// slice takes up to 1.25 budgets, so no small remainder pays a pass.
     func testSliceBudgetsAverageMeasuredCostsAndSplitEvenly() {
         let cost = CADExactCost()
         let opaque = CADExactCost.Key(resources: ObjectIdentifier(Self.self), width: 100, height: 100, translucent: false)
@@ -120,14 +134,12 @@ final class ExactSlicingTests: XCTestCase {
         cost.forget(ObjectIdentifier(Self.self))
         XCTAssertFalse(cost.hasSliceRate(opaque), "released resources forget their measurements")
 
-        // A frame of 63 bands of 16,000 covered pixels (the last 8 rows): about 1.5 budgets of 300,000
-        // per slice would leave a small remainder; even budgets make three slices within 1.25 budgets.
+        // A frame of 8 block rows of 128,000 covered pixels (the last 104 rows): strips of two rows
+        // within 300,000, then the last 232,000 together instead of a small remainder.
         var plan = CADSlicePlan(width: 1_000, height: 1_000, rects: [nil])
         var slices: [Int] = []
         while let slice = plan.next(budget: CADViewportPasses.evenBudget(plan, 300_000)) { slices.append(slice.covered) }
-        XCTAssertEqual(slices.count, 3)
-        XCTAssertEqual(slices.reduce(0, +), 1_000_000)
-        XCTAssertTrue(slices.allSatisfy { $0 <= 375_000 }, "\(slices)")
+        XCTAssertEqual(slices, [256_000, 256_000, 256_000, 232_000])
         var small = CADSlicePlan(width: 1_000, height: 1_000, rects: [nil])
         XCTAssertEqual(CADViewportPasses.evenBudget(small, 2_000_000), 2_000_000, "everything fits one slice")
         XCTAssertEqual(small.next(budget: 2_000_000)?.whole, true)

@@ -121,86 +121,116 @@ final class CADExactTargets: @unchecked Sendable {
     }
 }
 
-/// Screen slices of one exact frame's geometry: horizontal strips of the
-/// rows some proxy reaches, top to bottom, each one rectangle (the reached
-/// columns of its rows), whose estimated covered pixels (each proxy's
-/// projected bounds, counted per proxy) stay within a budget, at least one
-/// band of rows each. A pass ends when its slowest tile does, while the
-/// other cores idle, and another queue's frame waits for the tiles in
-/// flight whatever the pass's size; so slices are few and large, and every
-/// slice spans whole rows of many tiles. One rectangle per slice: each
-/// scissor of a viewport array draws every proxy again. Bands no proxy
-/// reaches get no slice; their stored layers keep the clear.
+/// Screen slices of one exact frame's geometry over square blocks that
+/// some proxy reaches: a slice is one rectangle, either a run of blocks of
+/// one block row or, once a budget holds whole rows, a strip of complete
+/// rows (their reached columns), top to bottom, whose estimated covered
+/// pixels (each proxy's projected bounds, counted per proxy) stay within the
+/// budget, at least one block each. Another queue's frame waits for the
+/// tiles in flight, about a tile per core while a slice is a few blocks and
+/// several while it spans the frame; every pass also ends with its slowest
+/// tile while other cores idle. So budgets start small and grow (see
+/// `CADViewportPasses.sliceBudget`). One rectangle per slice: each scissor of
+/// a viewport array draws every proxy again. Blocks no proxy reaches get no
+/// slice; their stored layers keep the clear.
 struct CADSlicePlan: Sendable {
-    /// Rows join in bands of this many pixels: an even number keeps pixel
-    /// quads whole.
-    static let band = 16
+    /// Block side in pixels (an even number keeps pixel quads whole).
+    static let block = 128
 
     struct Slice: Equatable, Sendable {
         /// Pixel rectangles (x0, y0, x1, y1 exclusive, top-left origin) of
         /// the slice; empty when the slice only clears.
         var rects: [SIMD4<Int32>]
         var covered: Int
-        /// The slice holds every band of the plan, so it needs no scissor.
+        /// The slice holds every block of the plan, so it needs no scissor.
         var whole = false
     }
 
     let width: Int
     let height: Int
-    /// Reached bands (index, estimated covered pixels, reached columns) top to bottom.
-    private let bands: [(index: Int, covered: Int, x0: Int32, x1: Int32)]
-    private var next = 0
+    let block: Int
+    /// Reached blocks of each block row (column, estimated covered pixels), and the rows' totals.
+    private let rows: [(index: Int, blocks: [(column: Int, covered: Int)], covered: Int)]
+    /// The next row, and the next block of that row.
+    private var row = 0
+    private var column = 0
     /// Estimated covered pixels of the whole frame.
     let total: Int
     private(set) var remaining: Int
 
     /// `rects` are proxies' pixel rectangles; nil covers the whole frame.
-    init(width: Int, height: Int, rects: [SIMD4<Int32>?]) {
+    init(width: Int, height: Int, rects: [SIMD4<Int32>?], block size: Int = Self.block) {
         self.width = max(0, width)
         self.height = max(0, height)
-        let size = Self.band
-        let count = (self.height + size - 1) / size
-        var covered = [Int](repeating: 0, count: count)
-        var low = [Int32](repeating: .max, count: count), high = [Int32](repeating: 0, count: count)
+        block = size
+        let columns = (self.width + size - 1) / size, count = (self.height + size - 1) / size
+        var covered = [Int](repeating: 0, count: columns * count)
         let full = SIMD4<Int32>(0, 0, Int32(self.width), Int32(self.height))
         for rect in rects {
             let r = rect ?? full
             let x0 = Int(max(0, r.x)), y0 = Int(max(0, r.y))
             let x1 = Int(min(Int32(self.width), r.z)), y1 = Int(min(Int32(self.height), r.w))
             guard x0 < x1, y0 < y1 else { continue }
-            for band in (y0 / size)...((y1 - 1) / size) {
-                covered[band] += (x1 - x0) * (min(y1, (band + 1) * size) - max(y0, band * size))
-                low[band] = min(low[band], Int32(x0))
-                high[band] = max(high[band], Int32(x1))
+            for by in (y0 / size)...((y1 - 1) / size) {
+                let h = min(y1, (by + 1) * size) - max(y0, by * size)
+                for bx in (x0 / size)...((x1 - 1) / size) {
+                    covered[by * columns + bx] += (min(x1, (bx + 1) * size) - max(x0, bx * size)) * h
+                }
             }
         }
-        bands = covered.indices.filter { covered[$0] > 0 }.map { (index: $0, covered: covered[$0], x0: low[$0], x1: high[$0]) }
-        total = bands.reduce(0) { $0 + $1.covered }
+        rows = (0..<count).compactMap { by in
+            let blocks = (0..<columns).filter { covered[by * columns + $0] > 0 }.map { (column: $0, covered: covered[by * columns + $0]) }
+            return blocks.isEmpty ? nil : (index: by, blocks: blocks, covered: blocks.reduce(0) { $0 + $1.covered })
+        }
+        total = rows.reduce(0) { $0 + $1.covered }
         remaining = total
     }
 
-    var isDone: Bool { next >= bands.count }
+    var isDone: Bool { row >= rows.count }
 
     /// The next slice whose estimated covered pixels stay within `budget`,
-    /// at least one band, or nil when every reached band has its slice.
+    /// at least one block, or nil when every reached block has its slice.
     mutating func next(budget: Int) -> Slice? {
-        guard next < bands.count else { return nil }
-        let first = next
-        var sum = bands[next].covered, x0 = bands[next].x0, x1 = bands[next].x1
-        next += 1
-        while next < bands.count, sum + bands[next].covered <= budget {
-            sum += bands[next].covered
-            x0 = min(x0, bands[next].x0)
-            x1 = max(x1, bands[next].x1)
-            next += 1
+        guard row < rows.count else { return nil }
+        let first = (row: row, column: column)
+        let size = Int32(block)
+        var sum = 0
+        if column == 0, rows[row].covered <= budget {
+            // Whole rows: a strip of their reached columns.
+            var x0 = Int32.max, x1 = Int32(0)
+            repeat {
+                sum += rows[row].covered
+                x0 = min(x0, Int32(rows[row].blocks.first!.column) * size)
+                x1 = max(x1, Int32(rows[row].blocks.last!.column + 1) * size)
+                row += 1
+            } while row < rows.count && sum + rows[row].covered <= budget
+            remaining -= sum
+            let rect = SIMD4(x0, Int32(rows[first.row].index) * size, min(Int32(width), x1),
+                             min(Int32(height), Int32(rows[row - 1].index + 1) * size))
+            return Slice(rects: [rect], covered: sum, whole: first.row == 0 && row == rows.count)
+        }
+        // A run of the current row's blocks.
+        let blocks = rows[row].blocks
+        sum = blocks[column].covered
+        var last = column
+        column += 1
+        while column < blocks.count, sum + blocks[column].covered <= budget {
+            sum += blocks[column].covered
+            last = column
+            column += 1
+        }
+        let rect = SIMD4(Int32(blocks[first.column].column) * size, Int32(rows[row].index) * size,
+                         min(Int32(width), Int32(blocks[last].column + 1) * size),
+                         min(Int32(height), Int32(rows[row].index + 1) * size))
+        if column >= blocks.count {
+            row += 1
+            column = 0
         }
         remaining -= sum
-        let rect = SIMD4(x0, Int32(bands[first].index * Self.band), x1,
-                         Int32(min(height, (bands[next - 1].index + 1) * Self.band)))
-        return Slice(rects: [rect], covered: sum, whole: first == 0 && next == bands.count)
+        return Slice(rects: [rect], covered: sum, whole: first.row == 0 && first.column == 0 && row == rows.count)
     }
 
-    /// The covered-pixel budget that splits the remaining bands into
+    /// The covered-pixel budget that splits the remaining blocks into
     /// `slices` slices of about equal estimates.
     func budget(slices: Int) -> Int {
         max(1, (remaining + max(1, slices) - 1) / max(1, slices))

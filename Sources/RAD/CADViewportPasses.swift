@@ -389,10 +389,20 @@ final class CADViewportPasses: @unchecked Sendable {
     static let sampleCount = 4
     /// GPU seconds of exact geometry a frame draws itself.
     static let frameBudget = 0.004
-    /// GPU seconds of one exact slice. A newer frame waits for the tiles in
-    /// flight, not for the slice; a slice bounds the work committed when a
-    /// newer view abandons the job.
+    /// GPU seconds of a job's first exact slice; each later one may take
+    /// twice its predecessor's, up to `sliceBudget`. A newer frame waits for
+    /// the tiles in flight: about one per core while a slice holds a few
+    /// blocks, several once it spans the frame. Small slices right after
+    /// navigation ends, when it is likeliest to resume, keep that wait near
+    /// the heaviest tile's; later slices are large, since every pass ends
+    /// with its slowest tile while the other cores idle.
+    static let firstSliceBudget = 0.004
     static let sliceBudget = 0.064
+
+    /// The budget of a job's slice after `slices` earlier ones.
+    static func sliceBudget(after slices: Int) -> Double {
+        min(sliceBudget, firstSliceBudget * Double(1 << min(max(0, slices), 16)))
+    }
     /// Experiment hook (temporary): adjusts exact geometry pass descriptors.
     nonisolated(unsafe) static var experimentPassHook: ((MTLRenderPassDescriptor) -> Void)?
 
@@ -533,13 +543,12 @@ final class CADViewportPasses: @unchecked Sendable {
         }
     }
 
-    /// A covered-pixel budget that splits a plan's remaining bands into
-    /// slices of about equal estimates within 1.25 times `covered`, so no
-    /// small remainder slice pays a pass of its own.
+    /// A covered-pixel budget of `covered` that takes the rest of a plan
+    /// when it is within 1.25 budgets, so no small remainder pays a pass of
+    /// its own.
     static func evenBudget(_ plan: CADSlicePlan, _ covered: Int) -> Int {
-        guard covered < Int.max / 4, plan.remaining > covered else { return covered }
-        let slices = (Double(plan.remaining) / (1.25 * Double(covered))).rounded(.up)
-        return plan.budget(slices: Int(min(slices, Double(Int32.max))))
+        guard covered < Int.max / 4 else { return covered }
+        return Double(plan.remaining) <= 1.25 * Double(covered) ? max(covered, plan.remaining) : covered
     }
 
     /// Covered pixels a slice of `budget` GPU seconds may estimate.

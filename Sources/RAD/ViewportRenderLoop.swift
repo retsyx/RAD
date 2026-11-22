@@ -11,12 +11,13 @@ import SceneKit
 /// Exact faces are drawn into stored layers by a job keyed by the frame's
 /// geometry identity (`CADExactKey`). A design whose exact geometry fits the
 /// frame budget draws it in the frame that shows it. Heavier geometry is
-/// drawn in a few screen slices of about `CADViewportPasses.sliceBudget` GPU
-/// time, each its own command buffer on a separate queue: one runs while the
-/// next is encoded behind it and committed by its completion, so the GPU
-/// does not wait for this thread and at most one slice is committed when a
-/// newer view abandons the job. The GPU switches to a newer frame's passes
-/// once the tiles in flight finish, whatever the slice's size. A newer frame
+/// drawn in screen slices that start small and grow
+/// (`CADViewportPasses.sliceBudget(after:)`), each its own command buffer on
+/// a separate queue: one runs while the next is encoded behind it and
+/// committed by its completion, so the GPU does not wait for this thread and
+/// at most one slice is committed when a newer view abandons the job. The
+/// GPU switches to a newer frame's passes once the tiles in flight finish,
+/// whatever the slice's size. A newer frame
 /// with the same key keeps the job and changes only what is composited;
 /// another key abandons its remaining slices. Until the slices complete,
 /// frames whose content differs from the screen's are drawn with display
@@ -349,7 +350,7 @@ final class ViewportRenderLoop: @unchecked Sendable {
                 let chain = running > 0
                 guard !chain || !waiting else { break }
                 let encoded = encodeSlice(job, chain: chain) { commandBuffer in
-                    passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
+                    passes.encodeSlice(job, budget: CADViewportPasses.sliceBudget(after: job.encoded), commandBuffer: commandBuffer)
                         .map { .slice(job, seconds: 0, covered: $0.covered) }
                 }
                 if !encoded { break }
@@ -364,7 +365,8 @@ final class ViewportRenderLoop: @unchecked Sendable {
         while running() == 0, condition.withLock({ chained == nil }),
               job.masks.values.contains(where: { !$0.cleared || !$0.plan.isDone }) {
             let encoded = encodeSlice(job) { commandBuffer in
-                passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget, commandBuffer: commandBuffer)
+                let slices = job.masks.values.reduce(0) { $0 + $1.encoded }
+                return passes.encodeMaskSlice(job, budget: CADViewportPasses.sliceBudget(after: slices), commandBuffer: commandBuffer)
                     .map { .mask(job, $0) }
             }
             if !encoded { break }
