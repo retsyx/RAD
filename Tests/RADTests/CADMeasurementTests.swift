@@ -133,10 +133,12 @@ final class CADMeasurementTests: XCTestCase {
     }
 
     func testMeasurementFormattingKeepsAreaVolumeAnglesAndVectorsDistinct() {
-        XCTAssertEqual(CADMeasurementMetric(id: "area", label: "Area", values: [12.5], unit: .area).formattedValue, "12.5 mm²")
-        XCTAssertEqual(CADMeasurementMetric(id: "volume", label: "Volume", values: [6], unit: .volume).formattedValue, "6 mm³")
-        XCTAssertEqual(CADMeasurementMetric(id: "angle", label: "Angle", values: [90], unit: .angle).formattedValue, "90°")
-        XCTAssertEqual(CADMeasurementMetric(id: "vector", label: "Point", values: [-0.00000001, 3, 4], unit: .length).formattedValue, "0, 3, 4 mm")
+        XCTAssertEqual(CADMeasurementMetric(id: "area", label: "Area", values: [12.5], unit: .area).formattedValue(.compact), "12.5 mm²")
+        XCTAssertEqual(CADMeasurementMetric(id: "volume", label: "Volume", values: [6], unit: .volume).formattedValue(.compact), "6 mm³")
+        XCTAssertEqual(CADMeasurementMetric(id: "angle", label: "Angle", values: [90], unit: .angle).formattedValue(.compact), "90°")
+        let point = CADMeasurementMetric(id: "vector", label: "Point", values: [-0.0049, -3.4567848, -0.00000001], unit: .length)
+        XCTAssertEqual(point.formattedValue(.compact), "0, -3.46, 0 mm")
+        XCTAssertEqual(point.formattedValue(.detailed), "-0.0049, -3.456785, 0 mm")
     }
 
     private func values(_ report: CADMeasurementReport, _ key: String) throws -> [Double] {

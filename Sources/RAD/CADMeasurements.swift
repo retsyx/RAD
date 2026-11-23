@@ -49,16 +49,26 @@ enum CADMeasurementUnit: String, Codable, Sendable {
     case scalar = ""
 }
 
+enum CADMeasurementPrecision: Int {
+    case compact = 2
+    case detailed = 6
+
+    func format(_ value: Double) -> String {
+        // Values that round to zero should display without a minus sign.
+        let halfUnit = 0.5 / pow(10, Double(rawValue))
+        let number = abs(value) <= halfUnit ? 0 : value
+        return number.formatted(.number.precision(.fractionLength(0...rawValue)))
+    }
+}
+
 struct CADMeasurementMetric: Codable, Sendable, Identifiable {
     var id: String
     var label: String
     var values: [Double]
     var unit: CADMeasurementUnit
 
-    var formattedValue: String {
-        let number = values.map { value in
-            (abs(value) < 0.0000005 ? 0 : value).formatted(.number.precision(.fractionLength(0...6)))
-        }.joined(separator: ", ")
+    func formattedValue(_ precision: CADMeasurementPrecision) -> String {
+        let number = values.map(precision.format).joined(separator: ", ")
         return number + (unit == .scalar ? "" : unit == .angle ? unit.rawValue : " " + unit.rawValue)
     }
 }

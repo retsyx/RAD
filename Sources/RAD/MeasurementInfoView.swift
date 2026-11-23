@@ -77,14 +77,16 @@ struct MeasurementInfoView: View {
     private func metricList(_ values: [CADMeasurementMetric]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(values) { metric in
+                let detailedValue = metric.formattedValue(.detailed)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(metricLabel(metric))
                         .font(.system(size: 9)).foregroundStyle(Palette.muted)
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(metric.formattedValue).font(.system(size: 10, design: .monospaced))
+                        Text(metric.formattedValue(.compact)).font(.system(size: 10, design: .monospaced))
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            .help(detailedValue)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        CopyButton(text: metric.formattedValue, label: "Copy \(metricLabel(metric))")
+                        CopyButton(text: detailedValue, label: "Copy \(metricLabel(metric))")
                     }
                 }
                 .accessibilityElement(children: .contain)
@@ -97,7 +99,7 @@ struct MeasurementInfoView: View {
     }
 
     private var copyText: String {
-        let values = metrics.map { "\($0.label): \($0.formattedValue)" }
+        let values = metrics.map { "\($0.label): \($0.formattedValue(.detailed))" }
         return (["Measurements"] + values).joined(separator: "\n")
     }
 }

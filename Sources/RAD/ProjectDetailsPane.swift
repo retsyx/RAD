@@ -69,17 +69,22 @@ struct ProjectDetailsPane: View {
             }
             if let mesh = state.mesh {
                 if state.assemblyPose?.solidTransforms.isEmpty != false {
+                    let dimensions = mesh.size
                     HStack(spacing: 5) {
                         ForEach(0..<3) { i in
                             if i > 0 { Text("×").foregroundStyle(Palette.muted) }
-                            Text(mesh.size[i], format: .number.precision(.fractionLength(0...1)))
+                            Text(CADMeasurementPrecision.compact.format(dimensions[i]))
+                                .help("\(CADMeasurementPrecision.detailed.format(dimensions[i])) mm")
                         }
                         Text("mm").foregroundStyle(Palette.muted)
                     }.font(.system(size: 11, design: .monospaced)).lineLimit(1).minimumScaleFactor(0.8)
                 }
                 Rectangle().fill(Palette.line).frame(height: 1)
-                detailRow("Solids", "\(mesh.solids)")
-                detailRow("Volume", "\(mesh.volume.formatted(.number.precision(.fractionLength(0)))) mm³")
+                detailRow("Solids") { Text(String(mesh.solids)) }
+                detailRow("Volume") {
+                    Text("\(CADMeasurementPrecision.compact.format(mesh.volume)) mm³")
+                        .help("\(CADMeasurementPrecision.detailed.format(mesh.volume)) mm³")
+                }
             }
         }
     }
@@ -97,11 +102,11 @@ struct ProjectDetailsPane: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func detailRow(_ label: String, _ value: String) -> some View {
+    private func detailRow(_ label: String, @ViewBuilder value: () -> some View) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text(label).foregroundStyle(Palette.muted).lineLimit(1)
             Spacer(minLength: 8)
-            Text(value).multilineTextAlignment(.trailing).lineLimit(2).truncationMode(.middle)
+            value().multilineTextAlignment(.trailing).lineLimit(2).truncationMode(.middle)
         }.font(.system(size: 10))
     }
 }
