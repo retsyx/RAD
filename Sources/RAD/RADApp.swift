@@ -11,6 +11,7 @@ struct RADApp: App {
             ProjectWindowRoot(request: $request, coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects)
         }
         .defaultSize(width: 1440, height: 900)
+        .windowStyle(.hiddenTitleBar)
         .commands { ProjectCommands(coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects,
                                     helpWindow: delegate.helpWindow) }
         Settings { RADSettingsView().preferredColorScheme(.dark).tint(Palette.accent) }
@@ -105,11 +106,7 @@ private struct ProjectWindowRoot: View {
 
     private func configureOpenHandler() {
         let opening = openWindow
-        let router = coordinator
-        router.onReopenProjectWindow = { opening(id: "project", value: $0) }
-        state.onOpenProject = { [weak router] url in
-            router?.openProject(at: url) { opening(id: "project", value: $0) }
-        }
+        coordinator.onReopenProjectWindow = { opening(id: "project", value: $0) }
         let recent = recentProjects
         state.onRecentProjectChanged = { [weak recent] url, previous in
             recent?.record(url, replacing: previous)

@@ -229,7 +229,6 @@ final class AppState {
     var pendingAttachments: [SourceAttachment] = [] {
         didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
     }
-    var onOpenProject: ((URL) -> Void)?
     var onRecentProjectChanged: ((URL, URL?) -> Void)?
     var onProjectAgentInvalidated: (() -> Void)?
     private var agentStateGeneration: UInt64 = 0
@@ -2369,15 +2368,6 @@ final class AppState {
                 }
             }
         }
-    }
-
-    func openProject() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "rad") ?? .package]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        if let onOpenProject { onOpenProject(url) }
-        else { openProject(url) }
     }
 
     func openProject(_ url: URL, restoringProjectID: UUID? = nil) {
