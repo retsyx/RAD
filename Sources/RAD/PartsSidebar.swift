@@ -130,7 +130,7 @@ private struct PartTreeItem: View {
     private var hiddenCount: Int { solids.intersection(state.hiddenSolids).count }
     private var selection: PartSelectionPresentation {
         PartSelectionPresentation(solidIndices: solids, selectedSolids: state.selectedSolids,
-                                  pointSelectedSolids: state.pointSelectedSolids,
+                                  featureSelectedSolids: state.featureSelectedSolids,
                                   explicitlySelected: state.selectedPartNodeIDs.contains(node.id))
     }
     private var isGroup: Bool { node.isGroup }
@@ -175,7 +175,7 @@ private struct PartTreeItem: View {
         .onChange(of: state.selectedRevisionID) { _, _ in showingColorPicker = false }
         .onChange(of: state.projectEditingID) { _, _ in showingColorPicker = false }
         .onChange(of: state.selectedSolids) { _, _ in showingColorPicker = false }
-        .onChange(of: state.pointSelectedSolids) { _, _ in showingColorPicker = false }
+        .onChange(of: state.featureSelectedSolids) { _, _ in showingColorPicker = false }
     }
 
     private var row: some View {
@@ -353,7 +353,7 @@ private struct PartActionsMenu: View {
         }
     }
 
-    /// Whole-part selections only; selected points never add their parts.
+    /// Only whole-part selections enter exports.
     private var exportSolidIndices: Set<Int> {
         if let node, node.allSolidIndices.isDisjoint(with: state.selectedSolids) {
             return node.allSolidIndices

@@ -4,7 +4,7 @@ struct RADHelpView: View {
     var body: some View {
         Form {
             Section("Viewport controls") {
-                control("Left-click", "Select or deselect a surface point")
+                control("Left-click", "Select or deselect a visible edge or a surface point")
                 control("Option-left-click", "Select or deselect a part")
                 control("Command-left-drag", "Move a mechanism part within its mates and travel limits")
                 control("Parts tree", "Select whole parts or folders")

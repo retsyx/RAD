@@ -115,6 +115,38 @@ final class ProjectSelectionContextTests: XCTestCase {
         XCTAssertFalse(json.contains("\"features\""))
     }
 
+    func testEdgeOnlyRequestKeepsCompactLandmarksThroughSaveAndStaging() throws {
+        let line = CADCreaseEdge(solidIndex: 0, index: 2, points: [[0, 0, 0], [0.1, 0, 0], [4, 0, 0]])
+        let loop = CADCreaseEdge(solidIndex: 1, index: 0, points: [[0, 0, 0], [3, 0, 0], [3, 3, 0], [0, 3, 0], [0, 0, 0]])
+        let selected = try XCTUnwrap(ProjectSelectionContext.capture(revisionID: UUID(), preview: preview(),
+            nodes: hierarchy(), selectedSolids: [], selectedNodeIDs: [], selectedEdges: [loop, line, loop]))
+        let edges = try XCTUnwrap(selected.edges)
+        XCTAssertTrue(selected.parts.isEmpty && selected.points.isEmpty)
+        XCTAssertEqual(edges.map(\.partID), ["lid", "base"])
+        XCTAssertEqual(edges.map(\.closed), [true, false])
+        XCTAssertEqual(edges.map(\.length), [12, 4])
+        XCTAssertEqual(edges[0].landmarks, [[0, 0, 0], [3, 1, 0], [1, 3, 0]])
+        XCTAssertEqual(edges[1].landmarks, [[0, 0, 0], [2, 0, 0], [4, 0, 0]])
+        let message = ChatMessage(role: "user", content: "Round these edges", selection: selected)
+        let project = RADProject(messages: [message], revisions: [], selectedRevisionID: nil)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let package = directory.appendingPathComponent("Edge selection.rad", isDirectory: true)
+        try ProjectPackage.write(project, to: package)
+        let copy = try ProjectStore.read(from: package)
+        XCTAssertEqual(copy.messages.first?.selection, selected)
+        let files = try CodexFileContext.prepare(current: nil, history: copy.messages, attachments: [],
+            directory: directory, selection: selected)
+        let staged = try Data(contentsOf: URL(fileURLWithPath: XCTUnwrap(files.selectionPath)))
+        XCTAssertEqual(try JSONDecoder().decode(CodexSelectionFile.self, from: staged).selection, selected)
+        XCTAssertEqual(files.selectionEdgeCount, 2)
+        XCTAssertNotNil(files.selectionManifestPath)
+        var invalid = selected
+        invalid.edges?[0].landmarks.removeLast()
+        XCTAssertThrowsError(try invalid.validate())
+    }
+
     func testInvalidPointsCannotEnterAProjectArchive() throws {
         let point = CADSurfacePoint(solidIndex: 0, point: [4, 1, 1], normal: [1, 0, 0])
         let original = try XCTUnwrap(ProjectSelectionContext.capture(revisionID: UUID(), preview: preview(), nodes: hierarchy(),

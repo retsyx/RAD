@@ -9,25 +9,14 @@ final class ViewportPointTests: XCTestCase {
     private let origin = CADSurfacePoint(solidIndex: 0, point: [0, 0, 0], normal: [0, 0, 1])
     private let corner = CADSurfacePoint(solidIndex: 0, point: [6, 0, 0], normal: [0, 0, 1])
 
-    func testAMarkerClickRemovesTheNearestSelectedPointAndOtherClicksAddTheHitInOrder() {
-        // Screen positions in points equal the points' X and Y here.
+    func testNearestSelectedMarkerWinsWithinTheClickTolerance() {
         let screen: (CADSurfacePoint) -> SIMD2<Double>? = { SIMD2($0.point[0], $0.point[1]) }
-        var selection = ViewportPointPicking.toggling(at: [6, 0], hit: corner, in: [], screen: screen)
-        selection = ViewportPointPicking.toggling(at: [30, 0], hit: origin, in: selection, screen: screen)
-        XCTAssertEqual(selection, [corner, origin], "The selection keeps click order.")
-
-        let near = CADSurfacePoint(solidIndex: 0, point: [4, 0, 0], normal: [0, 0, 1])
-        XCTAssertEqual(ViewportPointPicking.marker(at: [4, 0], in: selection, screen: screen), 0,
-                       "The nearest marker within the tolerance wins.")
-        XCTAssertEqual(ViewportPointPicking.toggling(at: [4, 0], hit: near, in: selection, screen: screen), [origin],
-                       "A click on a marker removes its point instead of adding the hit beneath it.")
-        let far = CADSurfacePoint(solidIndex: 0, point: [20, 0, 0], normal: [0, 0, 1])
-        XCTAssertEqual(ViewportPointPicking.toggling(at: [20, 0], hit: far, in: selection, screen: screen), [corner, origin, far])
-        XCTAssertEqual(ViewportPointPicking.toggling(at: [6 + ViewportPointPicking.markerTolerance + 0.5, 0], hit: nil,
-                                                     in: selection, screen: screen), selection,
-                       "A miss beyond every marker changes nothing.")
+        let selection = [corner, origin]
+        XCTAssertEqual(ViewportPointPicking.marker(at: [4, 0], in: selection, screen: screen), 0)
+        XCTAssertNil(ViewportPointPicking.marker(at: [6 + ViewportPointPicking.markerTolerance + 0.5, 0],
+                                                in: selection, screen: screen))
         XCTAssertNil(ViewportPointPicking.marker(at: [6, 0], in: selection, screen: { _ in nil }),
-                     "Markers without a screen position, such as those behind the eye, are not clickable.")
+                     "A marker behind the eye is not clickable.")
     }
 
     @MainActor
@@ -171,6 +160,100 @@ final class ViewportPointTests: XCTestCase {
                     selectedSolids: [], hiddenSolids: [0], selectedPoints: [corner, origin], solidTransforms: moved)
         XCTAssertTrue(view.makeFrame(width: 640, height: 480).seeds.isEmpty, "Hidden parts draw no markers.")
         XCTAssertNil(view.screenPosition(of: origin))
+    }
+
+    @MainActor
+    func testHoverAndClickUseOneWholeCreaseAndLeavePointSelectionAvailable() async throws {
+        let view = try makeView()
+        var preview = mesh()
+        preview.edgePoints = [-10, -10, 0, 0, -10, 0, 0, -10, 0, 10, -10, 0]
+        preview.edgeSolids = [0, 0]
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        let first = point([-7, -10, 0], in: view)
+        let second = point([7, -10, 0], in: view)
+        var edges = [[CADCreaseEdge]](), points = [[CADSurfacePoint]]()
+        view.onEdgeSelectionChanged = { edges.append($0) }
+        view.onPointSelectionChanged = { points.append($0) }
+        let move = try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: first, modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0))
+        view.mouseMoved(with: move)
+        let hover = try XCTUnwrap(view.makeFrame(width: 640, height: 480).seeds.first)
+        XCTAssertEqual(hover.channel, .hoveredEdge)
+        XCTAssertEqual(hover.buffer.vertexCount, 4, "Both segments highlight from either end.")
+        XCTAssertTrue(edges.isEmpty)
+        view.mouseDown(with: try click(at: first))
+        let edge = try XCTUnwrap(edges.last?.first)
+        XCTAssertEqual(edge.length, 20, accuracy: 1e-5)
+        XCTAssertTrue(points.isEmpty)
+        view.mouseMoved(with: move)
+        let selected = view.makeFrame(width: 640, height: 480)
+        XCTAssertEqual(selected.seeds.map(\.channel), [.selectedEdge])
+        XCTAssertTrue(selected.seeds.first?.buffer === hover.buffer)
+        XCTAssertFalse(selected.verticesEnabled)
+        let metadata = try XCTUnwrap((view.agentCaptureMetadata["selectedEdges"] as? [[String: Any]])?.first)
+        XCTAssertEqual(metadata["length"] as? Double, edge.length)
+        XCTAssertEqual((metadata["landmarks"] as? [[Double]])?.count, 3)
+
+        view.mouseDown(with: try click(at: point([0, 0, 0], in: view)))
+        XCTAssertEqual(points.last?.count, 1)
+        view.mouseDown(with: try click(at: second))
+        XCTAssertEqual(edges.last, [], "Clicking another segment toggles the same edge off.")
+        XCTAssertEqual(points.last?.count, 1)
+        let marker = CADSurfacePoint(solidIndex: 0, point: [-7, -10, 0], normal: [0, 0, 1])
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                    selectedPoints: [marker], selectedEdges: [edge])
+        view.mouseDown(with: try click(at: first))
+        XCTAssertEqual(points.last, [], "An existing point marker takes precedence over its edge.")
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).seeds.map(\.channel), [.selectedEdge])
+    }
+
+    @MainActor
+    func testCreasePickingHonorsOcclusionVisibilityPartPlacementAndDisplayMode() async throws {
+        let view = try makeView()
+        let preview = PreviewMesh(vertices: [[-10,-10,0], [10,-10,0], [10,10,0], [-10,10,0],
+                                              [-3,-3,1], [3,-3,1], [3,3,1], [-3,3,1]],
+            triangles: [[0,1,2], [0,2,3], [4,5,6], [4,6,7]], edges: [[-10,0,0,10,0,0]],
+            bounds: [-10,-10,0,10,10,1], volume: 1, area: 436, solids: 2, buildSeconds: 0, threads: 1,
+            buildID: "covered-edge", triangleSolids: [0,0,1,1], edgeSolids: [0])
+        for projection in [ViewportProjectionMode.perspective, .isometric] {
+            view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                        selectedSolids: [], hiddenSolids: [], projection: projection)
+            try await waitForPreparation(view)
+            let center = point([0, 0, 0], in: view)
+            guard case .point(let cover) = view.pickFeature(at: center) else {
+                return XCTFail("The front part hides the rear crease.")
+            }
+            XCTAssertEqual(cover.solidIndex, 1)
+            guard case .edge(let edge) = view.pickFeature(at: point([8, 0, 0], in: view)) else {
+                return XCTFail("The exposed portion of the same crease is selectable.")
+            }
+            view.update(mesh: preview, mode: .shaded, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [], projection: projection, selectedEdges: [edge])
+            XCTAssertEqual(view.pickFeature(at: center), .edge(edge), "The selected overlay can be toggled through the cover.")
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [1], projection: projection, selectedEdges: [edge])
+            XCTAssertEqual(view.pickFeature(at: center), .edge(edge))
+            let moved: [Int: [Double]] = [0: [1,0,0,0, 0,1,0,5, 0,0,1,0, 0,0,0,1]]
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [1], projection: projection, selectedEdges: [edge], solidTransforms: moved)
+            let posed = point([0, 5, 0], in: view)
+            XCTAssertNotEqual(view.pickFeature(at: center), .edge(edge))
+            XCTAssertEqual(view.pickFeature(at: posed), .edge(edge))
+            let frame = view.makeFrame(width: 640, height: 480)
+            XCTAssertEqual(frame.seeds.first?.model.columns.3.y, 5)
+            view.update(mesh: preview, mode: .shaded, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [1], projection: projection)
+            if case .edge = view.pickFeature(at: center) { XCTFail("Shaded mode hides the ordinary crease lines.") }
+            view.update(mesh: preview, mode: .wireframe, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [], projection: projection)
+            XCTAssertEqual(view.pickFeature(at: center), .edge(edge), "Wireframe exposes lines behind faces.")
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [],
+                        hiddenSolids: [0], projection: projection, selectedEdges: [edge])
+            XCTAssertTrue(view.makeFrame(width: 640, height: 480).seeds.isEmpty)
+            XCTAssertNil(view.pickFeature(at: point([8, 0, 0], in: view)))
+        }
     }
 
     @MainActor

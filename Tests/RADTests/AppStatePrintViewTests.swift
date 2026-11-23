@@ -34,6 +34,15 @@ final class AppStatePrintViewTests: XCTestCase {
         state.selectedRevisionID = revision.id
         XCTAssertTrue(state.loadStoredRevision())
         state.selectParts([1])
+        let creases = try XCTUnwrap(CADViewportPreparedMesh.prepareShared(preview)).creaseEdges
+        let rims = creases.filter { $0.solidIndex == 1 }
+        XCTAssertEqual(rims.count, 2, "Each circular end of the cylindrical peg is one selectable edge.")
+        for rim in rims {
+            XCTAssertEqual(rim.points.first, rim.points.last)
+            XCTAssertEqual(rim.length, 6 * .pi, accuracy: 0.1)
+        }
+        let edge = try XCTUnwrap(creases.first { $0.solidIndex == 0 })
+        state.selectEdges([edge])
 
         // The design itself, oriented and packed.
         let cameraKey = state.viewportCameraKey
@@ -43,6 +52,8 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertNotEqual(state.viewportCommand, command, "Placing the parts frames them")
         XCTAssertEqual(state.displayedMesh?.buildID, preview.buildID)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
+        XCTAssertEqual(state.selectedEdges, [edge], "Placing the original part on the plate preserves its edge.")
+        XCTAssertEqual(state.measurementReport?.metrics.first { $0.id == "edge1:length" }?.values, [edge.length])
         state.printLayoutView = false
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
@@ -60,6 +71,7 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
         XCTAssertEqual(state.selectedSolids, [1])
         XCTAssertEqual(state.measurementReport?.solidIndices, [1])
+        XCTAssertTrue(state.selectedEdges.isEmpty, "The alternate geometry has its own edges.")
 
         // Both: the printing version oriented and packed, as exported.
         state.printLayoutView = true
@@ -99,6 +111,7 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedMesh?.buildID, preview.buildID)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
+        XCTAssertEqual(state.selectedEdges, [edge], "Returning to the original build restores its edge.")
         state.printVersionView = true
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedSolidTransforms, layout)

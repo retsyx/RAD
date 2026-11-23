@@ -27,12 +27,11 @@ final class AppState {
     var mesh: PreviewMesh? {
         didSet {
             projectThumbnailMeshModel = mesh == nil ? nil : current
-            // Points lie on one build's surfaces. Even a replacement at the
-            // same artifact path must not keep old point selections.
-            pointSelectionOrigin = nil; selectedPointsGeometry = nil
+            // Surface picks belong to one build, even when its replacement uses the same path.
+            surfaceSelectionOrigin = nil; surfaceSelectionGeometry = nil
             loadAssemblyPose()
             preparePrintView()
-            selectedPoints = []
+            surfaceSelection = SurfaceSelection()
             refreshMeasurements()
             scheduleProjectThumbnail()
         }
@@ -143,34 +142,38 @@ final class AppState {
     var selectedSolids: Set<Int> = [] {
         didSet { if selectedSolids != oldValue { refreshMeasurements() } }
     }
-    /// Surface points picked in the viewport, in selection order, in their
-    /// parts' built coordinates.
-    private(set) var selectedPoints: [CADSurfacePoint] = [] {
+    /// Points and crease edges in built coordinates on the displayed geometry.
+    private struct SurfaceSelection: Equatable {
+        var points: [CADSurfacePoint] = []
+        var edges: [CADCreaseEdge] = []
+        var isEmpty: Bool { points.isEmpty && edges.isEmpty }
+
+        func excluding(_ solids: Set<Int>) -> Self {
+            guard !solids.isEmpty else { return self }
+            return Self(points: points.filter { !solids.contains($0.solidIndex) },
+                        edges: edges.filter { !solids.contains($0.solidIndex) })
+        }
+    }
+    private var surfaceSelection = SurfaceSelection() {
         didSet {
-            guard selectedPoints != oldValue else { return }
-            let solids = Set(selectedPoints.map(\.solidIndex))
-            if solids != pointSelectedSolids { pointSelectedSolids = solids }
+            guard surfaceSelection != oldValue else { return }
+            let owners = Set(selectedPoints.map(\.solidIndex)).union(selectedEdges.map(\.solidIndex))
+            if owners != featureSelectedSolids { featureSelectedSolids = owners }
             refreshMeasurements()
         }
     }
-    /// Solids owning the selected points. Kept with the selection so each
-    /// parts-tree row does not rebuild it.
-    private(set) var pointSelectedSolids: Set<Int> = []
-    /// A build's design or printing version, whose surfaces the points lie on.
-    private struct PointSelectionGeometry {
+    var selectedPoints: [CADSurfacePoint] { surfaceSelection.points }
+    var selectedEdges: [CADCreaseEdge] { surfaceSelection.edges }
+    /// Cached ownership keeps each parts-tree row independent of the number of picks.
+    private(set) var featureSelectedSolids: Set<Int> = []
+    private struct SurfaceSelectionGeometry {
         var preview: PreviewMesh
         var printVersion: Bool
     }
-    /// The user's point selection on the geometry where it was made.
-    /// Switching to the other build and back restores the selection.
-    private struct PointSelectionOrigin {
-        var geometry: PointSelectionGeometry
-        var points: [CADSurfacePoint]
-    }
-    @ObservationIgnored private var pointSelectionOrigin: PointSelectionOrigin?
-    /// The geometry `selectedPoints` lie on. While a 3D printing view is
-    /// being prepared, it remains the previously displayed geometry.
-    @ObservationIgnored private var selectedPointsGeometry: PointSelectionGeometry?
+    /// Restores surface picks when switching back from a different printing version.
+    @ObservationIgnored private var surfaceSelectionOrigin: (build: String, selection: SurfaceSelection)?
+    /// While a printing version is being prepared, picks refer to the previous geometry.
+    @ObservationIgnored private var surfaceSelectionGeometry: SurfaceSelectionGeometry?
     private(set) var measurementReport: CADMeasurementReport?
     private(set) var assemblyPose: AssemblyPose?
     private(set) var isSolvingAssembly = false
@@ -427,11 +430,11 @@ final class AppState {
         partsPaneFraction = fraction
         scheduleDebouncedAutosave()
     }
-    /// Whole parts plus the parts owning selected points: the targets of
+    /// Whole parts plus the parts owning surface picks: the targets of
     /// hiding and coloring. Exports take whole-part selections only.
-    var selectedPartSolids: Set<Int> { selectedSolids.union(pointSelectedSolids) }
+    var selectedPartSolids: Set<Int> { selectedSolids.union(featureSelectedSolids) }
     var canExportSelectedParts: Bool { canExport && !selectedSolids.isEmpty }
-    var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !selectedPoints.isEmpty }
+    var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !surfaceSelection.isEmpty }
     var canSaveProject: Bool { projectReady && projectSavingEnabled && !preserveUnreadableSession }
     var canSaveNew: Bool { canSaveProject && !revisions.isEmpty && !isWorking }
     var python: String { runtimeOverride ?? EngineService.defaultPython }
@@ -778,16 +781,16 @@ final class AppState {
         guard let revisionID = selectedRevisionID else { return nil }
         // 3D printing view selections refer to the displayed geometry in its
         // built coordinates, never to the plate layout. While a view is being
-        // prepared, selected points still lie on their previous geometry.
+        // prepared, surface picks still lie on their previous geometry.
         if showsPrintView {
-            let geometry = displayedMesh.map(displayedPointGeometry) ?? selectedPointsGeometry
+            let geometry = displayedMesh.map(displayedSurfaceGeometry) ?? surfaceSelectionGeometry
             return ProjectSelectionContext.capture(revisionID: revisionID, preview: geometry?.preview, nodes: partTree,
-                selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedPoints: selectedPoints,
-                printVersion: geometry?.printVersion ?? printVersionView)
+                selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs,
+                selectedPoints: selectedPoints, selectedEdges: selectedEdges, printVersion: geometry?.printVersion ?? printVersionView)
         }
         return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
-            selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedPoints: selectedPoints,
-            assemblyPose: assemblyPose)
+            selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs,
+            selectedPoints: selectedPoints, selectedEdges: selectedEdges, assemblyPose: assemblyPose)
     }
 
     func editQueuedRequest(id: UUID, text: String) {
@@ -1563,7 +1566,7 @@ final class AppState {
         let solids = Set(range.flatMap(\.allSolidIndices))
         let ids = Set(range.map(\.id))
         let deselecting = PartSelectionPresentation(solidIndices: clicked.allSolidIndices, selectedSolids: selectedSolids,
-                                                   pointSelectedSolids: [], explicitlySelected: selectedPartNodeIDs.contains(id)).isFull
+                                                   featureSelectedSolids: [], explicitlySelected: selectedPartNodeIDs.contains(id)).isFull
         let preferred = deselecting ? selectedPartNodeIDs.subtracting(range.flatMap(\.allNodeIDs)) : selectedPartNodeIDs.union(ids)
         if deselecting { selectedSolids.subtract(solids) }
         else { selectedSolids.formUnion(solids) }
@@ -1579,38 +1582,48 @@ final class AppState {
             $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hiddenSolids.contains($0.solidIndex) &&
                 seen.insert($0).inserted
         }
-        let geometry = displayedPointGeometry(preview)
-        selectedPointsGeometry = geometry
-        pointSelectionOrigin = valid.isEmpty ? nil : PointSelectionOrigin(geometry: geometry, points: valid)
-        selectedPoints = valid
+        setSurfaceSelection(SurfaceSelection(points: valid, edges: selectedEdges), on: preview)
+    }
+
+    func selectEdges(_ edges: [CADCreaseEdge]) {
+        guard let preview = displayedMesh else { return }
+        var seen = Set<CADCreaseEdge>()
+        let valid = edges.filter {
+            $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hiddenSolids.contains($0.solidIndex) &&
+                seen.insert($0).inserted
+        }
+        setSurfaceSelection(SurfaceSelection(points: selectedPoints, edges: valid), on: preview)
+    }
+
+    private func setSurfaceSelection(_ selection: SurfaceSelection, on preview: PreviewMesh) {
+        surfaceSelectionGeometry = displayedSurfaceGeometry(preview)
+        surfaceSelectionOrigin = selection.isEmpty ? nil : (Self.printKey(preview), selection)
+        surfaceSelection = selection
     }
 
     func clearSelections() {
         selectedSolids = []
         selectedPartNodeIDs = []
-        pointSelectionOrigin = nil
-        selectedPoints = []
+        surfaceSelectionOrigin = nil
+        surfaceSelection = SurfaceSelection()
         refreshMeasurements()
     }
 
-    private func displayedPointGeometry(_ preview: PreviewMesh) -> PointSelectionGeometry {
-        PointSelectionGeometry(preview: preview, printVersion: showsPrintView && printVersionView)
+    private func displayedSurfaceGeometry(_ preview: PreviewMesh) -> SurfaceSelectionGeometry {
+        SurfaceSelectionGeometry(preview: preview, printVersion: showsPrintView && printVersionView)
     }
 
-    /// Points lie on one build's surfaces. When the design and its printing
-    /// version replace each other, show the user's points only on the build
-    /// where they were selected; the other build shows none.
-    private func showPointSelection() {
+    private func showSurfaceSelection() {
         guard let preview = displayedMesh else { return }
-        let shown = displayedPointGeometry(preview)
-        let changed = selectedPointsGeometry.map { Self.printKey($0.preview) } != Self.printKey(preview)
-        selectedPointsGeometry = shown
+        let build = Self.printKey(preview)
+        let changed = surfaceSelectionGeometry.map { Self.printKey($0.preview) } != build
+        surfaceSelectionGeometry = displayedSurfaceGeometry(preview)
         guard changed else { return }
-        guard let origin = pointSelectionOrigin, Self.printKey(origin.geometry.preview) == Self.printKey(preview) else {
-            selectedPoints = []
+        guard let origin = surfaceSelectionOrigin, origin.build == build else {
+            surfaceSelection = SurfaceSelection()
             return
         }
-        selectedPoints = origin.points.filter { !hiddenSolids.contains($0.solidIndex) }
+        surfaceSelection = origin.selection.excluding(hiddenSolids)
     }
 
     private func cancelMeasurement() {
@@ -1713,7 +1726,8 @@ final class AppState {
             assemblyPose = pose
             requestedJointPositions = pose.positions
             agentStateGeneration &+= 1
-            refreshMeasurements()
+            // Rigid motion preserves every selected edge's length.
+            if !selectedPoints.isEmpty || !selectedSolids.isEmpty { refreshMeasurements() }
         }
         if fit { viewportCommand = ViewportCommand(.fit) }
         if let index = revisions.firstIndex(where: { $0.id == revisionID }), revisions[index].jointPositions != pose.positions {
@@ -1856,7 +1870,7 @@ final class AppState {
             printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
             if printViewGeometry != nil { printViewGeometry = nil }
             isPreparingPrintView = false
-            showPointSelection()
+            showSurfaceSelection()
             return
         }
         let key = build.key
@@ -1918,7 +1932,7 @@ final class AppState {
     private func showPrintView(_ geometry: PrintViewGeometry) {
         printViewGeometry = geometry
         isPreparingPrintView = false
-        showPointSelection()
+        showSurfaceSelection()
         if fitsPrintViewWhenShown {
             fitsPrintViewWhenShown = false
             viewportCommand = ViewportCommand(.fit)
@@ -1991,15 +2005,20 @@ final class AppState {
         cancelMeasurement()
         measurementError = nil
         guard let preview = displayedMesh, hasMeasurementSelection else { measurementReport = nil; return }
-        let points = selectedPoints, solids = selectedSolids
+        let points = selectedPoints, edges = selectedEdges, solids = selectedSolids
         let transforms = displayedSolidTransforms
-        let key = MeasurementKey(buildID: preview.buildID, points: points, solids: solids.sorted(),
+        // Only a pair that needs the worker's minimum distance has a cache entry.
+        let key: MeasurementKey?
+        if edges.isEmpty, CADMeasurements.workerEntities(points: points, solids: solids) != nil {
+            key = MeasurementKey(buildID: preview.buildID, points: points, solids: solids.sorted(),
                                  transforms: AssemblySolidTransform.records(transforms))
-        if let cached = measurementCache[key] { measurementReport = cached; return }
-        do { measurementReport = try CADMeasurements.report(preview, points: points, solids: solids, solidTransforms: transforms) }
-        catch { measurementReport = nil; measurementError = error.localizedDescription; return }
-        // Two parts, or a point and a part, add the worker's minimum distance.
-        guard CADMeasurements.workerEntities(points: points, solids: solids) != nil else { return }
+        } else { key = nil }
+        if let key, let cached = measurementCache[key] { measurementReport = cached; return }
+        do {
+            measurementReport = try CADMeasurements.report(preview, points: points, edges: edges,
+                                                           solids: solids, solidTransforms: transforms)
+        } catch { measurementReport = nil; measurementError = error.localizedDescription; return }
+        guard let key else { return }
         let token = measurementToken, sessionID = projectSessionID
         let runtime = python, cores = threads
         isMeasuring = true
@@ -2129,8 +2148,10 @@ final class AppState {
         if hiddenSolids.isDisjoint(with: valid) { hiddenSolids.formUnion(valid) }
         else { hiddenSolids.subtract(valid) }
         selectedSolids.subtract(hiddenSolids)
-        pointSelectionOrigin?.points.removeAll { hiddenSolids.contains($0.solidIndex) }
-        selectedPoints.removeAll { hiddenSolids.contains($0.solidIndex) }
+        if let origin = surfaceSelectionOrigin {
+            surfaceSelectionOrigin = (origin.build, origin.selection.excluding(hiddenSolids))
+        }
+        surfaceSelection = surfaceSelection.excluding(hiddenSolids)
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)
         persistPartVisibility()
     }

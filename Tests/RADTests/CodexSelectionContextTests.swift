@@ -98,12 +98,12 @@ final class CodexSelectionContextTests: XCTestCase {
         }
         try await waitUntil { service.canSteer }
         let first = target()
-        var second = first
-        second.points[0].point = [8, 9, 10]
-        second.points[0].normal = [1, 0, 0]
+        let second = ProjectSelectionContext(revisionID: first.revisionID, parts: [], points: [],
+            edges: [ProjectSelectedEdge(partID: "lid", name: "SELECTION_NAME_STAYS_LOCAL", path: ["Case", "Lid"],
+                solidIndex: 0, closed: false, length: 4, landmarks: [[0, 0, 0], [2, 0, 0], [4, 0, 0]])])
         let turn = try XCTUnwrap(service.currentTurnID)
         let firstAccepted = try await service.steer(prompt: "This point", selection: first, selectionModel: originModel())
-        let secondAccepted = try await service.steer(prompt: "Also this point", selection: second, selectionModel: .bracket)
+        let secondAccepted = try await service.steer(prompt: "Also this edge", selection: second, selectionModel: .bracket)
         XCTAssertEqual(firstAccepted, turn)
         XCTAssertEqual(secondAccepted, turn)
         _ = try await generation.value

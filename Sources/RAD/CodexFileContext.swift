@@ -55,6 +55,7 @@ struct CodexFileContext: Sendable {
     var selectionPath: String? = nil
     var selectionPartCount = 0
     var selectionPointCount = 0
+    var selectionEdgeCount = 0
     var selectionOriginMatchesCurrent = false
     var selectionManifestPath: String? = nil
 
@@ -202,13 +203,14 @@ struct CodexFileContext: Sendable {
         var files = CodexFileContext(currentModelPath: modelPath, sources: references, images: currentImageReferences,
                                      imageManifestPath: imageManifestPath, currentImagePaths: currentImageReferences.map(\.readPath),
                                      partLayoutPath: layoutPath, inputAssetsPath: assetsPath)
-        if let selection, !selection.parts.isEmpty || !selection.points.isEmpty {
+        if let selection, !selection.isEmpty {
             let origin = selectionModel ?? selectionModelsByRevision[selection.revisionID]
             let staged = try stageSelection(selection, originModel: origin, current: current,
                                             directory: directory, folder: "context")
             files.selectionPath = staged.path
             files.selectionPartCount = selection.parts.count
             files.selectionPointCount = selection.points.count
+            files.selectionEdgeCount = selection.edges?.count ?? 0
             files.selectionOriginMatchesCurrent = staged.originMatchesCurrent
         }
         let requestSelectionRevisionID = selection?.revisionID
@@ -216,7 +218,7 @@ struct CodexFileContext: Sendable {
         if let requestSelectionRevisionID, files.selectionPath != nil { originFolders[requestSelectionRevisionID] = "context" }
         var historical: [CodexSelectionHistoryReference] = []
         for message in history {
-            guard let selection = message.selection, !selection.parts.isEmpty || !selection.points.isEmpty else { continue }
+            guard let selection = message.selection, !selection.isEmpty else { continue }
             let origin = selectionModelsByRevision[selection.revisionID]
                 ?? (selection.revisionID == requestSelectionRevisionID ? selectionModel : nil)
             let originFolder = originFolders[selection.revisionID] ?? "context/selection-origins/\(selection.revisionID.uuidString)"

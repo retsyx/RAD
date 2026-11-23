@@ -251,15 +251,19 @@ private struct WorkspaceViewer: View {
     @ObservedObject var viewportReference: WorkspaceViewportReference
 
     var body: some View {
+        let preview = state.displayedMesh
+        let buildID = preview?.buildID
         ZStack(alignment: .topLeading) {
-            CADViewport(mesh: state.displayedMesh, displayMode: state.displayMode, projectionMode: state.projectionMode, showGrid: state.showGrid,
+            CADViewport(mesh: preview, displayMode: state.displayMode, projectionMode: state.projectionMode, showGrid: state.showGrid,
                         command: state.viewportCommand,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids,
                         omittedSolids: state.displayedOmittedSolids, solidColors: state.solidColors,
-                        selectedPoints: state.selectedPoints,
+                        selectedPoints: state.selectedPoints, selectedEdges: state.selectedEdges,
                         solidTransforms: state.displayedSolidTransforms, cameraKey: state.viewportCameraKey,
                         onSelectionChanged: { state.selectParts($0) },
-                        onPointSelectionChanged: { state.selectPoints($0) }, onDeselectAll: { state.clearSelections() },
+                        onPointSelectionChanged: { if state.displayedMesh?.buildID == buildID { state.selectPoints($0) } },
+                        onEdgeSelectionChanged: { if state.displayedMesh?.buildID == buildID { state.selectEdges($0) } },
+                        onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
                         onViewReady: { view in
                             viewportReference.bindViewport(view)

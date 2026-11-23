@@ -32,6 +32,43 @@ struct ProjectSelectedPoint: Codable, Sendable, Equatable {
     var normal: [Double]
 }
 
+/// Compact landmarks identify a picked crease in its origin recipe. The
+/// preview's mesh segments and transient chain index stay in the viewport.
+struct ProjectSelectedEdge: Codable, Sendable, Equatable {
+    var partID: String
+    var name: String
+    var path: [String]
+    var solidIndex: Int
+    var closed: Bool
+    var length: Double
+    var landmarks: [[Double]]
+}
+
+extension CADCreaseEdge {
+    /// Open edges include their endpoints and midpoint. Closed rims use
+    /// three positions spaced around the loop, all in built coordinates.
+    var selectionLandmarks: [[Double]] {
+        guard let start = points.first, let end = points.last, points.count >= 2 else { return [] }
+        let closed = start == end
+        let fractions = closed ? [1.0 / 3, 2.0 / 3] : [0.5]
+        let targets = fractions.map { $0 * length }
+        var landmarks = [start], traveled = 0.0, target = 0
+        for (a, b) in zip(points, points.dropFirst()) {
+            let delta = SIMD3(b[0] - a[0], b[1] - a[1], b[2] - a[2])
+            let span = (delta * delta).sum().squareRoot()
+            while target < targets.count, span > 0, targets[target] <= traveled + span {
+                let t = (targets[target] - traveled) / span
+                landmarks.append([a[0] + t * delta.x, a[1] + t * delta.y, a[2] + t * delta.z])
+                target += 1
+            }
+            if target == targets.count { break }
+            traveled += span
+        }
+        if !closed { landmarks.append(end) }
+        return landmarks
+    }
+}
+
 struct ProjectSelectionContext: Codable, Sendable, Equatable {
     var revisionID: UUID
     var capturedAt = Date()
@@ -40,6 +77,7 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     var parts: [ProjectSelectedPart]
     /// Surface points in the user's selection order.
     var points: [ProjectSelectedPoint]
+    var edges: [ProjectSelectedEdge]? = nil
     /// Reproduce the selected mechanism pose when reconciling an older request.
     var jointPositions: [String: Double]? = nil
     /// Captured in the 3D printing version view: points and anchors belong to
@@ -48,9 +86,13 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
 
     static let maximumParts = 8_192
     static let maximumPoints = 8_192
+    static let maximumEdges = 8_192
+
+    var isEmpty: Bool { parts.isEmpty && points.isEmpty && (edges ?? []).isEmpty }
 
     static func capture(revisionID: UUID, preview: PreviewMesh?, nodes: [PartNode],
                         selectedSolids: Set<Int>, selectedNodeIDs: Set<String>, selectedPoints: [CADSurfacePoint] = [],
+                        selectedEdges: [CADCreaseEdge] = [],
                         assemblyPose: AssemblyPose? = nil, printVersion: Bool = false) -> ProjectSelectionContext? {
         struct Owner {
             var id: String
@@ -100,8 +142,17 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
                 return ProjectSelectedPoint(partID: identity.id, name: identity.name, path: identity.path,
                                             solidIndex: point.solidIndex, point: point.point, normal: point.normal)
             }
-        guard !parts.isEmpty || !points.isEmpty else { return nil }
+        var seenEdges = Set<CADCreaseEdge>()
+        let edges = selectedEdges.filter { $0.isValid && $0.solidIndex < solidCount && seenEdges.insert($0).inserted }
+            .prefix(maximumEdges).map { edge in
+                let identity = owner(edge.solidIndex)
+                return ProjectSelectedEdge(partID: identity.id, name: identity.name, path: identity.path,
+                    solidIndex: edge.solidIndex, closed: edge.points.first == edge.points.last,
+                    length: edge.length, landmarks: edge.selectionLandmarks)
+            }
+        guard !parts.isEmpty || !points.isEmpty || !edges.isEmpty else { return nil }
         return ProjectSelectionContext(revisionID: revisionID, parts: parts, points: Array(points),
+                                       edges: edges.isEmpty ? nil : edges,
                                        jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil,
                                        printVersion: printVersion ? true : nil)
     }
@@ -133,10 +184,14 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
             CADSurfacePoint(solidIndex: point.solidIndex, point: point.point, normal: point.normal)
         }
         guard capturedAt.timeIntervalSinceReferenceDate.isFinite,
-              !parts.isEmpty || !points.isEmpty,
+              !isEmpty,
               parts.count <= Self.maximumParts, points.count <= Self.maximumPoints,
               Set(parts.map(\.solidIndex)).count == parts.count,
               Set(points.map(surfacePoint)).count == points.count,
+              (edges ?? []).count <= Self.maximumEdges,
+              (edges ?? []).allSatisfy({ $0.solidIndex >= 0 && $0.solidIndex < 1_000_000 && text($0.partID) &&
+                  text($0.name) && path($0.path) && $0.length.isFinite && $0.length > 0 &&
+                  $0.landmarks.count == 3 && $0.landmarks.allSatisfy { vector($0) } }),
               parts.allSatisfy({ $0.solidIndex >= 0 && $0.solidIndex < 1_000_000 && text($0.partID) && text($0.name) && path($0.path) && anchor($0.anchor) }),
               points.allSatisfy({ surfacePoint($0).isValid && text($0.partID) && text($0.name) && path($0.path) }) else { throw invalid() }
     }

@@ -1,15 +1,15 @@
-/// A point selection involves its owning part without selecting that part's
+/// A selected point or edge involves its owning part without selecting its
 /// complete geometry. Folders also show partial selection for selected children.
 enum PartSelectionPresentation: Equatable {
     case none
     case partial
     case full
 
-    init(solidIndices: Set<Int>, selectedSolids: Set<Int>, pointSelectedSolids: Set<Int>,
+    init(solidIndices: Set<Int>, selectedSolids: Set<Int>, featureSelectedSolids: Set<Int>,
          explicitlySelected: Bool) {
         if explicitlySelected || (!solidIndices.isEmpty && solidIndices.isSubset(of: selectedSolids)) {
             self = .full
-        } else if !solidIndices.isDisjoint(with: selectedSolids.union(pointSelectedSolids)) {
+        } else if !solidIndices.isDisjoint(with: selectedSolids) || !solidIndices.isDisjoint(with: featureSelectedSolids) {
             self = .partial
         } else {
             self = .none

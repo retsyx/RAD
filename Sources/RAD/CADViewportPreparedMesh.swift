@@ -12,6 +12,7 @@ struct CADViewportPreparedMesh: Sendable {
     let groups: [Int: [Int32]]
     let solidBounds: [Int: [Double]]
     let edges: [Int: CADStrokeGeometry.Prepared]
+    let creaseEdges: [CADCreaseEdge]
     let hasOwnedEdges: Bool
     /// Exact faces of the parts with a field program and proxy.
     let field: CADFieldGeometry?
@@ -91,13 +92,18 @@ struct CADViewportPreparedMesh: Sendable {
             edgeGroups[owners?[index] ?? -1, default: []].append(index)
         }
         var edges = [Int: CADStrokeGeometry.Prepared]()
-        for (solid, segments) in edgeGroups {
+        var creaseEdges = [CADCreaseEdge]()
+        for (solid, segments) in edgeGroups.sorted(by: { $0.key < $1.key }) {
             edges[solid] = try CADStrokeGeometry.prepare(points: mesh.edgePoints, segments: segments, surfaces: surfaces)
+            if solid >= 0 || mesh.solids == 1 {
+                creaseEdges += try CADCreaseEdge.group(points: mesh.edgePoints, segments: segments, solid: max(solid, 0))
+            }
         }
         let field = try CADFieldGeometry.prepare(mesh, solidBounds: solidBounds)
         try Task.checkCancellation()
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
-                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: owners != nil, field: field)
+                    groups: groups, solidBounds: solidBounds, edges: edges, creaseEdges: creaseEdges,
+                    hasOwnedEdges: owners != nil, field: field)
     }
 
     private static func validBounds(_ bounds: [Double]) -> Bool {
@@ -110,7 +116,8 @@ struct CADViewportPreparedMesh: Sendable {
     fileprivate func presenting(_ mesh: PreviewMesh) -> Self? {
         guard Self.validBounds(mesh.bounds) else { return nil }
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
-                    groups: groups, solidBounds: solidBounds, edges: edges, hasOwnedEdges: hasOwnedEdges, field: field)
+                    groups: groups, solidBounds: solidBounds, edges: edges, creaseEdges: creaseEdges,
+                    hasOwnedEdges: hasOwnedEdges, field: field)
     }
 
     /// Buffers another view or capture already prepared for this preview.

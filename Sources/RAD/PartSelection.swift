@@ -18,7 +18,7 @@ enum PartSelection {
         guard let clicked = rows.firstIndex(where: { $0.id == id }) else { return [] }
         let selected = rows.map {
             PartSelectionPresentation(solidIndices: $0.allSolidIndices, selectedSolids: selectedSolids,
-                                      pointSelectedSolids: [], explicitlySelected: selectedNodeIDs.contains($0.id)).isFull
+                                      featureSelectedSolids: [], explicitlySelected: selectedNodeIDs.contains($0.id)).isFull
         }
         var boundary = clicked
         for distance in 1..<rows.count {

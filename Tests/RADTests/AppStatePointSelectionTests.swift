@@ -140,13 +140,51 @@ final class AppStatePointSelectionTests: XCTestCase {
     }
 
     @MainActor
+    func testEdgeSelectionReportsPolylineLengthAndTracksOnlyPartialPartOwnership() throws {
+        let state = try fixture()
+        let a = CADCreaseEdge(solidIndex: 0, index: 1, points: [[0, 0, 0], [0.125, 0, 0], [0.3125, 0.078125, 0]])
+        let b = CADCreaseEdge(solidIndex: 1, index: 1, points: [[5, 0, 0], [6, 0, 0]])
+        state.selectEdges([a, b, a])
+        XCTAssertEqual(state.selectedEdges, [a, b])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 1])
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+        XCTAssertFalse(state.canExportSelectedParts)
+        XCTAssertEqual(try values(state, "edge1:length"), [0.328125])
+        XCTAssertEqual(try values(state, "edge2:length"), [1])
+        state.selectPoints([point(2, 0)])
+        state.selectParts([0])
+        XCTAssertEqual(state.selectedEdges, [a, b])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 1, 2])
+        XCTAssertEqual(try values(state, "parts:count"), [1])
+        XCTAssertEqual(try values(state, "edge1:length"), [0.328125])
+        XCTAssertFalse(state.isMeasuring)
+        state.togglePartVisibility([1])
+        XCTAssertEqual(state.selectedEdges, [a])
+        state.selectEdges([a, b])
+        XCTAssertEqual(state.selectedEdges, [a])
+        state.togglePartVisibility([1])
+        XCTAssertEqual(state.selectedEdges, [a])
+        state.hideSelectedParts()
+        XCTAssertEqual(state.hiddenSolids, [0, 2])
+        XCTAssertTrue(state.selectedEdges.isEmpty)
+        XCTAssertNil(state.measurementReport)
+        state.showAllParts()
+        state.selectEdges([a])
+        let replacement = state.mesh
+        state.mesh = replacement
+        XCTAssertTrue(state.selectedEdges.isEmpty)
+        XCTAssertTrue(state.featureSelectedSolids.isEmpty)
+        XCTAssertNil(state.measurementReport)
+    }
+
+    @MainActor
     func testVisibilityToggleRemovesOnlyPointsOwnedByTheHiddenParts() throws {
         let state = try fixture()
         let a = point(0, 0), b = point(1, 0), c = point(2, 0)
         state.selectPoints([c, b, a])
         state.togglePartVisibility([1])
         XCTAssertEqual(state.selectedPoints, [c, a])
-        XCTAssertEqual(state.pointSelectedSolids, [0, 2])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 2])
         XCTAssertEqual(state.hiddenSolids, [1])
         XCTAssertNil(state.measurementError)
         XCTAssertFalse(state.isMeasuring)

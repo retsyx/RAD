@@ -103,26 +103,30 @@ enum CADMeasurements {
                 AssemblySolidTransform.point(point.normal, by: matrix, direction: true))
     }
 
-    /// Point and part measurements computed locally from the selection and
-    /// the build's statistics, posed with `solidTransforms`. Distances to a
-    /// part come from the worker (`EngineService.measure`).
-    static func report(_ preview: PreviewMesh, points: [CADSurfacePoint] = [], solids: Set<Int>,
+    /// Rigid placements affect point and part coordinates. Each edge's length
+    /// is the sum of its display segments in the part's built coordinates.
+    static func report(_ preview: PreviewMesh, points: [CADSurfacePoint] = [], edges: [CADCreaseEdge] = [], solids: Set<Int>,
                        solidTransforms: [Int: [Double]] = [:]) throws -> CADMeasurementReport {
-        guard !solids.isEmpty || !points.isEmpty else {
-            throw RADError.message("Select a part or a surface point to measure.")
+        guard !solids.isEmpty || !points.isEmpty || !edges.isEmpty else {
+            throw RADError.message("Select a part, edge or surface point to measure.")
         }
         guard solids.allSatisfy({ $0 >= 0 && $0 < preview.solids }),
               points.allSatisfy({ $0.isValid && $0.solidIndex < preview.solids }),
-              Set(points).count == points.count else {
+              edges.allSatisfy({ $0.isValid && $0.solidIndex < preview.solids }),
+              Set(points).count == points.count, Set(edges).count == edges.count else {
             throw RADError.message("The selection is no longer available. Select it again.")
         }
         var metrics: [CADMeasurementMetric] = []
         func add(_ id: String, _ label: String, _ values: [Double], _ unit: CADMeasurementUnit) {
             metrics.append(CADMeasurementMetric(id: id, label: label, values: values, unit: unit))
         }
+        for (index, edge) in edges.enumerated() {
+            let name = edges.count == 1 ? "Edge" : "Edge \(index + 1)"
+            add("edge\(index + 1):length", "\(name) length (approx.)", [edge.length], .length)
+        }
         let posed = points.map { posedPoint($0, transforms: solidTransforms) }
         for (index, point) in posed.enumerated() {
-            let prefix = points.count > 1 || !solids.isEmpty ? "Point \(index + 1) · " : ""
+            let prefix = points.count > 1 || !solids.isEmpty || !edges.isEmpty ? "Point \(index + 1) · " : ""
             add(pointPrefix(index) + "position", prefix + "Coordinates X, Y, Z", point.position, .length)
             add(pointPrefix(index) + "normal", prefix + "Normal", point.normal, .scalar)
         }
@@ -167,7 +171,10 @@ enum CADMeasurements {
             add("parts:maximum", "Maximum X, Y, Z", maximum, .length)
             add("parts:centroid", "Volume centroid", centroid, .length)
         }
-        let title = points.count == 1 && solids.isEmpty ? "Surface point" : "Measurements"
+        let title: String
+        if points.count == 1 && solids.isEmpty && edges.isEmpty { title = "Surface point" }
+        else if edges.count == 1 && solids.isEmpty && points.isEmpty { title = "Edge" }
+        else { title = "Measurements" }
         return CADMeasurementReport(title: title, metrics: metrics, points: points, solidIndices: solids.sorted(),
                                     closestPoints: closestPoints)
     }

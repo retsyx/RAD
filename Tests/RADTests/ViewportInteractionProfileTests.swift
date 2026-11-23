@@ -89,7 +89,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         XCTAssertNotEqual(view.agentCaptureMetadata["cameraTransform"] as? [Double], initialCamera)
 
         // Separate SceneKit's first surface-ray acceleration cost from the
-        // first surface-point pick. The original combined cold baseline is
+        // first feature pick. The original combined cold baseline is
         // retained in the saved before.json artifact for comparison.
         let center = NSPoint(x: view.bounds.midX, y: view.bounds.midY)
         let surfaceStart = ProcessInfo.processInfo.systemUptime
@@ -97,8 +97,15 @@ final class ViewportInteractionProfileTests: XCTestCase {
                                                              .searchMode: SCNHitTestSearchMode.closest.rawValue])
         let firstSurfaceCost = (ProcessInfo.processInfo.systemUptime - surfaceStart) * 1_000
         let coldStart = ProcessInfo.processInfo.systemUptime
-        let cold = view.surfacePoint(at: center)
+        let cold = view.pickFeature(at: center)
         let coldCost = (ProcessInfo.processInfo.systemUptime - coldStart) * 1_000
+        func description(_ feature: CADViewportPick) -> String {
+            switch feature {
+            case .marker(let index): return "marker \(index)"
+            case .edge(let edge): return "edge \(edge.solidIndex):\(edge.index)"
+            case .point(let point): return "point \(point.solidIndex):\(point.point)"
+            }
+        }
         var warmCosts = [Double](), warmHits = 0
         var warmPoints = [String]()
         let points = (0..<40).map { index in
@@ -107,9 +114,9 @@ final class ViewportInteractionProfileTests: XCTestCase {
         }
         for point in points {
             let started = ProcessInfo.processInfo.systemUptime
-            let picked = view.surfacePoint(at: point)
+            let picked = view.pickFeature(at: point)
             if picked != nil { warmHits += 1 }
-            warmPoints.append(picked.map { "\($0.solidIndex):\($0.point)" } ?? "")
+            warmPoints.append(picked.map(description) ?? "")
             warmCosts.append((ProcessInfo.processInfo.systemUptime - started) * 1_000)
         }
 
@@ -147,9 +154,9 @@ final class ViewportInteractionProfileTests: XCTestCase {
             "coldPickingMS": coldCost,
             "firstSurfaceHitMS": firstSurfaceCost,
             "firstSurfaceHitCount": firstSurfaceHits.count,
-            "coldPoint": cold.map { "\($0.solidIndex):\($0.point)" } as Any? ?? NSNull(),
+            "coldFeature": cold.map(description) as Any? ?? NSNull(),
             "warmPicking": ["durationsMS": warmCosts, "summary": summary(warmCosts), "hits": warmHits,
-                            "points": warmPoints],
+                            "features": warmPoints],
             "hover": ["durationsMS": hoverCosts, "summary": summary(hoverCosts)]
         ]
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])

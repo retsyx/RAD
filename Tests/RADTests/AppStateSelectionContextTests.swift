@@ -163,7 +163,7 @@ final class AppStateSelectionContextTests: XCTestCase {
         let base = CADSurfacePoint(solidIndex: 0, point: [1, 1, 0], normal: [0, 0, 1])
         state.selectPoints([lid, base, lid, CADSurfacePoint(solidIndex: 7, point: [0, 0, 0], normal: [0, 0, 1])])
         XCTAssertEqual(state.selectedPoints, [lid, base], "Duplicates and points on missing parts are dropped.")
-        XCTAssertEqual(state.pointSelectedSolids, [0, 1])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 1])
         XCTAssertTrue(state.selectedSolids.isEmpty)
         XCTAssertEqual(state.selectedPartSolids, [0, 1], "Hiding and coloring include the points' parts.")
         XCTAssertFalse(state.canExportSelectedParts, "Point picks never add their parts to part exports.")
