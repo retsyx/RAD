@@ -784,7 +784,7 @@
   },
   {
     "name": "rad_screenshot",
-    "description": "Capture the current RAD viewport as a PNG image attachment with its camera, display, hidden and selected solid indices, selectedParts (part IDs and names), solidTransforms and selectedPoints: the user's picked surface points with their part, built part coordinates and unit normal, and worldPoint/worldNormal as displayed, ready for rad_measure. selectedEdges describes each selected crease by owning part, built-coordinate landmarks, approximate length in mm and whether it is closed. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.",
+    "description": "Capture the current RAD viewport as a PNG image attachment with its camera, display, hidden and selected solid indices, selectedParts (part IDs and names), solidTransforms and selectedPoints: the user's picked surface points with their part, built part coordinates and unit normal, and worldPoint/worldNormal as displayed, ready for rad_measure. selectedEdges describes each selected crease by owning part, built-coordinate landmarks, approximate length in mm and whether it is closed. selectedPatches gives each selected surface region’s part, approximate area in mm², centroid, bounds and one representative point with its local normal, in built coordinates. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.",
     "inputSchema": {
       "type": "object",
       "properties": {},

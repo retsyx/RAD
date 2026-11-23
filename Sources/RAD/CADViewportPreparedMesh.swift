@@ -13,6 +13,7 @@ struct CADViewportPreparedMesh: Sendable {
     let solidBounds: [Int: [Double]]
     let edges: [Int: CADStrokeGeometry.Prepared]
     let creaseEdges: [CADCreaseEdge]
+    let surfacePatches: CADSurfacePatches
     let hasOwnedEdges: Bool
     /// Exact faces of the parts with a field program and proxy.
     let field: CADFieldGeometry?
@@ -40,30 +41,29 @@ struct CADViewportPreparedMesh: Sendable {
             if index.isMultiple(of: 768) { try Task.checkCancellation() }
             guard value.isFinite, abs(value) < 1e12 else { return nil }
         }
-        let maximumIndex = UInt32(vertexCount)
-        for (index, vertex) in mesh.triangleIndices.enumerated() {
-            if index.isMultiple(of: 768) { try Task.checkCancellation() }
-            guard vertex < maximumIndex else { return nil }
-        }
         if mesh.vertexNormals != nil {
             try Task.checkCancellation()
             guard mesh.hasValidNormals else { return nil }
+        }
+        let solidMap = try validOwners(mesh.triangleSolids, count: triangleCount, solids: mesh.solids)
+        var groups = [Int: [Int32]]()
+        func appendTriangle(_ a: UInt32, _ b: UInt32, _ c: UInt32, to group: inout [Int32]) {
+            group.append(Int32(a))
+            group.append(Int32(b))
+            group.append(Int32(c))
+        }
+        let maximumIndex = UInt32(vertexCount)
+        for index in 0..<triangleCount {
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
+            let offset = index * 3
+            let a = mesh.triangleIndices[offset], b = mesh.triangleIndices[offset + 1], c = mesh.triangleIndices[offset + 2]
+            guard a < maximumIndex, b < maximumIndex, c < maximumIndex else { return nil }
+            appendTriangle(a, b, c, to: &groups[solidMap?[index] ?? 0, default: []])
         }
         // SceneKit uploads Float32 attributes; the packed arrays already match.
         let vertexData = mesh.positions.withUnsafeBufferPointer { Data(buffer: $0) }
         let normalData = try mesh.vertexNormals.map { normals in normals.withUnsafeBufferPointer { Data(buffer: $0) } }
             ?? smoothNormals(mesh)
-
-        let solidMap = try validOwners(mesh.triangleSolids, count: triangleCount, solids: mesh.solids)
-        var groups = [Int: [Int32]]()
-        for index in 0..<triangleCount {
-            if index.isMultiple(of: 256) { try Task.checkCancellation() }
-            let solid = solidMap?[index] ?? 0
-            let base = index * 3
-            let corners: [Int32] = [Int32(mesh.triangleIndices[base]), Int32(mesh.triangleIndices[base + 1]),
-                                    Int32(mesh.triangleIndices[base + 2])]
-            groups[solid, default: []].append(contentsOf: corners)
-        }
 
         var solidBounds = [Int: [Double]]()
         for (index, part) in (mesh.partStats ?? []).enumerated() {
@@ -71,14 +71,20 @@ struct CADViewportPreparedMesh: Sendable {
             if part.bounds.count == 6, part.bounds.allSatisfy(\.isFinite) { solidBounds[part.solidIndex] = part.bounds }
         }
         // The worker's part bounds take precedence. Synthetic previews retain
-        // the triangle-buffer fallback without changing fit or ownership.
-        for (solid, indices) in groups where solidBounds[solid] == nil {
-            var bounds = CADSilhouetteBatching.Bounds()
-            for (index, vertex) in indices.enumerated() {
-                if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                bounds.include(mesh.position(Int(vertex)))
+        // the triangle-buffer fallback. Include each vertex once per owner.
+        if groups.keys.contains(where: { solidBounds[$0] == nil }) {
+            var seen = [Int](repeating: -1, count: vertexCount)
+            for (solid, indices) in groups where solidBounds[solid] == nil {
+                var bounds = CADSilhouetteBatching.Bounds()
+                for (offset, vertex) in indices.enumerated() {
+                    if offset.isMultiple(of: 256) { try Task.checkCancellation() }
+                    let index = Int(vertex)
+                    guard seen[index] != solid else { continue }
+                    seen[index] = solid
+                    bounds.include(mesh.position(index))
+                }
+                solidBounds[solid] = bounds.values
             }
-            solidBounds[solid] = bounds.values
         }
 
         let segmentCount = mesh.edgePoints.count.isMultiple(of: 6) ? min(mesh.edgeSegmentCount, 250_000) : 0
@@ -99,11 +105,17 @@ struct CADViewportPreparedMesh: Sendable {
                 creaseEdges += try CADCreaseEdge.group(points: mesh.edgePoints, segments: segments, solid: max(solid, 0))
             }
         }
+        // Every boundary must have an unambiguous owner. On a single-part
+        // preview both the triangles and unowned crease strokes belong to it.
+        let canMapPatches = mesh.solids == 1 || (solidMap != nil && (edgeGroups.isEmpty || owners != nil))
+        let surfacePatches = try canMapPatches
+            ? CADSurfacePatches(positions: mesh.positions, groups: groups, edgePoints: mesh.edgePoints, edgeGroups: edgeGroups)
+            : CADSurfacePatches()
         let field = try CADFieldGeometry.prepare(mesh, solidBounds: solidBounds)
         try Task.checkCancellation()
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
                     groups: groups, solidBounds: solidBounds, edges: edges, creaseEdges: creaseEdges,
-                    hasOwnedEdges: owners != nil, field: field)
+                    surfacePatches: surfacePatches, hasOwnedEdges: owners != nil, field: field)
     }
 
     private static func validBounds(_ bounds: [Double]) -> Bool {
@@ -117,7 +129,7 @@ struct CADViewportPreparedMesh: Sendable {
         guard Self.validBounds(mesh.bounds) else { return nil }
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
                     groups: groups, solidBounds: solidBounds, edges: edges, creaseEdges: creaseEdges,
-                    hasOwnedEdges: hasOwnedEdges, field: field)
+                    surfacePatches: surfacePatches, hasOwnedEdges: hasOwnedEdges, field: field)
     }
 
     /// Buffers another view or capture already prepared for this preview.

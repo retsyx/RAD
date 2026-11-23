@@ -103,17 +103,18 @@ enum CADMeasurements {
                 AssemblySolidTransform.point(point.normal, by: matrix, direction: true))
     }
 
-    /// Rigid placements affect point and part coordinates. Each edge's length
-    /// is the sum of its display segments in the part's built coordinates.
-    static func report(_ preview: PreviewMesh, points: [CADSurfacePoint] = [], edges: [CADCreaseEdge] = [], solids: Set<Int>,
-                       solidTransforms: [Int: [Double]] = [:]) throws -> CADMeasurementReport {
-        guard !solids.isEmpty || !points.isEmpty || !edges.isEmpty else {
-            throw RADError.message("Select a part, edge or surface point to measure.")
+    /// Rigid placements affect point and part coordinates. Edge lengths and
+    /// patch areas come from the display mesh in the part's built coordinates.
+    static func report(_ preview: PreviewMesh, points: [CADSurfacePoint] = [], edges: [CADCreaseEdge] = [],
+                       patches: [CADSurfacePatch] = [], solids: Set<Int>, solidTransforms: [Int: [Double]] = [:]) throws -> CADMeasurementReport {
+        guard !solids.isEmpty || !points.isEmpty || !edges.isEmpty || !patches.isEmpty else {
+            throw RADError.message("Select a part, surface patch, edge or point to measure.")
         }
         guard solids.allSatisfy({ $0 >= 0 && $0 < preview.solids }),
               points.allSatisfy({ $0.isValid && $0.solidIndex < preview.solids }),
               edges.allSatisfy({ $0.isValid && $0.solidIndex < preview.solids }),
-              Set(points).count == points.count, Set(edges).count == edges.count else {
+              patches.allSatisfy({ $0.isValid && $0.solidIndex < preview.solids }),
+              Set(points).count == points.count, Set(edges).count == edges.count, Set(patches).count == patches.count else {
             throw RADError.message("The selection is no longer available. Select it again.")
         }
         var metrics: [CADMeasurementMetric] = []
@@ -124,9 +125,13 @@ enum CADMeasurements {
             let name = edges.count == 1 ? "Edge" : "Edge \(index + 1)"
             add("edge\(index + 1):length", "\(name) length (approx.)", [edge.length], .length)
         }
+        for (index, patch) in patches.enumerated() {
+            let name = patches.count == 1 ? "Patch" : "Patch \(index + 1)"
+            add("patch\(index + 1):area", "\(name) area (approx.)", [patch.area], .area)
+        }
         let posed = points.map { posedPoint($0, transforms: solidTransforms) }
         for (index, point) in posed.enumerated() {
-            let prefix = points.count > 1 || !solids.isEmpty || !edges.isEmpty ? "Point \(index + 1) · " : ""
+            let prefix = points.count > 1 || !solids.isEmpty || !edges.isEmpty || !patches.isEmpty ? "Point \(index + 1) · " : ""
             add(pointPrefix(index) + "position", prefix + "Coordinates X, Y, Z", point.position, .length)
             add(pointPrefix(index) + "normal", prefix + "Normal", point.normal, .scalar)
         }
@@ -172,9 +177,12 @@ enum CADMeasurements {
             add("parts:centroid", "Volume centroid", centroid, .length)
         }
         let title: String
-        if points.count == 1 && solids.isEmpty && edges.isEmpty { title = "Surface point" }
-        else if edges.count == 1 && solids.isEmpty && points.isEmpty { title = "Edge" }
-        else { title = "Measurements" }
+        switch (solids.count, points.count, edges.count, patches.count) {
+        case (0, 1, 0, 0): title = "Surface point"
+        case (0, 0, 1, 0): title = "Edge"
+        case (0, 0, 0, 1): title = "Surface patch"
+        default: title = "Measurements"
+        }
         return CADMeasurementReport(title: title, metrics: metrics, points: points, solidIndices: solids.sorted(),
                                     closestPoints: closestPoints)
     }

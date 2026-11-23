@@ -51,6 +51,7 @@ enum ViewportPointPicking {
 enum CADViewportPick: Equatable {
     case marker(Int)
     case edge(CADCreaseEdge)
+    case patch(CADSurfacePatch)
     case point(CADSurfacePoint)
 }
 
@@ -68,12 +69,14 @@ struct CADViewport: NSViewRepresentable {
     var solidColors: [Int: PartColor] = [:]
     var selectedPoints: [CADSurfacePoint] = []
     var selectedEdges: [CADCreaseEdge] = []
+    var selectedPatches: [CADSurfacePatch] = []
     var solidTransforms: [Int: [Double]] = [:]
     /// Replacing the mesh under the same key keeps the camera.
     var cameraKey: String? = nil
     var onSelectionChanged: ((Set<Int>) -> Void)? = nil
     var onPointSelectionChanged: (([CADSurfacePoint]) -> Void)? = nil
     var onEdgeSelectionChanged: (([CADCreaseEdge]) -> Void)? = nil
+    var onPatchSelectionChanged: (([CADSurfacePatch]) -> Void)? = nil
     var onDeselectAll: (() -> Void)? = nil
     var onHideSelected: (() -> Void)? = nil
     var onShowAll: (() -> Void)? = nil
@@ -92,6 +95,7 @@ struct CADViewport: NSViewRepresentable {
         view.onSelectionChanged = onSelectionChanged
         view.onPointSelectionChanged = onPointSelectionChanged
         view.onEdgeSelectionChanged = onEdgeSelectionChanged
+        view.onPatchSelectionChanged = onPatchSelectionChanged
         view.onDeselectAll = onDeselectAll
         view.onHideSelected = onHideSelected
         view.onShowAll = onShowAll
@@ -104,7 +108,7 @@ struct CADViewport: NSViewRepresentable {
         view.update(mesh: mesh, mode: displayMode, grid: showGrid, command: command,
                     selectedSolids: selectedSolids, hiddenSolids: hiddenSolids, omittedSolids: omittedSolids,
                     projection: projectionMode, solidColors: solidColors, selectedPoints: selectedPoints,
-                    selectedEdges: selectedEdges, solidTransforms: solidTransforms, cameraKey: cameraKey)
+                    selectedEdges: selectedEdges, selectedPatches: selectedPatches, solidTransforms: solidTransforms, cameraKey: cameraKey)
         onViewReady?(view)
     }
 }
@@ -181,6 +185,8 @@ final class CADSceneView: NSView {
     private var selectedSolids = Set<Int>()
     private var selectedPoints = [CADSurfacePoint]()
     private var selectedEdges = [CADCreaseEdge]()
+    private var selectedPatches = [CADSurfacePatch]()
+    private var surfacePatches: CADSurfacePatches?
     private var hoveredFeature: CADViewportPick?
     private var creaseEdges = [CADCreaseEdge]()
     private var creaseProjection: CADCreaseProjection?
@@ -208,7 +214,8 @@ final class CADSceneView: NSView {
     private var commandGrabGesture = false
     private var assemblyGrab: AssemblyGrabGesture?
     private var pointerPoint: NSPoint?
-    private var commandPressed = false
+    private var pointerModifiers: NSEvent.ModifierFlags = []
+    private var commandPressed: Bool { pointerModifiers.contains(.command) }
     private var commandCursorSet = false
     private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
@@ -247,6 +254,9 @@ final class CADSceneView: NSView {
     private var highlightedPoints = [CADSurfacePoint]()
     private var highlightedHover: CADSurfacePoint?
     private var edgeSeeds = [CADCreaseEdge: CADHighlightBuffers.Seeds]()
+    private var highlightedPatches = [CADSurfacePatch]()
+    private var highlightedHoverPatch: CADSurfacePatch?
+    private var patchMasks = [CADSurfacePatch: CADHighlightBuffers.Mask]()
     private var highlightedEdges = [CADCreaseEdge]()
     private var highlightedHoverEdge: CADCreaseEdge?
     private var projectionSize = NSSize.zero
@@ -362,6 +372,10 @@ final class CADSceneView: NSView {
             "solidTransformLayout": "row-major",
             "solidTransforms": solidTransforms.keys.sorted().map { ["solid": $0, "matrix": solidTransforms[$0]!] as [String: Any] },
             // Built (unposed) part coordinates; `solidTransforms` pose them.
+            "selectedPatches": selectedPatches.map {
+                ["solidIndex": $0.solidIndex, "index": $0.index, "area": $0.area, "centroid": $0.centroid, "bounds": $0.bounds,
+                 "point": $0.point, "normal": $0.normal] as [String: Any]
+            },
             "selectedEdges": selectedEdges.map {
                 ["solidIndex": $0.solidIndex, "index": $0.index, "length": $0.length,
                  "closed": $0.points.first == $0.points.last, "landmarks": $0.selectionLandmarks] as [String: Any]
@@ -374,6 +388,7 @@ final class CADSceneView: NSView {
     var onSelectionChanged: ((Set<Int>) -> Void)?
     var onPointSelectionChanged: (([CADSurfacePoint]) -> Void)?
     var onEdgeSelectionChanged: (([CADCreaseEdge]) -> Void)?
+    var onPatchSelectionChanged: (([CADSurfacePatch]) -> Void)?
     var onDeselectAll: (() -> Void)?
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
@@ -490,7 +505,8 @@ final class CADSceneView: NSView {
                 selectedSolids: Set<Int>, hiddenSolids userHidden: Set<Int>, omittedSolids: Set<Int> = [],
                 projection: ViewportProjectionMode = .perspective,
                 solidColors: [Int: PartColor] = [:], selectedPoints: [CADSurfacePoint] = [],
-                selectedEdges: [CADCreaseEdge] = [], solidTransforms: [Int: [Double]] = [:], cameraKey: String? = nil) {
+                selectedEdges: [CADCreaseEdge] = [], selectedPatches: [CADSurfacePatch] = [],
+                solidTransforms: [Int: [Double]] = [:], cameraKey: String? = nil) {
         let hiddenSolids = userHidden.union(omittedSolids)
         let orthographic = projection == .isometric
         let projectionChanged = rig.usesOrthographicProjection != orthographic
@@ -514,6 +530,8 @@ final class CADSceneView: NSView {
         self.selectedPoints = selectedPoints.filter { $0.isValid && seenPoints.insert($0).inserted }
         var seenEdges = Set<CADCreaseEdge>()
         self.selectedEdges = selectedEdges.filter { $0.isValid && seenEdges.insert($0).inserted }
+        var seenPatches = Set<CADSurfacePatch>()
+        self.selectedPatches = selectedPatches.filter { $0.isValid && seenPatches.insert($0).inserted }
         self.hiddenSolids = hiddenSolids
         userHiddenSolids = userHidden
         self.omittedSolids = omittedSolids
@@ -648,6 +666,7 @@ final class CADSceneView: NSView {
         let source = makeSource(prepared.vertexData, semantic: .vertex)
         let normalSource = makeSource(prepared.normalData, semantic: .normal)
         resetHighlightResources()
+        surfacePatches = prepared.surfacePatches
         creaseEdges = prepared.creaseEdges
         meshSources = [source, normalSource]
         let groups = prepared.groups
@@ -874,6 +893,10 @@ final class CADSceneView: NSView {
 
     private func resetHighlightResources() {
         hoveredFeature = nil
+        surfacePatches = nil
+        patchMasks.removeAll()
+        highlightedPatches.removeAll()
+        highlightedHoverPatch = nil
         creaseEdges.removeAll()
         creaseProjection = nil
         edgeSeeds.removeAll()
@@ -893,13 +916,20 @@ final class CADSceneView: NSView {
     private func updateFeatureHighlights() -> Bool {
         var hover: CADSurfacePoint?
         var hoverEdge: CADCreaseEdge?
+        var hoverPatch: CADSurfacePatch?
         switch hoveredFeature {
         case .point(let point) where !selectedPoints.contains(point): hover = point
         case .edge(let edge) where !selectedEdges.contains(edge): hoverEdge = edge
+        case .patch(let patch) where !selectedPatches.contains(patch): hoverPatch = patch
         default: break
         }
         guard highlightedPoints != selectedPoints || highlightedHover != hover ||
-                highlightedEdges != selectedEdges || highlightedHoverEdge != hoverEdge else { return false }
+                highlightedEdges != selectedEdges || highlightedHoverEdge != hoverEdge ||
+                highlightedPatches != selectedPatches || highlightedHoverPatch != hoverPatch else { return false }
+        highlightedPatches = selectedPatches
+        highlightedHoverPatch = hoverPatch
+        let activePatches = Set(selectedPatches + (hoverPatch.map { [$0] } ?? []))
+        patchMasks = patchMasks.filter { activePatches.contains($0.key) }
         highlightedPoints = selectedPoints
         highlightedHover = hover
         highlightedEdges = selectedEdges
@@ -942,6 +972,15 @@ final class CADSceneView: NSView {
             raw.baseAddress.flatMap { device.makeBuffer(bytes: $0, length: data.count, options: .storageModeShared) }
         }
         return meshPositions
+    }
+
+    /// The patch shares the part's positions and references only its triangles.
+    private func patchMask(_ patch: CADSurfacePatch) -> CADHighlightBuffers.Mask? {
+        if let mask = patchMasks[patch] { return mask }
+        guard let device, let indices = surfacePatches?.triangleIndices(for: patch), let positions = highlightPositions(),
+              let mask = CADHighlightBuffers.Mask(device: device, positions: positions, triangleIndices: indices) else { return nil }
+        patchMasks[patch] = mask
+        return mask
     }
 
     /// A selected part's filled projection, sharing its scene geometry indices.
@@ -1017,12 +1056,27 @@ final class CADSceneView: NSView {
             masks.append(item)
             rectangles.append(project(solidBounds[solid] ?? originalMeshBounds, transform))
         }
-        // Disjoint masks share one projection and contour pass; overlapping
-        // masks keep separate passes so nested parts keep their own outline.
-        for batch in CADSilhouetteBatching.make(rectangles) {
-            include(batch.rect)
-            frame.batches.append(.init(rect: batch.rect, masks: batch.items.map { masks[$0] }))
+        // Keep the stored coverage of exact parts independent of patch hover.
+        // Touching masks of either kind need separate contours.
+        func appendBatches() {
+            for batch in CADSilhouetteBatching.make(rectangles) {
+                include(batch.rect)
+                frame.batches.append(.init(rect: batch.rect, masks: batch.items.map { masks[$0] }))
+            }
         }
+        appendBatches()
+        masks.removeAll(keepingCapacity: true)
+        rectangles.removeAll(keepingCapacity: true)
+        func appendPatch(_ patch: CADSurfacePatch, selected: Bool) {
+            guard !hiddenSolids.contains(patch.solidIndex) else { return }
+            let transform = model(patch.solidIndex)
+            guard let rect = project(patch.bounds, transform), let mask = patchMask(patch) else { return }
+            masks.append(.init(buffer: mask, selected: selected, model: transform, outlineClippedCoverage: true))
+            rectangles.append(rect)
+        }
+        for patch in highlightedPatches { appendPatch(patch, selected: true) }
+        if let patch = highlightedHoverPatch { appendPatch(patch, selected: false) }
+        appendBatches()
         frame.highlightBounds = area
         return frame
     }
@@ -1652,7 +1706,7 @@ final class CADSceneView: NSView {
     private func trackPointer(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         pointerPoint = ownsPointer(point) ? point : nil
-        commandPressed = event.modifierFlags.contains(.command)
+        pointerModifiers = event.modifierFlags.intersection([.shift, .option, .command])
     }
 
     private func updateModifiers(with event: NSEvent) {
@@ -1662,14 +1716,14 @@ final class CADSceneView: NSView {
             // target so overlays and the composer retain their own cursors.
             let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
             let owned = ownsPointer(point) ? point : nil
-            let pressed = event.modifierFlags.contains(.command)
-            guard pressed != commandPressed || owned != pointerPoint else { return }
-            commandPressed = pressed
+            let modifiers = event.modifierFlags.intersection([.shift, .option, .command])
+            guard modifiers != pointerModifiers || owned != pointerPoint else { return }
+            pointerModifiers = modifiers
             pointerPoint = owned
         } else {
-            let pressed = event.modifierFlags.contains(.command)
-            guard pressed != commandPressed else { return }
-            commandPressed = pressed
+            let modifiers = event.modifierFlags.intersection([.shift, .option, .command])
+            guard modifiers != pointerModifiers else { return }
+            pointerModifiers = modifiers
         }
         refreshPointerFeedback()
     }
@@ -1690,7 +1744,7 @@ final class CADSceneView: NSView {
 
     private func clearPointerFeedback() {
         pointerPoint = nil
-        commandPressed = false
+        pointerModifiers = []
         if (commandCursorSet || rightGesture?.isDragging == true || otherDragPoint != nil), NSCursor.current === NSCursor.closedHand {
             NSCursor.arrow.set()
         }
@@ -1700,13 +1754,13 @@ final class CADSceneView: NSView {
 
     private func refreshPointerFeedback() {
         updatePointerCursor()
-        guard let point = pointerPoint, !(assemblyGrabbingEnabled && commandPressed),
+        guard let point = pointerPoint, !pointerModifiers.contains(.option), !(assemblyGrabbingEnabled && commandPressed),
               !commandGrabGesture, !isAnimatingCamera, rightGesture == nil,
               NSEvent.pressedMouseButtons == 0 else {
             setHoveredFeature(nil)
             return
         }
-        setHoveredFeature(pickFeature(at: point))
+        setHoveredFeature(pickFeature(at: point, precisePoint: pointerModifiers.contains(.shift)))
     }
 
     private func updateHover(with event: NSEvent) {
@@ -1751,12 +1805,13 @@ final class CADSceneView: NSView {
             }
             return
         }
+        let pick = pickFeature(at: point, precisePoint: event.modifierFlags.contains(.shift))
         if event.clickCount >= 2 {
             setHoveredFeature(nil)
-            if pickFeature(at: point) == nil { deselectAll() }
+            if pick == nil { deselectAll() }
             return
         }
-        switch pickFeature(at: point) {
+        switch pick {
         case .marker(let index):
             var points = selectedPoints
             points.remove(at: index)
@@ -1767,6 +1822,11 @@ final class CADSceneView: NSView {
                 edges.remove(at: index)
                 selectEdges(edges)
             } else { selectEdges(selectedEdges + [edge]) }
+        case .patch(let patch):
+            var patches = selectedPatches
+            if let index = patches.firstIndex(of: patch) { patches.remove(at: index) }
+            else { patches.append(patch) }
+            selectPatches(patches)
         case .point(let point):
             if !selectedPoints.contains(point) { selectPoints(selectedPoints + [point]) }
         case nil: break
@@ -1933,11 +1993,20 @@ final class CADSceneView: NSView {
         requestRedraw()
     }
 
+    private func selectPatches(_ patches: [CADSurfacePatch]) {
+        guard selectedPatches != patches else { return }
+        selectedPatches = patches
+        updateFeatureHighlights()
+        onPatchSelectionChanged?(patches)
+        requestRedraw()
+    }
+
     private func deselectAll() {
         setHoveredFeature(nil)
         select([])
         selectPoints([])
         selectEdges([])
+        selectPatches([])
         onDeselectAll?()
     }
 
@@ -1966,6 +2035,7 @@ final class CADSceneView: NSView {
         let hide = menu.addItem(withTitle: "Hide Selected Parts", action: #selector(menuHideSelected), keyEquivalent: "")
         hide.target = self
         let selectedOwners = selectedSolids.union(selectedPoints.map(\.solidIndex)).union(selectedEdges.map(\.solidIndex))
+            .union(selectedPatches.map(\.solidIndex))
         hide.isEnabled = !selectedOwners.subtracting(hiddenSolids).isEmpty
         if !userHiddenSolids.isEmpty {
             let showAll = menu.addItem(withTitle: "Show All Parts", action: #selector(menuShowAll), keyEquivalent: "")
@@ -1974,7 +2044,7 @@ final class CADSceneView: NSView {
         menu.addItem(.separator())
         let deselect = menu.addItem(withTitle: "Deselect All", action: #selector(menuDeselect), keyEquivalent: "")
         deselect.target = self
-        deselect.isEnabled = !selectedSolids.isEmpty || !selectedPoints.isEmpty || !selectedEdges.isEmpty
+        deselect.isEnabled = !selectedSolids.isEmpty || !selectedPoints.isEmpty || !selectedEdges.isEmpty || !selectedPatches.isEmpty
         menu.autoenablesItems = false
         return menu
     }
@@ -2017,14 +2087,15 @@ final class CADSceneView: NSView {
         return picked.isValid ? picked : nil
     }
 
-    /// Markers remain clickable through surfaces. A nearby drawn crease
-    /// takes precedence over adding a new surface point.
-    func pickFeature(at point: NSPoint) -> CADViewportPick? {
+    /// Point markers can be removed in either mode. Shift takes the exact
+    /// clicked position on the visible surface, even next to a crease.
+    func pickFeature(at point: NSPoint, precisePoint: Bool = false) -> CADViewportPick? {
         guard hasModel, !isPreparingResources, bounds.contains(point) else { return nil }
         let cursor = SIMD2(Double(point.x), Double(point.y))
         if let index = ViewportPointPicking.marker(at: cursor, in: selectedPoints, screen: screenPosition(of:)) {
             return .marker(index)
         }
+        if precisePoint { return surfacePoint(at: point).map(CADViewportPick.point) }
         if !creaseEdges.isEmpty, mode != .shaded || !selectedEdges.isEmpty, let projection = pickingProjection() {
             if creaseProjection == nil {
                 creaseProjection = CADCreaseProjection(edges: creaseEdges, projection: projection,
@@ -2044,7 +2115,9 @@ final class CADSceneView: NSView {
                 return depth <= surfaceDepth + max(1e-6, depth * 2e-6)
             }) { return .edge(edge) }
         }
-        return surfacePoint(at: point).map(CADViewportPick.point)
+        guard mode != .wireframe, let hit = visibleHit(at: point), let solid = solidIndex(of: hit.node),
+              let patch = surfacePatches?.patch(solid: solid, faceIndex: hit.faceIndex) else { return nil }
+        return .patch(patch)
     }
 
     /// A point's marker position in view coordinates at its part's current

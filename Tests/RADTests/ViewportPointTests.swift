@@ -39,10 +39,10 @@ final class ViewportPointTests: XCTestCase {
         XCTAssertEqual(picked.normal[2], 1, accuracy: 1e-6)
         XCTAssertTrue(picked.isValid)
 
-        view.mouseDown(with: try click(at: target))
+        view.mouseDown(with: try click(at: target, modifiers: .shift))
         XCTAssertEqual(selections.count, 1)
         let first = try XCTUnwrap(selections.last?.first)
-        view.mouseDown(with: try click(at: point([9, 7, 0], in: view)))
+        view.mouseDown(with: try click(at: point([9, 7, 0], in: view), modifiers: .shift))
         let second = try XCTUnwrap(selections.last?.last)
         XCTAssertEqual(selections.last?.count, 2)
         XCTAssertEqual(second.point[0], 5, accuracy: 1e-3)
@@ -196,7 +196,7 @@ final class ViewportPointTests: XCTestCase {
         XCTAssertEqual(metadata["length"] as? Double, edge.length)
         XCTAssertEqual((metadata["landmarks"] as? [[Double]])?.count, 3)
 
-        view.mouseDown(with: try click(at: point([0, 0, 0], in: view)))
+        view.mouseDown(with: try click(at: point([0, 0, 0], in: view), modifiers: .shift))
         XCTAssertEqual(points.last?.count, 1)
         view.mouseDown(with: try click(at: second))
         XCTAssertEqual(edges.last, [], "Clicking another segment toggles the same edge off.")
@@ -222,7 +222,7 @@ final class ViewportPointTests: XCTestCase {
                         selectedSolids: [], hiddenSolids: [], projection: projection)
             try await waitForPreparation(view)
             let center = point([0, 0, 0], in: view)
-            guard case .point(let cover) = view.pickFeature(at: center) else {
+            guard case .patch(let cover) = view.pickFeature(at: center) else {
                 return XCTFail("The front part hides the rear crease.")
             }
             XCTAssertEqual(cover.solidIndex, 1)
@@ -254,6 +254,60 @@ final class ViewportPointTests: XCTestCase {
             XCTAssertTrue(view.makeFrame(width: 640, height: 480).seeds.isEmpty)
             XCTAssertNil(view.pickFeature(at: point([8, 0, 0], in: view)))
         }
+    }
+
+    @MainActor
+    func testShiftSwitchesStationaryHoverAndPicksAPointEvenBesideACrease() async throws {
+        let view = try makeView()
+        let preview = mesh()
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        let rim = point([0, -10, 0], in: view)
+        let interior = point([0, 0, 0], in: view)
+        let nearEdge = NSPoint(x: rim.x, y: rim.y + (interior.y > rim.y ? 2 : -2))
+        guard case .edge = view.pickFeature(at: nearEdge) else { return XCTFail("Expected the ordinary crease.") }
+        func flags(_ flags: NSEvent.ModifierFlags) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: .flagsChanged, location: interior, modifierFlags: flags, timestamp: 0,
+                windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56))
+        }
+        func move(_ point: NSPoint) throws {
+            view.mouseMoved(with: try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
+                timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0)))
+        }
+        try move(interior)
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).batches.flatMap(\.masks).map(\.selected), [false])
+        view.flagsChanged(with: try flags(.shift))
+        var frame = view.makeFrame(width: 640, height: 480)
+        XCTAssertEqual(frame.seeds.map(\.channel), [.hoveredVertex])
+        XCTAssertTrue(frame.batches.isEmpty)
+        view.flagsChanged(with: try flags([]))
+        frame = view.makeFrame(width: 640, height: 480)
+        XCTAssertTrue(frame.seeds.isEmpty)
+        XCTAssertEqual(frame.batches.flatMap(\.masks).map(\.selected), [false])
+
+        var points = [CADSurfacePoint](), patches = [CADSurfacePatch]()
+        view.onPointSelectionChanged = { points = $0 }
+        view.onPatchSelectionChanged = { patches = $0 }
+        view.mouseDown(with: try click(at: nearEdge, modifiers: .shift))
+        XCTAssertEqual(points.count, 1)
+        XCTAssertTrue(patches.isEmpty)
+        view.mouseDown(with: try click(at: interior))
+        let patch = try XCTUnwrap(patches.first)
+        let moved = [0: [1.0,0,0,3, 0,1,0,6, 0,0,1,4, 0,0,0,1]]
+        view.update(mesh: preview, mode: .shaded, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                    selectedPatches: [patch], solidTransforms: moved)
+        XCTAssertEqual(view.pickFeature(at: point([3, 6, 4], in: view)), .patch(patch))
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).batches.first?.masks.first?.model.columns.3, [3,6,4,1])
+        view.update(mesh: preview, mode: .wireframe, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        XCTAssertNil(view.pickFeature(at: interior), "Wireframe has no filled face to select.")
+        guard case .point = view.pickFeature(at: interior, precisePoint: true) else {
+            return XCTFail("An explicit point pick still works in wireframe.")
+        }
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [0],
+                    selectedPatches: [patch])
+        XCTAssertNil(view.pickFeature(at: interior))
+        XCTAssertTrue(view.makeFrame(width: 640, height: 480).batches.isEmpty)
     }
 
     @MainActor

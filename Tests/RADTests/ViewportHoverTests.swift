@@ -183,10 +183,10 @@ final class ViewportHoverTests: XCTestCase {
     @MainActor
     private func event(_ type: NSEvent.EventType, at point: NSPoint) throws -> NSEvent {
         if type == .mouseEntered || type == .mouseExited {
-            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: .shift, timestamp: 0,
                 windowNumber: 0, context: nil, eventNumber: 1, trackingNumber: 0, userData: nil))
         }
-        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: .shift, timestamp: 0,
             windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0))
     }
 

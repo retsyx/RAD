@@ -3,6 +3,15 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+private protocol SurfacePick: Hashable {
+    var solidIndex: Int { get }
+    var isValid: Bool { get }
+}
+
+extension CADSurfacePoint: SurfacePick {}
+extension CADCreaseEdge: SurfacePick {}
+extension CADSurfacePatch: SurfacePick {}
+
 /// Observation tracks each property separately, so a view re-renders only
 /// when the state it actually reads changes.
 @MainActor
@@ -142,28 +151,32 @@ final class AppState {
     var selectedSolids: Set<Int> = [] {
         didSet { if selectedSolids != oldValue { refreshMeasurements() } }
     }
-    /// Points and crease edges in built coordinates on the displayed geometry.
+    /// Surface features in built coordinates on the displayed geometry.
     private struct SurfaceSelection: Equatable {
         var points: [CADSurfacePoint] = []
         var edges: [CADCreaseEdge] = []
-        var isEmpty: Bool { points.isEmpty && edges.isEmpty }
+        var patches: [CADSurfacePatch] = []
+        var isEmpty: Bool { points.isEmpty && edges.isEmpty && patches.isEmpty }
 
         func excluding(_ solids: Set<Int>) -> Self {
             guard !solids.isEmpty else { return self }
             return Self(points: points.filter { !solids.contains($0.solidIndex) },
-                        edges: edges.filter { !solids.contains($0.solidIndex) })
+                        edges: edges.filter { !solids.contains($0.solidIndex) },
+                        patches: patches.filter { !solids.contains($0.solidIndex) })
         }
     }
     private var surfaceSelection = SurfaceSelection() {
         didSet {
             guard surfaceSelection != oldValue else { return }
-            let owners = Set(selectedPoints.map(\.solidIndex)).union(selectedEdges.map(\.solidIndex))
+            let owners = Set(selectedPoints.map(\.solidIndex))
+                .union(selectedEdges.map(\.solidIndex)).union(selectedPatches.map(\.solidIndex))
             if owners != featureSelectedSolids { featureSelectedSolids = owners }
             refreshMeasurements()
         }
     }
     var selectedPoints: [CADSurfacePoint] { surfaceSelection.points }
     var selectedEdges: [CADCreaseEdge] { surfaceSelection.edges }
+    var selectedPatches: [CADSurfacePatch] { surfaceSelection.patches }
     /// Cached ownership keeps each parts-tree row independent of the number of picks.
     private(set) var featureSelectedSolids: Set<Int> = []
     private struct SurfaceSelectionGeometry {
@@ -786,11 +799,13 @@ final class AppState {
             let geometry = displayedMesh.map(displayedSurfaceGeometry) ?? surfaceSelectionGeometry
             return ProjectSelectionContext.capture(revisionID: revisionID, preview: geometry?.preview, nodes: partTree,
                 selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs,
-                selectedPoints: selectedPoints, selectedEdges: selectedEdges, printVersion: geometry?.printVersion ?? printVersionView)
+                selectedPoints: selectedPoints, selectedEdges: selectedEdges, selectedPatches: selectedPatches,
+                printVersion: geometry?.printVersion ?? printVersionView)
         }
         return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
             selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs,
-            selectedPoints: selectedPoints, selectedEdges: selectedEdges, assemblyPose: assemblyPose)
+            selectedPoints: selectedPoints, selectedEdges: selectedEdges, selectedPatches: selectedPatches,
+            assemblyPose: assemblyPose)
     }
 
     func editQueuedRequest(id: UUID, text: String) {
@@ -1573,29 +1588,20 @@ final class AppState {
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: tree)
     }
 
-    /// Replaces the viewport's point selection, keeping valid points on
-    /// visible parts of the displayed build in their selection order.
-    func selectPoints(_ points: [CADSurfacePoint]) {
-        guard let preview = displayedMesh else { return }
-        var seen = Set<CADSurfacePoint>()
-        let valid = points.filter {
-            $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hiddenSolids.contains($0.solidIndex) &&
-                seen.insert($0).inserted
-        }
-        setSurfaceSelection(SurfaceSelection(points: valid, edges: selectedEdges), on: preview)
-    }
+    func selectPoints(_ points: [CADSurfacePoint]) { select(points, at: \.points) }
+    func selectEdges(_ edges: [CADCreaseEdge]) { select(edges, at: \.edges) }
+    func selectPatches(_ patches: [CADSurfacePatch]) { select(patches, at: \.patches) }
 
-    func selectEdges(_ edges: [CADCreaseEdge]) {
+    private func select<Item: SurfacePick>(_ items: [Item], at keyPath: WritableKeyPath<SurfaceSelection, [Item]>) {
         guard let preview = displayedMesh else { return }
-        var seen = Set<CADCreaseEdge>()
-        let valid = edges.filter {
-            $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hiddenSolids.contains($0.solidIndex) &&
-                seen.insert($0).inserted
+        let hidden = hiddenSolids.union(displayedOmittedSolids)
+        var seen = Set<Item>()
+        var selection = surfaceSelection
+        selection[keyPath: keyPath] = items.filter {
+            $0.isValid && (0..<preview.solids).contains($0.solidIndex) && !hidden.contains($0.solidIndex)
+                && seen.insert($0).inserted
         }
-        setSurfaceSelection(SurfaceSelection(points: selectedPoints, edges: valid), on: preview)
-    }
-
-    private func setSurfaceSelection(_ selection: SurfaceSelection, on preview: PreviewMesh) {
+        guard selection != surfaceSelection else { return }
         surfaceSelectionGeometry = displayedSurfaceGeometry(preview)
         surfaceSelectionOrigin = selection.isEmpty ? nil : (Self.printKey(preview), selection)
         surfaceSelection = selection
@@ -1616,14 +1622,12 @@ final class AppState {
     private func showSurfaceSelection() {
         guard let preview = displayedMesh else { return }
         let build = Self.printKey(preview)
-        let changed = surfaceSelectionGeometry.map { Self.printKey($0.preview) } != build
         surfaceSelectionGeometry = displayedSurfaceGeometry(preview)
-        guard changed else { return }
         guard let origin = surfaceSelectionOrigin, origin.build == build else {
             surfaceSelection = SurfaceSelection()
             return
         }
-        surfaceSelection = origin.selection.excluding(hiddenSolids)
+        surfaceSelection = origin.selection.excluding(hiddenSolids.union(displayedOmittedSolids))
     }
 
     private func cancelMeasurement() {
@@ -1726,7 +1730,7 @@ final class AppState {
             assemblyPose = pose
             requestedJointPositions = pose.positions
             agentStateGeneration &+= 1
-            // Rigid motion preserves every selected edge's length.
+            // Edge lengths and patch areas are invariant under rigid motion.
             if !selectedPoints.isEmpty || !selectedSolids.isEmpty { refreshMeasurements() }
         }
         if fit { viewportCommand = ViewportCommand(.fit) }
@@ -2005,17 +2009,17 @@ final class AppState {
         cancelMeasurement()
         measurementError = nil
         guard let preview = displayedMesh, hasMeasurementSelection else { measurementReport = nil; return }
-        let points = selectedPoints, edges = selectedEdges, solids = selectedSolids
+        let points = selectedPoints, edges = selectedEdges, patches = selectedPatches, solids = selectedSolids
         let transforms = displayedSolidTransforms
         // Only a pair that needs the worker's minimum distance has a cache entry.
         let key: MeasurementKey?
-        if edges.isEmpty, CADMeasurements.workerEntities(points: points, solids: solids) != nil {
+        if edges.isEmpty, patches.isEmpty, CADMeasurements.workerEntities(points: points, solids: solids) != nil {
             key = MeasurementKey(buildID: preview.buildID, points: points, solids: solids.sorted(),
                                  transforms: AssemblySolidTransform.records(transforms))
         } else { key = nil }
         if let key, let cached = measurementCache[key] { measurementReport = cached; return }
         do {
-            measurementReport = try CADMeasurements.report(preview, points: points, edges: edges,
+            measurementReport = try CADMeasurements.report(preview, points: points, edges: edges, patches: patches,
                                                            solids: solids, solidTransforms: transforms)
         } catch { measurementReport = nil; measurementError = error.localizedDescription; return }
         guard let key else { return }

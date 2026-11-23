@@ -34,7 +34,8 @@ final class AppStatePrintViewTests: XCTestCase {
         state.selectedRevisionID = revision.id
         XCTAssertTrue(state.loadStoredRevision())
         state.selectParts([1])
-        let creases = try XCTUnwrap(CADViewportPreparedMesh.prepareShared(preview)).creaseEdges
+        let prepared = try XCTUnwrap(CADViewportPreparedMesh.prepareShared(preview))
+        let creases = prepared.creaseEdges
         let rims = creases.filter { $0.solidIndex == 1 }
         XCTAssertEqual(rims.count, 2, "Each circular end of the cylindrical peg is one selectable edge.")
         for rim in rims {
@@ -43,6 +44,8 @@ final class AppStatePrintViewTests: XCTestCase {
         }
         let edge = try XCTUnwrap(creases.first { $0.solidIndex == 0 })
         state.selectEdges([edge])
+        let patch = try firstPatch(in: prepared, solid: 0)
+        state.selectPatches([patch])
 
         // The design itself, oriented and packed.
         let cameraKey = state.viewportCameraKey
@@ -54,6 +57,8 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         XCTAssertEqual(state.selectedEdges, [edge], "Placing the original part on the plate preserves its edge.")
         XCTAssertEqual(state.measurementReport?.metrics.first { $0.id == "edge1:length" }?.values, [edge.length])
+        XCTAssertEqual(state.selectedPatches, [patch])
+        XCTAssertEqual(state.measurementReport?.metrics.first { $0.id == "patch1:area" }?.values, [patch.area])
         state.printLayoutView = false
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
@@ -72,6 +77,7 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(state.selectedSolids, [1])
         XCTAssertEqual(state.measurementReport?.solidIndices, [1])
         XCTAssertTrue(state.selectedEdges.isEmpty, "The alternate geometry has its own edges.")
+        XCTAssertTrue(state.selectedPatches.isEmpty, "The alternate geometry has its own patches.")
 
         // Both: the printing version oriented and packed, as exported.
         state.printLayoutView = true
@@ -112,6 +118,7 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(state.displayedMesh?.buildID, preview.buildID)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         XCTAssertEqual(state.selectedEdges, [edge], "Returning to the original build restores its edge.")
+        XCTAssertEqual(state.selectedPatches, [patch])
         state.printVersionView = true
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedSolidTransforms, layout)
@@ -155,18 +162,26 @@ final class AppStatePrintViewTests: XCTestCase {
         state.selectParts([1, 2])
         XCTAssertEqual(state.measurementReport?.solidIndices, [1, 2])
         state.clearSelections()
+        let prepared = try XCTUnwrap(CADViewportPreparedMesh.prepareShared(preview))
+        let referencePatch = try firstPatch(in: prepared, solid: 2)
+        state.selectPatches([referencePatch])
 
         // The plate holds the printed parts only; the printing version is the same geometry.
         state.printLayoutView = true
         try await waitForPrintView(state)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         XCTAssertEqual(state.displayedOmittedSolids, [2])
+        XCTAssertTrue(state.selectedPatches.isEmpty)
+        state.selectPatches([referencePatch])
+        XCTAssertTrue(state.selectedPatches.isEmpty, "An omitted reference part cannot be picked in the layout.")
+        XCTAssertNil(state.measurementReport)
         state.printVersionView = true
         try await waitForPrintView(state)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         XCTAssertEqual(state.displayedOmittedSolids, [2])
         state.printLayoutView = false
         XCTAssertTrue(state.displayedOmittedSolids.isEmpty, "The printing version keeps its reference parts")
+        XCTAssertEqual(state.selectedPatches, [referencePatch], "The original part is displayed again.")
         state.printVersionView = false
 
         let printing = directory.appendingPathComponent("printing.3mf")
@@ -191,6 +206,11 @@ final class AppStatePrintViewTests: XCTestCase {
         while state.isWorking, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(state.error?.contains("reference parts, which are not printed") == true, state.error ?? "no error")
         XCTAssertFalse(FileManager.default.fileExists(atPath: board.path))
+    }
+
+    private func firstPatch(in prepared: CADViewportPreparedMesh, solid: Int) throws -> CADSurfacePatch {
+        let count = try XCTUnwrap(prepared.groups[solid]).count / 3
+        return try XCTUnwrap((0..<count).lazy.compactMap { prepared.surfacePatches.patch(solid: solid, faceIndex: $0) }.first)
     }
 
     @MainActor

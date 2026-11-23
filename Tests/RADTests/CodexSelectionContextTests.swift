@@ -18,7 +18,7 @@ final class CodexSelectionContextTests: XCTestCase {
         XCTAssertEqual(file.selection, selection)
         XCTAssertEqual(file.originRecipeStatus, "available")
         XCTAssertFalse(file.originMatchesCurrent)
-        XCTAssertTrue(request.contains("1 selected parts and 1 selected points"))
+        XCTAssertTrue(request.contains("(parts, surface patches, edges, points): 1, 0, 0, 1"))
         XCTAssertTrue(request.contains("never reuse them blindly"))
         XCTAssertFalse(request.contains("SELECTION_NAME_STAYS_LOCAL"))
         XCTAssertFalse(request.contains("ORIGIN_PROGRAM_STAYS_LOCAL"))

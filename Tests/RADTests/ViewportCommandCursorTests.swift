@@ -92,6 +92,25 @@ final class ViewportCommandCursorTests: XCTestCase {
     }
 
     @MainActor
+    func testStationaryShiftInTheKeyWindowSwitchesBetweenPatchAndPointWithoutMovingEditorFocus() async throws {
+        let host = try Host()
+        defer { host.close() }
+        try await host.ready()
+        XCTAssertTrue(host.window.makeFirstResponder(host.editor))
+        host.view.mouseMoved(with: try mouse(.mouseMoved, at: host.center, host: host))
+        func frame() -> CADViewportFrame { host.view.makeFrame(width: 640, height: 400) }
+        XCTAssertEqual(frame().batches.flatMap(\.masks).map(\.selected), [false])
+        NSApplication.shared.sendEvent(try flags(.shift, host: host))
+        XCTAssertEqual(frame().seeds.map(\.channel), [.hoveredVertex])
+        XCTAssertTrue(frame().batches.isEmpty)
+        NSApplication.shared.sendEvent(try flags([], host: host))
+        XCTAssertTrue(frame().seeds.isEmpty)
+        XCTAssertEqual(frame().batches.flatMap(\.masks).map(\.selected), [false])
+        XCTAssertTrue(host.window.firstResponder === host.editor)
+        XCTAssertEqual(host.editor.modifierEvents, 2)
+    }
+
+    @MainActor
     func testModifierEventsBelongToTheirKeyWindowAndDeactivationClearsHand() async throws {
         let first = try Host(origin: NSPoint(x: 50, y: 50))
         defer { first.close() }
@@ -187,13 +206,13 @@ final class ViewportCommandCursorTests: XCTestCase {
         let point = view.projectPoint(SCNVector3Zero)
         let center = NSPoint(x: CGFloat(point.x), y: CGFloat(point.y))
         func channels() -> [CADViewportFrame.SeedChannel] { view.makeFrame(width: 64, height: 64).seeds.map(\.channel) }
-        view.mouseMoved(with: try unattachedMouse(.mouseMoved, point: center))
+        view.mouseMoved(with: try unattachedMouse(.mouseMoved, point: center, modifiers: .shift))
         XCTAssertEqual(channels(), [.selectedVertex, .hoveredVertex])
-        view.flagsChanged(with: try flags(.command, windowNumber: 0))
+        view.flagsChanged(with: try flags([.shift, .command], windowNumber: 0))
         XCTAssertEqual(channels(), [.selectedVertex], "Pressing Command clears the stationary hover marker immediately.")
         XCTAssertTrue(NSCursor.current === NSCursor.closedHand)
         XCTAssertEqual(changes, 0)
-        view.flagsChanged(with: try flags([], windowNumber: 0))
+        view.flagsChanged(with: try flags(.shift, windowNumber: 0))
         XCTAssertTrue(NSCursor.current === NSCursor.arrow)
         XCTAssertEqual(channels(), [.selectedVertex, .hoveredVertex],
                        "Modifier release repicks the stationary pointer without losing selection.")

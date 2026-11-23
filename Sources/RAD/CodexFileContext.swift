@@ -56,6 +56,7 @@ struct CodexFileContext: Sendable {
     var selectionPartCount = 0
     var selectionPointCount = 0
     var selectionEdgeCount = 0
+    var selectionPatchCount = 0
     var selectionOriginMatchesCurrent = false
     var selectionManifestPath: String? = nil
 
@@ -211,6 +212,7 @@ struct CodexFileContext: Sendable {
             files.selectionPartCount = selection.parts.count
             files.selectionPointCount = selection.points.count
             files.selectionEdgeCount = selection.edges?.count ?? 0
+            files.selectionPatchCount = selection.patches?.count ?? 0
             files.selectionOriginMatchesCurrent = staged.originMatchesCurrent
         }
         let requestSelectionRevisionID = selection?.revisionID

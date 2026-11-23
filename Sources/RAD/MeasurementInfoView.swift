@@ -9,7 +9,9 @@ struct MeasurementInfoView: View {
         metrics.filter { $0.id.hasPrefix("pair:") || $0.id.hasPrefix("triangle:") }
     }
     private var partMetrics: [CADMeasurementMetric] { metrics.filter { $0.id.hasPrefix("parts:") } }
-    private var edgeMetrics: [CADMeasurementMetric] { metrics.filter { $0.id.hasPrefix("edge") } }
+    private var surfaceMetrics: [CADMeasurementMetric] {
+        metrics.filter { $0.id.hasPrefix("edge") || $0.id.hasPrefix("patch") }
+    }
     /// Each selected point's metrics, in selection order.
     private var pointGroups: [[CADMeasurementMetric]] {
         (0..<(state.measurementReport?.points.count ?? 0)).map { index in
@@ -47,11 +49,11 @@ struct MeasurementInfoView: View {
                 metricList(partMetrics)
             }
 
-            if !edgeMetrics.isEmpty { metricList(edgeMetrics) }
+            if !surfaceMetrics.isEmpty { metricList(surfaceMetrics) }
 
             ForEach(Array(pointGroups.enumerated()), id: \.offset) { index, group in
                 VStack(alignment: .leading, spacing: 6) {
-                    if pointGroups.count > 1 || !partMetrics.isEmpty || !edgeMetrics.isEmpty {
+                    if pointGroups.count > 1 || !partMetrics.isEmpty || !surfaceMetrics.isEmpty {
                         Text("Point \(index + 1)")
                             .font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.muted)
                     }

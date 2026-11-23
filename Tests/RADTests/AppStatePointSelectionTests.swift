@@ -178,6 +178,53 @@ final class AppStatePointSelectionTests: XCTestCase {
     }
 
     @MainActor
+    func testPatchSelectionMeasuresAreaAndTracksOnlyPartialOwnership() throws {
+        let state = try fixture()
+        let front = CADSurfacePatch(solidIndex: 0, index: 0, area: 0.5, centroid: [0.3, 0.3, 0],
+                                    bounds: [0, 0, 0, 1, 1, 0], point: [0.25, 0.25, 0], normal: [0, 0, 1])
+        let side = CADSurfacePatch(solidIndex: 1, index: 0, area: 1, centroid: [5, 0.5, 0.5],
+                                   bounds: [5, 0, 0, 5, 1, 1], point: [5, 0.25, 0.25], normal: [-1, 0, 0])
+        state.selectPatches([front, side, front])
+        XCTAssertEqual(state.selectedPatches, [front, side])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 1])
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+        XCTAssertFalse(state.canExportSelectedParts)
+        XCTAssertEqual(try values(state, "patch1:area"), [0.5])
+        XCTAssertEqual(try values(state, "patch2:area"), [1])
+        XCTAssertEqual(state.measurementReport?.metrics.first?.unit, .area)
+
+        let edge = CADCreaseEdge(solidIndex: 0, index: 0, points: [[0, 0, 0], [1, 0, 0]])
+        state.selectPoints([point(2, 0)])
+        state.selectEdges([edge])
+        state.selectParts([2])
+        XCTAssertEqual(state.selectedPatches, [front, side])
+        XCTAssertEqual(state.featureSelectedSolids, [0, 1, 2])
+        XCTAssertEqual(try values(state, "parts:count"), [1])
+        XCTAssertFalse(state.isMeasuring)
+        state.togglePartVisibility([1])
+        XCTAssertEqual(state.selectedPatches, [front])
+        state.selectPatches([front, side])
+        XCTAssertEqual(state.selectedPatches, [front])
+        state.togglePartVisibility([1])
+        XCTAssertEqual(state.selectedPatches, [front])
+
+        state.hideSelectedParts()
+        XCTAssertEqual(state.hiddenSolids, [0, 2])
+        XCTAssertTrue(state.selectedPatches.isEmpty)
+        XCTAssertNil(state.measurementReport)
+        state.showAllParts()
+        state.selectPatches([front])
+        state.selectPatches([])
+        XCTAssertNil(state.measurementReport)
+        state.selectPatches([front])
+        let replacement = state.mesh
+        state.mesh = replacement
+        XCTAssertTrue(state.selectedPatches.isEmpty)
+        XCTAssertTrue(state.featureSelectedSolids.isEmpty)
+        XCTAssertNil(state.measurementReport)
+    }
+
+    @MainActor
     func testVisibilityToggleRemovesOnlyPointsOwnedByTheHiddenParts() throws {
         let state = try fixture()
         let a = point(0, 0), b = point(1, 0), c = point(2, 0)

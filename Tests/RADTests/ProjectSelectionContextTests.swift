@@ -147,6 +147,38 @@ final class ProjectSelectionContextTests: XCTestCase {
         XCTAssertThrowsError(try invalid.validate())
     }
 
+    func testPatchOnlyRequestKeepsItsBuiltSurfaceLandmarksThroughSaveAndStaging() throws {
+        let patch = CADSurfacePatch(solidIndex: 1, index: 7, area: 16, centroid: [2, 2, 6],
+                                    bounds: [0, 0, 6, 4, 4, 6], point: [1, 2, 6], normal: [0, 0, 1])
+        let selected = try XCTUnwrap(ProjectSelectionContext.capture(revisionID: UUID(), preview: preview(),
+            nodes: hierarchy(), selectedSolids: [], selectedNodeIDs: [], selectedPatches: [patch, patch]))
+        let saved = try XCTUnwrap(selected.patches)
+        XCTAssertEqual(saved, [ProjectSelectedPatch(partID: "lid", name: "Lid", path: ["Case", "Lid"],
+            solidIndex: 1, area: 16, centroid: [2, 2, 6], bounds: [0, 0, 6, 4, 4, 6], point: [1, 2, 6], normal: [0, 0, 1])])
+        XCTAssertTrue(selected.parts.isEmpty && selected.points.isEmpty)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Patches.rad", isDirectory: true)
+        let queued = ProjectQueuedRequest(content: "Move this surface", selection: selected)
+        let project = RADProject(messages: [], revisions: [], selectedRevisionID: nil, queuedRequests: [queued])
+        try ProjectPackage.write(project, to: url)
+        let restored = try XCTUnwrap(ProjectStore.read(from: url).queuedRequests?.first?.selection)
+        let files = try CodexFileContext.prepare(current: nil, history: [], attachments: [], directory: directory, selection: restored)
+        XCTAssertEqual(files.selectionPatchCount, 1)
+        let file = try XCTUnwrap(files.selectionPath)
+        let bytes = try Data(contentsOf: URL(fileURLWithPath: file))
+        XCTAssertEqual(try JSONDecoder().decode(CodexSelectionFile.self, from: bytes).selection, selected)
+
+        var invalid = selected
+        invalid.patches?[0].area = -1
+        XCTAssertThrowsError(try invalid.validate())
+        invalid = selected
+        invalid.patches?[0].normal = [0, 0, 0]
+        XCTAssertThrowsError(try invalid.validate())
+    }
+
     func testInvalidPointsCannotEnterAProjectArchive() throws {
         let point = CADSurfacePoint(solidIndex: 0, point: [4, 1, 1], normal: [1, 0, 0])
         let original = try XCTUnwrap(ProjectSelectionContext.capture(revisionID: UUID(), preview: preview(), nodes: hierarchy(),

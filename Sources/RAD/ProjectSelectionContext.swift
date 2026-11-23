@@ -44,6 +44,20 @@ struct ProjectSelectedEdge: Codable, Sendable, Equatable {
     var landmarks: [[Double]]
 }
 
+/// Request landmarks in built coordinates. The normal is local to the
+/// representative point, including on curved patches.
+struct ProjectSelectedPatch: Codable, Sendable, Equatable {
+    var partID: String
+    var name: String
+    var path: [String]
+    var solidIndex: Int
+    var area: Double
+    var centroid: [Double]
+    var bounds: [Double]
+    var point: [Double]
+    var normal: [Double]
+}
+
 extension CADCreaseEdge {
     /// Open edges include their endpoints and midpoint. Closed rims use
     /// three positions spaced around the loop, all in built coordinates.
@@ -78,6 +92,7 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     /// Surface points in the user's selection order.
     var points: [ProjectSelectedPoint]
     var edges: [ProjectSelectedEdge]? = nil
+    var patches: [ProjectSelectedPatch]? = nil
     /// Reproduce the selected mechanism pose when reconciling an older request.
     var jointPositions: [String: Double]? = nil
     /// Captured in the 3D printing version view: points and anchors belong to
@@ -87,12 +102,13 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     static let maximumParts = 8_192
     static let maximumPoints = 8_192
     static let maximumEdges = 8_192
+    static let maximumPatches = 8_192
 
-    var isEmpty: Bool { parts.isEmpty && points.isEmpty && (edges ?? []).isEmpty }
+    var isEmpty: Bool { parts.isEmpty && points.isEmpty && (edges ?? []).isEmpty && (patches ?? []).isEmpty }
 
     static func capture(revisionID: UUID, preview: PreviewMesh?, nodes: [PartNode],
                         selectedSolids: Set<Int>, selectedNodeIDs: Set<String>, selectedPoints: [CADSurfacePoint] = [],
-                        selectedEdges: [CADCreaseEdge] = [],
+                        selectedEdges: [CADCreaseEdge] = [], selectedPatches: [CADSurfacePatch] = [],
                         assemblyPose: AssemblyPose? = nil, printVersion: Bool = false) -> ProjectSelectionContext? {
         struct Owner {
             var id: String
@@ -150,9 +166,17 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
                     solidIndex: edge.solidIndex, closed: edge.points.first == edge.points.last,
                     length: edge.length, landmarks: edge.selectionLandmarks)
             }
-        guard !parts.isEmpty || !points.isEmpty || !edges.isEmpty else { return nil }
+        var seenPatches = Set<CADSurfacePatch>()
+        let patches = selectedPatches.filter { $0.isValid && $0.solidIndex < solidCount && seenPatches.insert($0).inserted }
+            .prefix(maximumPatches).map { patch in
+                let identity = owner(patch.solidIndex)
+                return ProjectSelectedPatch(partID: identity.id, name: identity.name, path: identity.path,
+                    solidIndex: patch.solidIndex, area: patch.area, centroid: patch.centroid, bounds: patch.bounds,
+                    point: patch.point, normal: patch.normal)
+            }
+        guard !parts.isEmpty || !points.isEmpty || !edges.isEmpty || !patches.isEmpty else { return nil }
         return ProjectSelectionContext(revisionID: revisionID, parts: parts, points: Array(points),
-                                       edges: edges.isEmpty ? nil : edges,
+                                       edges: edges.isEmpty ? nil : edges, patches: patches.isEmpty ? nil : patches,
                                        jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil,
                                        printVersion: printVersion ? true : nil)
     }
@@ -183,11 +207,17 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
         func surfacePoint(_ point: ProjectSelectedPoint) -> CADSurfacePoint {
             CADSurfacePoint(solidIndex: point.solidIndex, point: point.point, normal: point.normal)
         }
+        func validPatch(_ patch: ProjectSelectedPatch) -> Bool {
+            text(patch.partID) && text(patch.name) && path(patch.path) &&
+                CADSurfacePatch(solidIndex: patch.solidIndex, index: 0, area: patch.area, centroid: patch.centroid,
+                                bounds: patch.bounds, point: patch.point, normal: patch.normal).isValid
+        }
         guard capturedAt.timeIntervalSinceReferenceDate.isFinite,
               !isEmpty,
               parts.count <= Self.maximumParts, points.count <= Self.maximumPoints,
               Set(parts.map(\.solidIndex)).count == parts.count,
               Set(points.map(surfacePoint)).count == points.count,
+              (patches ?? []).count <= Self.maximumPatches, (patches ?? []).allSatisfy(validPatch),
               (edges ?? []).count <= Self.maximumEdges,
               (edges ?? []).allSatisfy({ $0.solidIndex >= 0 && $0.solidIndex < 1_000_000 && text($0.partID) &&
                   text($0.name) && path($0.path) && $0.length.isFinite && $0.length > 0 &&

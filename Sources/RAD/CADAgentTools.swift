@@ -1294,10 +1294,11 @@ final class CADAgentTools {
                 return item
             }
         }
-        if let edges = metadata["selectedEdges"] as? [[String: Any]] {
-            metadata["selectedEdges"] = edges.map { edge in
-                var item = edge
-                guard let solid = edge["solidIndex"] as? Int, let owner = owners[solid] else { return item }
+        for key in ["selectedEdges", "selectedPatches"] {
+            guard let features = metadata[key] as? [[String: Any]] else { continue }
+            metadata[key] = features.map { feature in
+                var item = feature
+                guard let solid = feature["solidIndex"] as? Int, let owner = owners[solid] else { return item }
                 item["partID"] = owner.id
                 item["name"] = owner.name
                 return item

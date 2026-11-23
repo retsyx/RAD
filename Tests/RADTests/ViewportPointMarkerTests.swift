@@ -93,7 +93,7 @@ final class ViewportPointMarkerTests: XCTestCase {
 
     @MainActor
     private func mouse(_ type: NSEvent.EventType, at point: NSPoint) throws -> NSEvent {
-        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: .shift, timestamp: 0,
             windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0))
     }
 

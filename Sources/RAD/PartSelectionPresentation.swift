@@ -1,4 +1,4 @@
-/// A selected point or edge involves its owning part without selecting its
+/// A selected surface feature involves its owning part without selecting its
 /// complete geometry. Folders also show partial selection for selected children.
 enum PartSelectionPresentation: Equatable {
     case none

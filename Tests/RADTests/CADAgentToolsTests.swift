@@ -188,11 +188,15 @@ final class CADAgentToolsTests: XCTestCase {
             PartNode(id: "base", name: "Base", solidIndices: [0]), PartNode(id: "lid", name: "Lid", solidIndices: [1])])]
         let metadata: [String: Any] = [
             "selectedSolidIndices": [0],
+            "selectedPatches": [["solidIndex": 1, "area": 48.0, "point": [1.0, 2.0, 3.0]]],
             "solidTransforms": [["solid": 1, "matrix": [0, -1, 0, 10, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]]],
             "selectedPoints": [["solidIndex": 1, "point": [1.0, 2.0, 3.0], "normal": [1.0, 0.0, 0.0]],
                                ["solidIndex": 0, "point": [4, 5, 6], "normal": [0, 0, 1]]]]
         let identified = CADAgentTools.identifiedSelection(metadata, parts: parts)
         XCTAssertEqual((identified["selectedParts"] as? [[String: Any]])?.first?["partID"] as? String, "base")
+        let patches = try XCTUnwrap(identified["selectedPatches"] as? [[String: Any]])
+        XCTAssertEqual(patches[0]["partID"] as? String, "lid")
+        XCTAssertEqual(patches[0]["point"] as? [Double], [1, 2, 3])
         let points = try XCTUnwrap(identified["selectedPoints"] as? [[String: Any]])
         XCTAssertEqual(points[0]["partID"] as? String, "lid")
         XCTAssertEqual(points[0]["point"] as? [Double], [1, 2, 3], "Built coordinates are kept.")

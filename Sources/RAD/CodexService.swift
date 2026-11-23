@@ -280,11 +280,12 @@ final class CodexService {
         }
         if let path = files.selectionPath {
             request += try selectionRequest(path: path, partCount: files.selectionPartCount, pointCount: files.selectionPointCount,
-                                            edgeCount: files.selectionEdgeCount, originMatchesCurrent: files.selectionOriginMatchesCurrent, encoder: encoder)
+                                            edgeCount: files.selectionEdgeCount, patchCount: files.selectionPatchCount,
+                                            originMatchesCurrent: files.selectionOriginMatchesCurrent, encoder: encoder)
         }
         if let path = files.selectionManifestPath {
             request += "SAVED SELECTION REFERENCE MANIFEST FILE:\n" + String(decoding: try encoder.encode(path), as: UTF8.self) + "\n\n"
-            request += "This local index links saved user messages to their selected parts, surface points and edges, and to their originating recipes when available. Use stable part IDs, part facts, point coordinates and edge landmarks to reconcile historical selections with the current design. Ask if the intended target remains ambiguous.\n\n"
+            request += "This local index links saved user messages to their selected parts, surface patches, points and edges, and to their originating recipes when available. Use stable part IDs and the recorded geometry to reconcile historical selections with the current design. Ask if the intended target remains ambiguous.\n\n"
         }
         request += "RECENT CONVERSATION:\n"
         // Keep milestones in the saved conversation, without letting them
@@ -375,7 +376,8 @@ final class CodexService {
                                                             directory: directory, folder: folder)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             request += "\n\n" + (try selectionRequest(path: staged.path, partCount: selection.parts.count,
-                pointCount: selection.points.count, edgeCount: selection.edges?.count ?? 0, originMatchesCurrent: false, encoder: encoder))
+                pointCount: selection.points.count, edgeCount: selection.edges?.count ?? 0, patchCount: selection.patches?.count ?? 0,
+                originMatchesCurrent: false, encoder: encoder))
         }
         guard request.utf8.count <= maximumRequestBytes else {
             throw CodexError.failed("The follow-up is too long to send. Shorten the message or reference a local source file instead of pasting its contents. The follow-up remains queued.")
@@ -383,13 +385,10 @@ final class CodexService {
         return (request, imagePaths)
     }
 
-    nonisolated private static func selectionRequest(path: String, partCount: Int, pointCount: Int, edgeCount: Int,
+    nonisolated private static func selectionRequest(path: String, partCount: Int, pointCount: Int, edgeCount: Int, patchCount: Int,
                                                      originMatchesCurrent: Bool, encoder: JSONEncoder) throws -> String {
         var request = "REQUEST SELECTION FILE:\n" + String(decoding: try encoder.encode(path), as: UTF8.self) + "\n"
-        request += "Captured request selection: \(partCount) selected parts and \(pointCount) selected points. Read this immutable local JSON for the exact selection: stable part identities, part facts (volume centroid, area, volume, bounds), surface points (each with its part, built coordinates before any mechanism pose, and outward unit normal, in selection order), the originating revision ID, and referenced origin recipe/input files. Points are picks on the preview mesh, accurate to its resolution. Contents are not embedded in this prompt.\n"
-        if edgeCount > 0 {
-            request += "The same selection file contains \(edgeCount) selected edges. Each records the owning part, three landmarks in built coordinates, approximate length in mm and whether the edge is closed. Use these to locate the crease on the originating design.\n"
-        }
+        request += "Captured selection counts (parts, surface patches, edges, points): \(partCount), \(patchCount), \(edgeCount), \(pointCount). Read this local JSON for stable part identities, part measurements, built-coordinate feature landmarks and the originating revision and recipe references. Surface points record an outward unit normal. Edges carry three landmarks and approximate length. Patches carry approximate area in mm², centroid, bounds and a representative point with its local outward normal. These features are measured at preview resolution.\n"
         if !originMatchesCurrent {
             request += "The selection originates from a different or unavailable revision, or supplements an in-progress design. Solid indices and point coordinates belong only to that originating recipe's geometry; never reuse them blindly on the current design or a new candidate. Reconcile stable part IDs and points by measuring the current design, regenerating the referenced origin recipe only if necessary. If its recipe is unavailable or the target remains ambiguous, ask rather than guess.\n"
         } else {

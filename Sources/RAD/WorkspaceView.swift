@@ -258,11 +258,12 @@ private struct WorkspaceViewer: View {
                         command: state.viewportCommand,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids,
                         omittedSolids: state.displayedOmittedSolids, solidColors: state.solidColors,
-                        selectedPoints: state.selectedPoints, selectedEdges: state.selectedEdges,
+                        selectedPoints: state.selectedPoints, selectedEdges: state.selectedEdges, selectedPatches: state.selectedPatches,
                         solidTransforms: state.displayedSolidTransforms, cameraKey: state.viewportCameraKey,
                         onSelectionChanged: { state.selectParts($0) },
                         onPointSelectionChanged: { if state.displayedMesh?.buildID == buildID { state.selectPoints($0) } },
                         onEdgeSelectionChanged: { if state.displayedMesh?.buildID == buildID { state.selectEdges($0) } },
+                        onPatchSelectionChanged: { if state.displayedMesh?.buildID == buildID { state.selectPatches($0) } },
                         onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
                         onViewReady: { view in

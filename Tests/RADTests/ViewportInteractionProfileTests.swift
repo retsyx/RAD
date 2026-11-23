@@ -103,6 +103,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
             switch feature {
             case .marker(let index): return "marker \(index)"
             case .edge(let edge): return "edge \(edge.solidIndex):\(edge.index)"
+            case .patch(let patch): return "patch \(patch.solidIndex):\(patch.index)"
             case .point(let point): return "point \(point.solidIndex):\(point.point)"
             }
         }

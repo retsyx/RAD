@@ -135,6 +135,88 @@ final class ViewportSilhouetteTests: XCTestCase {
     }
 
     @MainActor
+    func testPatchPickingAndGoldOutlinesSeparateTheTopBottomAndAdjacentSide() async throws {
+        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 320))
+        let vertices: [[Double]] = [[-6,-6,-4], [6,-6,-4], [6,6,-4], [-6,6,-4],
+                                    [-6,-6,4], [6,-6,4], [6,6,4], [-6,6,4]]
+        let triangles = [[0,2,1], [0,3,2], [4,5,6], [4,6,7], [0,1,5], [0,5,4],
+                         [1,2,6], [1,6,5], [2,3,7], [2,7,6], [3,0,4], [3,4,7]]
+        let creases = [(0,1), (1,2), (2,3), (3,0), (4,5), (5,6), (6,7), (7,4), (0,4), (1,5), (2,6), (3,7)]
+        let preview = PreviewMesh(vertices: vertices, triangles: triangles, edges: creases.map { vertices[$0.0] + vertices[$0.1] },
+            bounds: [-6,-6,-4,6,6,4], volume: 1152, area: 672, solids: 1, buildSeconds: 0, threads: 1,
+            buildID: "patch-outlines", triangleSolids: Array(repeating: 0, count: 12), edgeSolids: Array(repeating: 0, count: 12))
+        func screen(_ x: Double, _ y: Double, _ z: Double) -> NSPoint {
+            let point = view.projectPoint(SCNVector3(x, y, z))
+            return NSPoint(x: point.x, y: point.y)
+        }
+        func patch(_ point: NSPoint) throws -> CADSurfacePatch {
+            guard case .patch(let patch) = view.pickFeature(at: point) else {
+                throw RADError.message("Expected the surface patch at \(point).")
+            }
+            return patch
+        }
+        func show(_ selected: [CADSurfacePatch], from direction: ViewportCommand.Action? = nil) {
+            view.update(mesh: preview, mode: .edges, grid: false, command: direction.map(ViewportCommand.init),
+                        selectedSolids: [], hiddenSolids: [], projection: .isometric, selectedPatches: selected)
+        }
+        show([], from: .top)
+        try await ready(view)
+        let top = try patch(screen(-3, 1, 4))
+        XCTAssertEqual(try patch(screen(3, -1, 4)), top)
+        XCTAssertEqual(top.area, 144, accuracy: 1e-6)
+        show([], from: .bottom)
+        let bottom = try patch(screen(0, 0, -4))
+        XCTAssertNotEqual(bottom, top)
+
+        show([], from: .isometric)
+        let upperRim = SCNVector3(0, -6, 4), lowerRim = SCNVector3(0, -6, -4)
+        view.mouseMoved(with: try event(.mouseMoved, at: screen(0, 0, 4)))
+        let hovered = try await bitmap(view)
+        XCTAssertTrue(hasGold(hovered, around: upperRim, in: view, hover: true))
+        XCTAssertFalse(hasGold(hovered, around: lowerRim, in: view, hover: true))
+        let hoverMask = try XCTUnwrap(view.makeFrame(width: 400, height: 320).batches.flatMap(\.masks).first?.buffer)
+
+        var changes = [[CADSurfacePatch]]()
+        view.onPatchSelectionChanged = { changes.append($0) }
+        view.mouseDown(with: try event(.leftMouseDown, at: screen(1, 0, 4)))
+        XCTAssertEqual(changes.last, [top])
+        XCTAssertTrue(view.makeFrame(width: 400, height: 320).batches.flatMap(\.masks).first?.buffer === hoverMask)
+        let topImage = try await bitmap(view)
+        XCTAssertTrue(hasGold(topImage, around: upperRim, in: view))
+        XCTAssertFalse(hasGold(topImage, around: lowerRim, in: view))
+        view.mouseDown(with: try event(.leftMouseDown, at: screen(2, -1, 4)))
+        XCTAssertEqual(changes.last, [])
+        show([bottom])
+        let bottomImage = try await bitmap(view)
+        XCTAssertFalse(hasGold(bottomImage, around: upperRim, in: view))
+        XCTAssertTrue(hasGold(bottomImage, around: lowerRim, in: view))
+
+        let front = try patch(screen(0, -6, 0))
+        show([top, front])
+        let touching = view.makeFrame(width: 400, height: 320)
+        XCTAssertEqual(touching.batches.count, 2, "The shared rim must remain visible between selected faces.")
+        let adjacentImage = try await bitmap(view)
+        XCTAssertTrue(hasGold(adjacentImage, around: upperRim, in: view))
+
+        // Zoom until most of the top face is outside the frame. Its real edge
+        // crosses the center and retains its stroke on the clipped projection.
+        show([top])
+        try view.configureAgentView(named: "top", camera: CADAgentCamera(target: [0,-6,4], zoom: 4))
+        let clipped = try await bitmap(view)
+        XCTAssertTrue(hasGold(clipped, around: upperRim, in: view))
+        XCTAssertFalse(hasGold(clipped, around: SCNVector3(0, -5, 4), in: view))
+
+        try view.configureAgentView(named: "top", camera: CADAgentCamera(target: [0,0,4], zoom: 8))
+        let full = try await bitmap(view)
+        for (x, y) in [(1, full.pixelsHigh / 2), (full.pixelsWide - 2, full.pixelsHigh / 2),
+                       (full.pixelsWide / 2, 1), (full.pixelsWide / 2, full.pixelsHigh - 2)] {
+            XCTAssertTrue(isGold(full, x: x, y: y), "A patch filling the view marks each viewport border.")
+        }
+        XCTAssertFalse(isGold(full, x: full.pixelsWide / 2, y: full.pixelsHigh / 2))
+    }
+
+    @MainActor
     private func bitmap(_ view: CADSceneView) async throws -> NSBitmapImageRep {
         let png = try await CADAgentRenderer.capturePNG(view: view)
         return try XCTUnwrap(NSBitmapImageRep(data: png))

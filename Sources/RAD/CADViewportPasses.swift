@@ -130,6 +130,9 @@ struct CADViewportFrame: @unchecked Sendable {
         var buffer: CADHighlightBuffers.Mask
         var selected: Bool
         var model: simd_float4x4
+        /// A surface patch may cover the entire viewport. Keep the boundary
+        /// of its on-screen footprint visible when its own perimeter is clipped.
+        var outlineClippedCoverage = false
         /// Exact solids cover their field projection instead of their mesh.
         var field: (resources: CADFieldResources, solid: Int)? = nil
     }
@@ -1049,7 +1052,8 @@ final class CADViewportPasses: @unchecked Sendable {
             encoder.setRenderPipelineState(pipelines.mask)
             for item in batch.masks {
                 if exact, item.field != nil { continue }
-                let channel: SIMD4<Float> = item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0)
+                let clipped: Float = item.outlineClippedCoverage ? 1 : 0
+                let channel: SIMD4<Float> = item.selected ? SIMD4(1, 0, clipped, 0) : SIMD4(0, 1, 0, clipped)
                 var mask = MaskUniforms(modelViewProjection: viewProjection * item.model, remap: batchRemap,
                                         channel: channel)
                 encoder.setVertexBuffer(item.buffer.positions, offset: 0, index: 0)
@@ -1076,6 +1080,9 @@ final class CADViewportPasses: @unchecked Sendable {
             var region = SIMD4<Int32>(Int32(pixels.x - areaX), Int32(pixels.y - areaY), Int32(pixels.width), Int32(pixels.height))
             contourEncoder.setFragmentTexture(scratch, index: 0)
             contourEncoder.setFragmentBytes(&region, length: MemoryLayout<SIMD4<Int32>>.stride, index: 0)
+            var frameBorders = SIMD4<Int32>(Int32(-pixels.x), Int32(-pixels.y),
+                Int32(frame.width - 1 - pixels.x), Int32(frame.height - 1 - pixels.y))
+            contourEncoder.setFragmentBytes(&frameBorders, length: MemoryLayout<SIMD4<Int32>>.stride, index: 1)
             contourEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             contourEncoder.endEncoding()
         }
@@ -1398,16 +1405,21 @@ final class CADViewportPasses: @unchecked Sendable {
     // Reads clamp to this batch's region, which is padded inside the frame
     // and coincides with the frame edge where a large surface is clipped.
     fragment float4 cad_contour(CADQuadOut in [[stage_in]], texture2d<float, access::read> mask [[texture(0)]],
-                                constant int4 &region [[buffer(0)]]) {
+                                constant int4 &region [[buffer(0)]], constant int4 &frameBorders [[buffer(1)]]) {
         int2 last = region.zw - 1;
         int2 p = clamp(int2(in.position.xy) - region.xy, int2(0), last);
-        float2 covered = step(0.5f, mask.read(uint2(p)).rg);
+        float4 coverage = step(0.5f, mask.read(uint2(p)));
+        float2 covered = coverage.rg;
         float2 interior = covered;
         interior = min(interior, step(0.5f, mask.read(uint2(max(p - int2(1, 0), int2(0)))).rg));
         interior = min(interior, step(0.5f, mask.read(uint2(min(p + int2(1, 0), last))).rg));
         interior = min(interior, step(0.5f, mask.read(uint2(max(p - int2(0, 1), int2(0)))).rg));
         interior = min(interior, step(0.5f, mask.read(uint2(min(p + int2(0, 1), last))).rg));
-        return float4(covered - interior, 0.0f, 0.0f);
+        // Only patch coverage reaches BA. At the viewport edge, its next
+        // neighbor is outside the visible footprint. A cropped scratch
+        // texture's own edges do not count.
+        float2 clipped = any(p == frameBorders.xy) || any(p == frameBorders.zw) ? coverage.ba : float2(0.0f);
+        return float4(max(covered - interior, clipped), 0.0f, 0.0f);
     }
 
     static float cad_scale(constant CADHighlightUniforms &u) {
