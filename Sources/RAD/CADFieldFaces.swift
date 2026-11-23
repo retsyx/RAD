@@ -354,8 +354,10 @@ final class CADFieldResources: @unchecked Sendable {
         var projection: SIMD4<Float>
         var samples01: SIMD4<Float>
         var samples23: SIMD4<Float>
-        /// Maximum march steps per ray, hit tolerance as a fraction of the pixel footprint.
-        var march = SIMD4<Float>(48, 0.05, 0, 0)
+        /// Maximum march steps per ray, hit tolerance as a fraction of the
+        /// pixel footprint, further samples of a pixel's center ray that used
+        /// its steps, and their largest step in footprints.
+        var march = SIMD4<Float>(48, 0.05, 32, 16)
 
         init(view: simd_float4x4, projection: simd_float4x4, height: Int, lights: CADFieldLights,
              alpha: Float, debug: Int, sampleOffsets: [SIMD2<Float>]) {
@@ -624,7 +626,8 @@ struct CADFieldUniforms {
     float4 projection;   // footprint scale, orthographic, alpha, debug
     float4 samples01;    // sample offsets from the pixel center, in pixels
     float4 samples23;
-    float4 march;        // maximum steps per ray, hit tolerance (fraction of the footprint)
+    float4 march;        // maximum steps per ray, hit tolerance (fraction of the footprint),
+                         // ray 0's further samples after its steps, their largest step (footprints)
 };
 
 struct CADFieldInstance {
@@ -712,8 +715,13 @@ inline void cad_field_ray(thread const CADFieldRays &r, constant CADFieldUniform
 // tracing by |f| / L, stepping back whenever the unbounding spheres of two
 // samples do not overlap (Keinert et al. 2014), so no surface is skipped; a
 // sign change is bisected; |f| below the tolerance hits. A ray rising above
-// the shell has left the proxy's interior and misses. A ray that runs out of
-// steps within half a pixel of the surface (a grazing one) hits there.
+// the shell has left the proxy's interior and misses. Sphere tracing beside
+// a surface it does not reach advances by tiny steps, so a ray 0 still short
+// of the surface after its steps (one grazing a fold on its way to the
+// surface behind) takes further samples whose steps are at least 2, 4, 8 ...
+// pixel footprints, up to a limit; dropped there, it would leave a hole. A
+// ray that runs out of samples within half a pixel of the surface hits there,
+// and so does a multisample ray of a pixel whose ray 0 hit.
 #define CAD_FIELD_RELAXATION 1.5f
 // With `contacts`, every crossing is then sampled in the fields of the parts
 // whose bounds overlap this one (at the same call): a multisample crossing
@@ -735,8 +743,9 @@ void cad_field_march(device const uint *w, thread const RADFieldGrid &own, threa
     float3 o, d;
     float footprint0, slope;
     cad_field_ray(rays, u, ray, o, d, footprint0, slope);
-    // Multisample rays refine coverage only: half the budget.
-    uint budget = first == 0 ? uint(u.march.x) : uint(u.march.x) / 2;
+    // Multisample rays refine coverage only: half the budget, no further samples.
+    const uint budget = first == 0 ? uint(u.march.x) : uint(u.march.x) / 2;
+    const uint limit = first == 0 ? budget + uint(u.march.z) : budget;
     float t = 0, previous_t = 0, previous = 0, previous_radius = 0, step = 0, omega = CAD_FIELD_RELAXATION;
     float a = 0, b = 0, fa = 0, m = 0, eps = 0;
     uint phase = 0, k = 0, bisections = 0, ray_steps = 0;
@@ -781,13 +790,13 @@ void cad_field_march(device const uint *w, thread const RADFieldGrid &own, threa
                 }
             } else {
                 float radius = s.value / s.lipschitz;
-                if (omega > 1 && ray_steps > 1 && radius + previous_radius < step) {
+                if (omega > 1 && ray_steps > 1 && ray_steps <= budget && radius + previous_radius < step) {
                     // The relaxed step may have passed a surface: step back.
                     omega = 1;
                     t = previous_t;
                     radius = previous_radius;
-                } else if (ray_steps >= budget) {
-                    hit = s.value < 0.5f * footprint;
+                } else if (ray_steps >= limit) {
+                    hit = s.value < 0.5f * footprint || (ray > 0 && (r.mask & 1u) != 0);
                     done = !hit;
                 } else if (s.value > shell && ray_steps > 1 && s.value >= previous) {
                     done = true;  // rising above the shell: left the proxy's interior
@@ -809,6 +818,7 @@ void cad_field_march(device const uint *w, thread const RADFieldGrid &own, threa
                 }
                 if (!hit && !done) {
                     step = omega * radius;
+                    if (ray_steps > budget) step = max(step, footprint * min(exp2(float(ray_steps - budget)), u.march.w));
                     t += step;
                     x = o + t * d;
                     continue;

@@ -157,6 +157,45 @@ final class ExactFacesTests: XCTestCase {
                           "exact depth agrees with the analytic fields away from their curves (mesh: \(meshWrong) of \(compared))")
     }
 
+    // MARK: Grazing rays
+
+    /// Rays passing a fold of a gyroid sheet on their way to the sheet behind
+    /// it outlast the march's steps by far. They must still reach a surface:
+    /// no background may show where the display mesh is solid (the old march
+    /// left 64 such pixels in these views).
+    func testRaysGrazingAFoldReachTheSurfaceBehindIt() async throws {
+        let preview = try await preview("""
+            pitch = 33.0
+            k = 2 * math.pi / pitch
+            g = sin(k * x) * cos(k * y) + sin(k * y) * cos(k * z) + sin(k * z) * cos(k * x)
+            result = implicit(abs(g) - 0.44, ((-25, -25, -25), (25, 25, 25)))
+            """)
+        let color = try XCTUnwrap(CADSceneView.sceneBackgroundColor.usingColorSpace(.sRGB))
+        let background = SIMD3(Double(color.redComponent), Double(color.greenComponent), Double(color.blueComponent))
+        var camera = CADAgentCamera()
+        camera.zoom = 2
+        var holes = 0
+        for view in ["isometric", "left", "top"] {
+            let exact = try await render(preview, projection: .perspective, view: view, camera: camera, width: 800, height: 600)
+            let mesh = try await render(preview, exact: false, projection: .perspective, view: view, camera: camera,
+                                        width: 800, height: 600)
+            let width = mesh.pixels.width, height = mesh.pixels.height
+            var covered = [Bool](repeating: false, count: width * height)
+            for y in 0..<height {
+                for x in 0..<width { covered[y * width + x] = simd_reduce_max(abs(mesh.pixels.rgb(x, y) - background)) > 30.0 / 255 }
+            }
+            // Background in the exact image with the mesh solid around it
+            // (silhouettes differ by the mesh's deviation).
+            for y in 3..<(height - 3) {
+                for x in 3..<(width - 3) where simd_reduce_max(abs(exact.pixels.rgb(x, y) - background)) <= 6.0 / 255 {
+                    let solid = (-3...3).allSatisfy { dy in (-3...3).allSatisfy { dx in covered[(y + dy) * width + x + dx] } }
+                    if solid { holes += 1 }
+                }
+            }
+        }
+        XCTAssertEqual(holes, 0, "background shows through exact faces where the display mesh is solid")
+    }
+
     // MARK: Translucent layers
 
     /// Every proxy fragment owns one crossing: front faces the entering one,
